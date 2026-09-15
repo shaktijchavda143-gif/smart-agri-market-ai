@@ -1,23 +1,32 @@
-SMART AGRI-MARKET AI — Android AI Backend
+Smart Agri Market AI - Render Backend (Groq enabled)
 
-આ folder Render પર અલગ Web Service તરીકે deploy કરવાનું છે. Weather service અને આ AI service અલગ છે.
+Files:
+- main.py
+- smart_agri_agent.py
+- requirements.txt
+- render.yaml
+- README_GU.txt
 
-1) Render માં New Web Service બનાવો અને આ ai_backend folder deploy કરો.
-2) Build Command: pip install -r requirements.txt
-3) Start Command: uvicorn main:app --host 0.0.0.0 --port $PORT
-4) Environment Variable:
-   OPENAI_API_KEY = તમારી OpenAI API key (optional for rule-based agent; required for full OpenAI AI/vision)
-   OPENAI_MODEL = gpt-5.6-luna
-5) Deploy થયા પછી browserમાં ચેક કરો:
-   https://YOUR-SERVICE.onrender.com/api/v1/health
-   તેમાં ok=true અને agent_loaded=true આવવું જોઈએ.
-6) Android > Settings > AI Backend URL માં:
-   https://YOUR-SERVICE.onrender.com/api/v1/
+Render:
+Build: pip install -r requirements.txt
+Start: uvicorn main:app --host 0.0.0.0 --port $PORT
+Root Directory: blank
 
-Android calls:
-POST /api/v1/ai/ask
-POST /api/v1/ai/diagnose
+Environment variables:
+GROQ_API_KEY = your Groq API key (keep secret)
+GROQ_TEXT_MODEL = openai/gpt-oss-20b
+GROQ_VISION_MODEL = qwen/qwen3.6-27b
 
-મહત્વપૂર્ણ: જો Androidમાં HTTP 404 આવે તો URL ખોટો છે અથવા Render પર આ AI backend deploy થયેલું નથી. Weather Render URL અહીં ન મૂકવો.
+Optional fallback:
+OPENAI_API_KEY
+OPENAI_MODEL = gpt-5.6-luna
 
-આ backendમાં આપેલી smart_agri_agent.py નો પાક-જ્ઞાન fallback પણ જોડાયેલ છે, એટલે OPENAI key વગર પણ AI Agent પ્રશ્નોના મૂળભૂત ખેતી જવાબ આપે છે.
+Behavior:
+- Text AI prefers Groq, then optional OpenAI, then the supplied local agent.
+- Photo diagnosis prefers Groq vision, then optional OpenAI vision.
+- Android API paths remain unchanged:
+  /api/v1/health
+  /api/v1/ai/ask
+  /api/v1/ai/diagnose
+
+Do not put API keys in GitHub files or the Android APK. Store them in Render Environment Variables.

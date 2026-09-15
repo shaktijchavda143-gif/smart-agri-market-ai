@@ -1,7 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Smart Agri-Market AI HTTP backend.
-Wraps the supplied Smart Agri-Market Agent so the Android app can call it.
-"""
+"""Smart Agri-Market AI HTTP backend with optional Groq/OpenAI AI providers."""
 import os
 import base64
 import importlib.util
@@ -12,8 +10,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from openai import OpenAI
 
-APP_VERSION = "9.0 Android API Bridge"
-MODEL = os.getenv("OPENAI_MODEL", "gpt-5.6-luna").strip() or "gpt-5.6-luna"
+APP_VERSION = "10.0 Android API Bridge - Groq"
+GROQ_TEXT_MODEL = os.getenv("GROQ_TEXT_MODEL", "openai/gpt-oss-20b").strip() or "openai/gpt-oss-20b"
+GROQ_VISION_MODEL = os.getenv("GROQ_VISION_MODEL", "qwen/qwen3.6-27b").strip() or "qwen/qwen3.6-27b"
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.6-luna").strip() or "gpt-5.6-luna"
 
 app = FastAPI(title="Smart Agri Market AI Backend", version=APP_VERSION)
 app.add_middleware(
@@ -22,7 +22,6 @@ app.add_middleware(
     allow_methods=["*"], allow_headers=["*"],
 )
 
-# Load the user's supplied agent file without executing its CLI main().
 _agent = None
 try:
     _path = os.path.join(os.path.dirname(__file__), "smart_agri_agent.py")
@@ -36,7 +35,7 @@ except Exception as exc:
 
 SYSTEM = (
     "તમે Smart Agri-Market AI ગુજરાતી ખેડૂત સહાયક છો. "
-    "જવાબ સરળ, વ્યવહારુ અને પાક/ખેડૂતના સંદર્ભ મુજબ આપો. "
+    "જવાબ સરળ, વ્યવહારુ અને પાક/ખેડૂતના સંદર્ભ મુજબ ગુજરાતી ભાષામાં આપો. "
     "પાક, સિંચાઈ, પોષણ, રોગ-જીવાત, હવામાન અને બજાર અંગે માર્ગદર્શન આપો. "
     "ચોક્કસ pesticide dose અથવા નિશ્ચિત રોગનિદાન માટે સ્થાનિક કૃષિ નિષ્ણાત/KVK/લેબ ચકાસણી જરૂરી હોવાનું જણાવો."
 )
@@ -44,6 +43,11 @@ SYSTEM = (
 class Ask(BaseModel):
     question: str
     context: dict | None = None
+
+
+def groq_client():
+    key = os.getenv("GROQ_API_KEY", "").strip()
+    return OpenAI(api_key=key, base_url="https://api.groq.com/openai/v1") if key else None
 
 
 def openai_client():
@@ -56,7 +60,6 @@ def norm(text: str) -> str:
 
 
 def rule_based_answer(question: str, context: dict | None) -> str:
-    """Use the supplied agent's crop knowledge even when OpenAI is not configured."""
     q = norm(question)
     ctx = context or {}
     selected = ctx.get("selected_crop") or {}
@@ -111,6 +114,38 @@ def rule_based_answer(question: str, context: dict | None) -> str:
     )
 
 
+def ai_text_answer(question: str, context: dict | None) -> tuple[str, str, str]:
+    """Prefer Groq, then optional OpenAI, then the supplied local agent."""
+    ctx = context or {}
+    prompt = f"ખેડૂત પ્રશ્ન: {question.strip()}\nખેડૂત સંદર્ભ: {ctx}"
+
+    client = groq_client()
+    if client:
+        try:
+            response = client.responses.create(
+                model=GROQ_TEXT_MODEL,
+                instructions=SYSTEM,
+                input=prompt,
+            )
+            answer = (response.output_text or "").strip()
+            if answer:
+                return answer, "groq", GROQ_TEXT_MODEL
+        except Exception as exc:
+            print(f"Groq text warning: {exc}")
+
+    client = openai_client()
+    if client:
+        try:
+            response = client.responses.create(model=OPENAI_MODEL, instructions=SYSTEM, input=prompt)
+            answer = (response.output_text or "").strip()
+            if answer:
+                return answer, "openai", OPENAI_MODEL
+        except Exception as exc:
+            print(f"OpenAI text warning: {exc}")
+
+    return rule_based_answer(question, context), "agent_fallback", "local"
+
+
 @app.get("/")
 def root():
     return {"ok": True, "service": "smart-agri-ai", "version": APP_VERSION}
@@ -123,8 +158,10 @@ def health():
         "service": "smart-agri-ai",
         "version": APP_VERSION,
         "agent_loaded": _agent is not None,
+        "groq_configured": bool(os.getenv("GROQ_API_KEY", "").strip()),
         "openai_configured": bool(os.getenv("OPENAI_API_KEY", "").strip()),
-        "model": MODEL,
+        "text_model": GROQ_TEXT_MODEL,
+        "vision_model": GROQ_VISION_MODEL,
     }
 
 
@@ -132,24 +169,8 @@ def health():
 def ask(req: Ask):
     if not req.question.strip():
         raise HTTPException(status_code=400, detail="પ્રશ્ન ખાલી છે.")
-    try:
-        client = openai_client()
-        if client is None:
-            return {"answer": rule_based_answer(req.question, req.context), "mode": "agent"}
-        ctx = req.context or {}
-        prompt = f"ખેડૂત પ્રશ્ન: {req.question.strip()}\nખેડૂત સંદર્ભ: {ctx}"
-        response = client.responses.create(model=MODEL, instructions=SYSTEM, input=prompt)
-        answer = (response.output_text or "").strip()
-        if not answer:
-            answer = rule_based_answer(req.question, req.context)
-        return {"answer": answer, "mode": "openai", "model": MODEL}
-    except Exception as exc:
-        # Never make the Android button fail just because the external AI service failed.
-        return {
-            "answer": rule_based_answer(req.question, req.context),
-            "mode": "agent_fallback",
-            "warning": str(exc),
-        }
+    answer, mode, model = ai_text_answer(req.question, req.context)
+    return {"answer": answer, "mode": mode, "model": model}
 
 
 @app.post("/api/v1/ai/diagnose")
@@ -157,28 +178,51 @@ async def diagnose(image: UploadFile = File(...), crop: str = Form(""), context:
     data = await image.read()
     if not data:
         raise HTTPException(status_code=400, detail="ફોટો ખાલી છે.")
-    client = openai_client()
-    if client is None:
-        return {
-            "answer": "📷 ફોટો મળ્યો છે. Vision AI ચાલુ કરવા Renderમાં OPENAI_API_KEY સેટ કરો. હાલમાં ફોટા પરથી નિશ્ચિત રોગનિદાન અથવા દવા/ડોઝ આપવો યોગ્ય નથી.",
-            "mode": "agent_unavailable",
-        }
+
     mime = image.content_type or "image/jpeg"
     b64 = base64.b64encode(data).decode("ascii")
     prompt = (
         f"આ ખેતીના પાકનો ફોટો છે. પાક: {crop or 'અજ્ઞાત'}. સંદર્ભ: {context}. "
         "ફોટામાં દેખાતા લક્ષણોનું નિરીક્ષણ કરો. 1-3 સંભવિત કારણો, દેખાતા લક્ષણો અને તરત કરી શકાય તેવી IPM/સલામતી સલાહ આપો. "
-        "ફોટા પરથી નિશ્ચિત નિદાન ન કરો અને ચોક્કસ pesticide dose ન આપો."
+        "ફોટા પરથી નિશ્ચિત નિદાન ન કરો અને ચોક્કસ pesticide dose ન આપો. જવાબ સરળ ગુજરાતી ભાષામાં આપો."
     )
-    try:
-        response = client.responses.create(
-            model=MODEL,
-            instructions=SYSTEM,
-            input=[{"role": "user", "content": [
-                {"type": "input_text", "text": prompt},
-                {"type": "input_image", "image_url": f"data:{mime};base64,{b64}"},
-            ]}],
-        )
-        return {"answer": response.output_text, "mode": "openai_vision", "model": MODEL}
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Vision AI error: {exc}")
+
+    client = groq_client()
+    if client:
+        try:
+            response = client.responses.create(
+                model=GROQ_VISION_MODEL,
+                instructions=SYSTEM,
+                input=[{
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": prompt},
+                        {"type": "input_image", "image_url": f"data:{mime};base64,{b64}"},
+                    ],
+                }],
+            )
+            answer = (response.output_text or "").strip()
+            if answer:
+                return {"answer": answer, "mode": "groq_vision", "model": GROQ_VISION_MODEL}
+        except Exception as exc:
+            print(f"Groq vision warning: {exc}")
+
+    client = openai_client()
+    if client:
+        try:
+            response = client.responses.create(
+                model=OPENAI_MODEL,
+                instructions=SYSTEM,
+                input=[{"role": "user", "content": [
+                    {"type": "input_text", "text": prompt},
+                    {"type": "input_image", "image_url": f"data:{mime};base64,{b64}"},
+                ]}],
+            )
+            return {"answer": response.output_text, "mode": "openai_vision", "model": OPENAI_MODEL}
+        except Exception as exc:
+            print(f"OpenAI vision warning: {exc}")
+
+    return {
+        "answer": "📷 ફોટો મળ્યો છે. હાલમાં Vision AI service ઉપલબ્ધ નથી; ફોટા પરથી નિશ્ચિત રોગનિદાન અથવા દવા/ડોઝ આપવો યોગ્ય નથી. કૃપા કરીને પાકનું નામ, ઉંમર અને લક્ષણો લખો.",
+        "mode": "agent_unavailable",
+    }
