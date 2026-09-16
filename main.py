@@ -31,8 +31,8 @@ APP_VERSION = "9.0 Android API Bridge"
 
 GROQ_MODEL = os.getenv(
     "GROQ_MODEL",
-    "llama-3.3-70b-versatile"
-).strip() or "llama-3.3-70b-versatile"
+    "openai/gpt-oss-20b"
+).strip() or "openai/gpt-oss-20b"
 
 
 # ============================================================
