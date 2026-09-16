@@ -2,6 +2,7 @@
 """Smart Agri-Market AI HTTP backend.
 Wraps the supplied Smart Agri-Market Agent so the Android app can call it.
 """
+
 import os
 import base64
 import importlib.util
@@ -20,14 +21,29 @@ from openai import OpenAI
 from google import genai
 from google.genai import types
 
+
 APP_VERSION = "9.0 Android API Bridge"
 
-GROK_MODEL = os.getenv("GROK_MODEL", "grok-4.6").strip() or "grok-4.6"
+
+# ============================================================
+# GROQ TEXT MODEL
+# ============================================================
+
+GROQ_MODEL = os.getenv(
+    "GROQ_MODEL",
+    "llama-3.3-70b-versatile"
+).strip() or "llama-3.3-70b-versatile"
+
+
+# ============================================================
+# GEMINI VISION MODEL
+# ============================================================
 
 VISION_MODEL = os.getenv(
     "VISION_MODEL",
     "gemini-2.5-flash"
 ).strip() or "gemini-2.5-flash"
+
 
 app = FastAPI(
     title="Smart Agri Market AI Backend",
@@ -42,7 +58,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Load the user's supplied agent file without executing its CLI main().
+
+# ============================================================
+# LOAD SUPPLIED SMART AGRI AGENT
+# ============================================================
+
 _agent = None
 
 try:
@@ -65,6 +85,10 @@ except Exception as exc:
     print(f"Agent import warning: {exc}")
 
 
+# ============================================================
+# SYSTEM INSTRUCTION
+# ============================================================
+
 SYSTEM = (
     "તમે Smart Agri-Market AI ગુજરાતી ખેડૂત સહાયક છો. "
     "જવાબ સરળ, વ્યવહારુ અને પાક/ખેડૂતના સંદર્ભ મુજબ આપો. "
@@ -73,24 +97,28 @@ SYSTEM = (
 )
 
 
+# ============================================================
+# REQUEST MODEL
+# ============================================================
+
 class Ask(BaseModel):
     question: str
     context: dict | None = None
 
 
 # ============================================================
-# GROK TEXT AI CLIENT
+# GROQ TEXT AI CLIENT
 # ============================================================
 
-def grok_client():
-    key = os.getenv("XAI_API_KEY", "").strip()
+def groq_client():
+    key = os.getenv("GROQ_API_KEY", "").strip()
 
     if not key:
         return None
 
     return OpenAI(
         api_key=key,
-        base_url="https://api.x.ai/v1",
+        base_url="https://api.groq.com/openai/v1",
     )
 
 
@@ -104,14 +132,23 @@ def gemini_client():
     return genai.Client(api_key=key) if key else None
 
 
+# ============================================================
+# NORMALIZE TEXT
+# ============================================================
+
 def norm(text: str) -> str:
     return " ".join(
         (text or "").strip().lower().replace("-", " ").split()
     )
 
 
+# ============================================================
+# RULE-BASED ANSWER
+# ============================================================
+
 def rule_based_answer(question: str, context: dict | None) -> str:
     """Use the supplied agent's crop knowledge when needed."""
+
     q = norm(question)
     ctx = context or {}
     selected = ctx.get("selected_crop") or {}
@@ -236,7 +273,9 @@ def rule_based_answer(question: str, context: dict | None) -> str:
     )
 
 
-# ---------------- Live Gujarat Weather News ----------------
+# ============================================================
+# LIVE GUJARAT WEATHER NEWS
+# ============================================================
 
 NEWS_FEEDS = [
     (
@@ -416,6 +455,10 @@ def _fetch_news_feed(
     return items
 
 
+# ============================================================
+# WEATHER NEWS ENDPOINT
+# ============================================================
+
 @app.get("/api/v1/weather/news")
 def weather_news():
 
@@ -473,6 +516,10 @@ def weather_news():
     }
 
 
+# ============================================================
+# ROOT
+# ============================================================
+
 @app.get("/")
 def root():
     return {
@@ -495,9 +542,9 @@ def health():
         "version": APP_VERSION,
         "agent_loaded": _agent is not None,
 
-        "grok_configured": bool(
+        "groq_configured": bool(
             os.getenv(
-                "XAI_API_KEY",
+                "GROQ_API_KEY",
                 ""
             ).strip()
         ),
@@ -509,8 +556,8 @@ def health():
             ).strip()
         ),
 
-        "text_provider": "grok",
-        "text_model": GROK_MODEL,
+        "text_provider": "groq",
+        "text_model": GROQ_MODEL,
 
         "vision_provider": "gemini",
         "vision_model": VISION_MODEL,
@@ -518,7 +565,7 @@ def health():
 
 
 # ============================================================
-# GROK TEXT AI
+# GROQ TEXT AI
 # ============================================================
 
 @app.post("/api/v1/ai/ask")
@@ -530,15 +577,15 @@ def ask(req: Ask):
             detail="પ્રશ્ન ખાલી છે."
         )
 
-    client = grok_client()
+    client = groq_client()
 
     if client is None:
         raise HTTPException(
             status_code=503,
             detail=(
-                "Grok AI configured નથી. "
+                "Groq AI configured નથી. "
                 "Render Environment Variables માં "
-                "XAI_API_KEY સેટ કરો."
+                "GROQ_API_KEY સેટ કરો."
             )
         )
 
@@ -558,27 +605,35 @@ def ask(req: Ask):
 
     try:
 
-        response = client.responses.create(
-            model=GROK_MODEL,
-            instructions=SYSTEM,
-            input=prompt,
+        response = client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": SYSTEM,
+                },
+                {
+                    "role": "user",
+                    "content": prompt,
+                },
+            ],
         )
 
         answer = (
-            response.output_text
+            response.choices[0].message.content
             or ""
         ).strip()
 
         if not answer:
             raise HTTPException(
                 status_code=502,
-                detail="Grok તરફથી ખાલી જવાબ મળ્યો."
+                detail="Groq તરફથી ખાલી જવાબ મળ્યો."
             )
 
         return {
             "answer": answer,
-            "mode": "grok",
-            "model": GROK_MODEL,
+            "mode": "groq",
+            "model": GROQ_MODEL,
         }
 
     except HTTPException:
@@ -588,7 +643,7 @@ def ask(req: Ask):
 
         raise HTTPException(
             status_code=502,
-            detail=f"Grok AI error: {exc}"
+            detail=f"Groq AI error: {exc}"
         )
 
 
