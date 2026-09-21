@@ -723,11 +723,15 @@ async def diagnose(
                 ),
                 prompt,
             ],
-            config=types.GenerateContentConfig(
-                system_instruction=SYSTEM,
-                temperature=0.2,
-                max_output_tokens=700,
-            ),
+                            config=types.GenerateContentConfig(
+                    system_instruction=SYSTEM,
+                    temperature=0.2,
+                    max_output_tokens=4096,
+                    thinking_config=types.ThinkingConfig(
+                        thinking_budget=0
+                    )
+                ),
+
         )
 
         answer = (
