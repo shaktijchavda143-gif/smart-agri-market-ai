@@ -1,25 +1,22 @@
-# -*- coding: utf-8 -*-
-"""Smart Agri-Market AI Backend - Version 10."""
-
 import os
-import html
-import json
 import re
-import time
+import html
+import base64
 import importlib.util
 import urllib.parse
 import urllib.request
-import urllib.error
 import xml.etree.ElementTree as ET
 
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
-from typing import Any, Optional
+from typing import Any
 
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, File, Form, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+
 from openai import OpenAI
+
 from google import genai
 from google.genai import types
 
@@ -28,33 +25,34 @@ from google.genai import types
 # APP CONFIG
 # ============================================================
 
-APP_VERSION = "10.1 Android API Bridge"
+APP_VERSION = "10.2 Android API Bridge - NEWS FIX"
 
-GROQ_MODEL = (
-    os.getenv("GROQ_MODEL", "openai/gpt-oss-20b").strip()
-    or "openai/gpt-oss-20b"
+GROQ_MODEL = os.getenv(
+    "GROQ_MODEL",
+    "openai/gpt-oss-20b",
 )
 
-VISION_MODEL = (
-    os.getenv("VISION_MODEL", "gemini-2.5-flash").strip()
-    or "gemini-2.5-flash"
+VISION_MODEL = os.getenv(
+    "GEMINI_VISION_MODEL",
+    "gemini-2.5-flash",
 )
 
-NEWS_TIMEOUT = max(3, int(os.getenv("NEWS_TIMEOUT", "8")))
-NEWS_RETRIES = max(0, min(int(os.getenv("NEWS_RETRIES", "1")), 3))
-NEWS_MAX_AGE_HOURS = 48
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
-NEWS_USER_AGENT = "SmartAgriMarketAI/10.1"
+MANDI_API_URL = os.getenv("MANDI_API_URL", "")
+MANDI_API_KEY = os.getenv("MANDI_API_KEY", "")
 
 
 # ============================================================
-# FASTAPI APP
+# FASTAPI
 # ============================================================
 
 app = FastAPI(
-    title="Smart Agri Market AI Backend",
+    title="Smart Agri-Market AI",
     version=APP_VERSION,
 )
+
 
 app.add_middleware(
     CORSMiddleware,
@@ -66,45 +64,57 @@ app.add_middleware(
 
 
 # ============================================================
-# SMART AGRI AGENT IMPORT
+# SMART AGRI AGENT
 # ============================================================
 
-_agent = None
+AGENT = None
 
 try:
     agent_path = os.path.join(
         os.path.dirname(__file__),
-        "smart_agri_agent.py"
+        "smart_agri_agent.py",
     )
 
-    spec = importlib.util.spec_from_file_location(
-        "smart_agri_agent",
-        agent_path
-    )
+    if os.path.exists(agent_path):
+        spec = importlib.util.spec_from_file_location(
+            "smart_agri_agent",
+            agent_path,
+        )
 
-    if spec and spec.loader:
-        _agent = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(_agent)
+        if spec and spec.loader:
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            AGENT = module
 
-except Exception as exc:
-    print(f"Agent import warning: {exc}")
+except Exception:
+    AGENT = None
 
 
 # ============================================================
 # SYSTEM PROMPT
 # ============================================================
 
-SYSTEM = (
-    "તમે Smart Agri-Market AI ગુજરાતી ખેડૂત સહાયક છો. "
-    "જવાબ સરળ, વ્યવહારુ અને ખેડૂતના સંદર્ભ મુજબ આપો. "
-    "પાક, સિંચાઈ, પોષણ, રોગ-જીવાત, હવામાન અને બજાર અંગે માર્ગદર્શન આપો. "
-    "ચોક્કસ pesticide dose અથવા નિશ્ચિત રોગનિદાન માટે સ્થાનિક કૃષિ "
-    "નિષ્ણાત/KVK/લેબ ચકાસણી જરૂરી હોવાનું જણાવો."
-)
+SYSTEM = """
+તમે Smart Agri-Market AI ના ગુજરાતી કૃષિ સહાયક છો.
+
+જવાબ સરળ, સ્પષ્ટ અને ખેડૂત માટે ઉપયોગી ગુજરાતીમાં આપો.
+
+જ્યારે પાક, રોગ, જીવાત, દવા, ખાતર અથવા ખેતી વિશે પૂછવામાં આવે:
+- પાકનું નામ સ્પષ્ટ કરો.
+- સમસ્યા/લક્ષણ સમજાવો.
+- શક્ય કારણ જણાવો.
+- વ્યવહારુ ઉપાય આપો.
+- દવા/કૃષિ રસાયણની સલાહ આપતી વખતે label મુજબ ઉપયોગ અને સ્થાનિક કૃષિ અધિકારીની સલાહ લેવાની નોંધ આપો.
+- ખોટી ખાતરી ન આપો.
+- ફોટો પરથી diagnosis હોય તો શું દેખાય છે અને શું ખાતરીથી કહી શકાય નહીં તે સ્પષ્ટ કરો.
+
+જવાબ અધૂરો ન રાખો.
+પૂર્ણ અને વાંચી શકાય તેવો જવાબ આપો.
+"""
 
 
 # ============================================================
-# REQUEST MODEL
+# MODELS
 # ============================================================
 
 class Ask(BaseModel):
@@ -113,44 +123,102 @@ class Ask(BaseModel):
 
 
 # ============================================================
-# GENERAL HELPERS
+# COMMON HELPERS
 # ============================================================
 
 def now_local_string() -> str:
-    return datetime.now().astimezone().strftime(
-        "%d-%m-%Y %H:%M"
-    )
+    """
+    Render server time may be UTC.
+    Keep API timestamp predictable.
+    """
+    now = datetime.now(timezone.utc)
+
+    return now.strftime("%d-%m-%Y %H:%M")
 
 
-def norm(text: str) -> str:
+def norm(value: Any) -> str:
+    if value is None:
+        return ""
+
     return " ".join(
-        (text or "")
+        str(value)
         .strip()
         .lower()
-        .replace("-", " ")
         .split()
     )
 
 
-def clean_html(value: str) -> str:
-    text = html.unescape(
-        re.sub(r"<[^>]+>", " ", value or "")
+def clean_html(value: Any) -> str:
+    if not value:
+        return ""
+
+    text = html.unescape(str(value))
+
+    text = re.sub(
+        r"<script.*?>.*?</script>",
+        " ",
+        text,
+        flags=re.I | re.S,
     )
 
-    return re.sub(
+    text = re.sub(
+        r"<style.*?>.*?</style>",
+        " ",
+        text,
+        flags=re.I | re.S,
+    )
+
+    text = re.sub(
+        r"<[^>]+>",
+        " ",
+        text,
+    )
+
+    text = re.sub(
         r"\s+",
         " ",
-        text
-    ).strip()
+        text,
+    )
+
+    return text.strip()
 
 
-def parse_rss_datetime(value: str) -> Optional[datetime]:
+# ============================================================
+# RSS DATE PARSER
+# ============================================================
+
+def parse_rss_datetime(value: Any) -> datetime | None:
+    """
+    Handles normal RSS RFC-822 dates and several common variants.
+    Always returns timezone-aware UTC datetime.
+    """
 
     if not value:
         return None
 
+    raw = str(value).strip()
+
+    if not raw:
+        return None
+
+    # Standard RSS / RFC822
     try:
-        dt = parsedate_to_datetime(value.strip())
+        dt = parsedate_to_datetime(raw)
+
+        if dt is not None:
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+
+            return dt.astimezone(timezone.utc)
+
+    except Exception:
+        pass
+
+    # ISO format fallback
+    try:
+        iso = raw.replace("Z", "+00:00")
+
+        dt = datetime.fromisoformat(iso)
 
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
@@ -160,549 +228,604 @@ def parse_rss_datetime(value: str) -> Optional[datetime]:
     except Exception:
         pass
 
-    try:
-        dt = datetime.fromisoformat(
-            value.strip().replace("Z", "+00:00")
-        )
+    # Manual formats
+    formats = [
+        "%a, %d %b %Y %H:%M:%S %z",
+        "%a, %d %b %Y %H:%M %z",
+        "%d %b %Y %H:%M:%S %z",
+        "%d %b %Y %H:%M %z",
+    ]
 
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
+    for fmt in formats:
+        try:
+            dt = datetime.strptime(raw, fmt)
 
-        return dt.astimezone(timezone.utc)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
 
-    except Exception:
-        return None
+            return dt.astimezone(timezone.utc)
+
+        except Exception:
+            continue
+
+    return None
 
 
-def rss_datetime(value: str) -> str:
-
+def rss_datetime(value: Any) -> str:
     dt = parse_rss_datetime(value)
 
-    if not dt:
-        return "સમય ઉપલબ્ધ નથી"
+    if dt is None:
+        return ""
 
-    return dt.astimezone().strftime(
-        "%d-%m-%Y %H:%M"
-    )
+    return dt.strftime("%d-%m-%Y %H:%M")
 
+
+# ============================================================
+# NEWS FILTERS
+# ============================================================
 
 def filter_last_48_hours(
-    items: list[dict[str, Any]],
-    hours: int = NEWS_MAX_AGE_HOURS,
-) -> list[dict[str, Any]]:
+    items: list[dict],
+    hours: int = 48,
+) -> list[dict]:
 
-    cutoff = (
-        datetime.now(timezone.utc)
-        - timedelta(hours=hours)
-    )
+    now = datetime.now(timezone.utc)
 
-    return [
-        item
-        for item in items
-        if isinstance(
-            item.get("_published_dt"),
-            datetime
-        )
-        and item["_published_dt"] >= cutoff
-    ]
+    cutoff = now - timedelta(hours=hours)
+
+    result: list[dict] = []
+
+    for item in items:
+        dt = item.get("_published_dt")
+
+        if not isinstance(dt, datetime):
+            continue
+
+        if cutoff <= dt <= now + timedelta(minutes=10):
+            result.append(item)
+
+    return result
 
 
 def remove_duplicates(
-    items: list[dict[str, Any]]
-) -> list[dict[str, Any]]:
+    items: list[dict],
+) -> list[dict]:
 
-    links = set()
-    headlines = set()
-    category_headlines = set()
-
-    result = []
+    result: list[dict] = []
+    seen: set[str] = set()
 
     for item in items:
 
-        link = norm(
-            str(item.get("url", ""))
-        )
+        title = norm(item.get("title"))
+        link = norm(item.get("link"))
 
-        headline = norm(
-            str(item.get("headline", ""))
-        )
+        key = title or link
 
-        category = norm(
-            str(item.get("category", ""))
-        )
-
-        category_headline = (
-            f"{category}|{headline}"
-        )
-
-        if link and link in links:
+        if not key:
             continue
 
-        if headline and headline in headlines:
+        if key in seen:
             continue
 
-        if category_headline in category_headlines:
-            continue
-
-        if link:
-            links.add(link)
-
-        if headline:
-            headlines.add(headline)
-
-        category_headlines.add(
-            category_headline
-        )
-
+        seen.add(key)
         result.append(item)
 
     return result
 
 
 def sort_latest(
-    items: list[dict[str, Any]]
-) -> list[dict[str, Any]]:
-
-    minimum = datetime.min.replace(
-        tzinfo=timezone.utc
-    )
+    items: list[dict],
+) -> list[dict]:
 
     return sorted(
         items,
-        key=lambda x: x.get(
-            "_published_dt",
-            minimum
+        key=lambda item: (
+            item.get("_published_dt")
+            or datetime.min.replace(tzinfo=timezone.utc)
         ),
         reverse=True,
     )
 
 
-def public_news_item(
-    item: dict[str, Any]
-) -> dict[str, Any]:
-
+def public_news_item(item: dict) -> dict:
     return {
-        key: value
-        for key, value in item.items()
-        if not key.startswith("_")
+        "title": item.get("title", ""),
+        "source": item.get("source", ""),
+        "published_at": item.get("published_at", ""),
+        "link": item.get("link", ""),
+        "category": item.get("category", ""),
     }
 
 
 # ============================================================
-# NETWORK FETCH
+# HTTP FETCH
 # ============================================================
 
 def _fetch_url(
     url: str,
-    timeout: int = NEWS_TIMEOUT,
-    retries: int = NEWS_RETRIES,
+    timeout: int = 15,
+    retries: int = 2,
 ) -> bytes:
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 "
+            "(Linux; Android 10) "
+            "AppleWebKit/537.36 "
+            "Chrome/120 Safari/537.36"
+        ),
+        "Accept": (
+            "application/rss+xml, "
+            "application/xml, "
+            "text/xml, "
+            "*/*"
+        ),
+        "Accept-Language": "gu-IN,gu;q=0.9,en-IN;q=0.8,en;q=0.7",
+    }
 
     last_error = None
 
-    for attempt in range(retries + 1):
+    for _ in range(max(1, retries)):
 
         try:
-
             request = urllib.request.Request(
                 url,
-                headers={
-                    "User-Agent": NEWS_USER_AGENT,
-                    "Accept": (
-                        "application/rss+xml, "
-                        "application/xml, "
-                        "text/xml, */*"
-                    ),
-                },
+                headers=headers,
             )
 
             with urllib.request.urlopen(
                 request,
-                timeout=timeout
+                timeout=timeout,
             ) as response:
 
                 return response.read()
 
-        except (
-            urllib.error.URLError,
-            urllib.error.HTTPError,
-            TimeoutError,
-            OSError,
-        ) as exc:
-
+        except Exception as exc:
             last_error = exc
 
-            if attempt < retries:
-                time.sleep(
-                    0.35 * (attempt + 1)
-                )
-
     raise RuntimeError(
-        f"RSS request failed: {last_error}"
+        f"RSS fetch failed: {last_error}"
     )
 
 
 # ============================================================
-# GOOGLE NEWS RSS ENGINE
+# GOOGLE NEWS RSS
 # ============================================================
 
-def fetch_google_news(
-    category: str,
+def build_google_news_url(
     query: str,
-    fallback_source: str,
-    limit: int = 10,
-) -> list[dict[str, Any]]:
+) -> str:
 
-    url = (
+    # when:2d forces Google News search toward the recent window.
+    final_query = f"{query} when:2d"
+
+    params = {
+        "q": final_query,
+        "hl": "gu",
+        "gl": "IN",
+        "ceid": "IN:gu",
+    }
+
+    return (
         "https://news.google.com/rss/search?"
         + urllib.parse.urlencode(
-            {
-                "q": query,
-                "hl": "gu",
-                "gl": "IN",
-                "ceid": "IN:gu",
-            }
+            params,
+            quote_via=urllib.parse.quote,
         )
     )
 
-    raw = _fetch_url(url)
+
+def fetch_google_news(
+    query: str,
+    category: str = "",
+    timeout: int = 15,
+) -> tuple[list[dict], str | None]:
+
+    url = build_google_news_url(query)
 
     try:
-        root = ET.fromstring(raw)
+        data = _fetch_url(
+            url,
+            timeout=timeout,
+            retries=2,
+        )
 
-    except ET.ParseError as exc:
-        raise RuntimeError(
-            f"Invalid RSS XML: {exc}"
-        ) from exc
+        root = ET.fromstring(data)
 
-    result = []
+    except Exception as exc:
+        return [], str(exc)
 
-    channel = root.find("channel")
+    items: list[dict] = []
 
-    if channel is None:
-        return result
-
-    rss_items = channel.findall("item")
-
-    for item in rss_items[:limit]:
+    for xml_item in root.findall(".//item"):
 
         title = clean_html(
-            item.findtext(
-                "title",
-                ""
-            )
+            xml_item.findtext("title")
         )
 
         link = (
-            item.findtext(
-                "link",
-                ""
-            )
+            xml_item.findtext("link")
             or ""
         ).strip()
 
         description = clean_html(
-            item.findtext(
-                "description",
-                ""
-            )
+            xml_item.findtext("description")
         )
 
         pub_raw = (
-            item.findtext(
-                "pubDate",
-                ""
-            )
+            xml_item.findtext("pubDate")
             or ""
         ).strip()
+
+        source_node = xml_item.find("source")
+
+        source = ""
+
+        if source_node is not None:
+            source = clean_html(
+                source_node.text
+                or ""
+            )
+
+        if not source:
+            # Google News often puts publisher after " - "
+            if " - " in title:
+                source = title.rsplit(
+                    " - ",
+                    1,
+                )[-1].strip()
+
+        # Remove publisher suffix from title.
+        clean_title = title
+
+        if source and clean_title.endswith(
+            f" - {source}"
+        ):
+            clean_title = clean_title[
+                : -(len(source) + 3)
+            ].strip()
 
         published_dt = parse_rss_datetime(
             pub_raw
         )
 
-        if not title or not link:
+        if not clean_title:
             continue
 
-        if published_dt is None:
+        if not link:
             continue
 
-        source_el = item.find("source")
-
-        source = ""
-
-        if source_el is not None:
-            source = clean_html(
-                source_el.text or ""
-            )
-
-        source = (
-            source
-            or fallback_source
-        )
-
-        summary = (
-            description
-            or f"{source} તરફથી સંબંધિત તાજો અહેવાલ."
-        )
-
-        if len(summary) > 400:
-            summary = (
-                summary[:397]
-                .rsplit(" ", 1)[0]
-                + "..."
-            )
-
-        result.append(
+        items.append(
             {
+                "title": clean_title,
+                "source": source or "Google News",
+                "published_at": rss_datetime(pub_raw),
+                "link": link,
+                "description": description,
                 "category": category,
-                "headline": title,
-                "summary": summary,
-                "published": (
-                    published_dt
-                    .astimezone()
-                    .strftime(
-                        "%d-%m-%Y %H:%M"
-                    )
-                ),
-                "source": source,
-                "url": link,
                 "_published_dt": published_dt,
             }
         )
 
-    return result
+    return items, None
 
+
+# ============================================================
+# MULTI-QUERY NEWS ENGINE
+# ============================================================
+
+def fetch_news_from_queries(
+    queries: list[str],
+    category: str,
+    max_items: int = 20,
+) -> tuple[list[dict], list[str]]:
+
+    all_items: list[dict] = []
+    errors: list[str] = []
+
+    for query in queries:
+
+        items, error = fetch_google_news(
+            query=query,
+            category=category,
+        )
+
+        if error:
+            errors.append(
+                f"{query}: {error}"
+            )
+
+        all_items.extend(items)
+
+    # First deduplicate.
+    all_items = remove_duplicates(
+        all_items
+    )
+
+    # Then apply the strict 48-hour requirement.
+    all_items = filter_last_48_hours(
+        all_items,
+        hours=48,
+    )
+
+    # Latest first.
+    all_items = sort_latest(
+        all_items
+    )
+
+    return all_items[:max_items], errors
+
+
+# ============================================================
+# NEWS RESPONSE
+# ============================================================
 
 def build_news_response(
-    items: list[dict[str, Any]],
-    errors: list[str],
-    limit: int = 24,
-) -> dict[str, Any]:
+    items: list[dict],
+    errors: list[str] | None = None,
+    crop: str = "",
+) -> dict:
 
-    items = sort_latest(
-        remove_duplicates(
-            filter_last_48_hours(items)
-        )
-    )
+    errors = errors or []
 
     public_items = [
         public_news_item(item)
-        for item in items[:limit]
+        for item in items
     ]
 
     return {
         "ok": True,
         "updated_at": now_local_string(),
         "items": public_items,
-        "live": bool(public_items),
-        "source": (
-            "Google News RSS / original publishers"
-        ),
-        "errors": errors[:6],
+        "live": False,
+        "source": "Google News RSS / original publishers",
+        "errors": errors,
+        "crop": crop,
     }
+
+
+# ============================================================
+# AGRICULTURE NEWS QUERIES
+# ============================================================
+
+AGRI_GENERAL_QUERIES = [
+    "કૃષિ સમાચાર ગુજરાત",
+    "ખેડૂત સમાચાર ગુજરાત",
+    "ખેડૂત યોજના ગુજરાત",
+    "ખેડૂત સહાય ગુજરાત",
+    "કૃષિ યોજના ગુજરાત",
+    "agriculture Gujarat farmers",
+    "Gujarat farmers agriculture",
+]
 
 
 # ============================================================
 # WEATHER NEWS
 # ============================================================
 
-WEATHER_FEEDS = [
-
+WEATHER_QUERIES = [
     (
         "🌧️ IMD Gujarat",
-        "IMD Gujarat weather",
-        "IMD Gujarat",
+        [
+            "IMD Gujarat weather",
+            "IMD Gujarat rainfall forecast",
+            "હવામાન વિભાગ ગુજરાત વરસાદ આગાહી",
+        ],
     ),
-
     (
         "☀️ Ambalal Patel",
-        "આંબાલાલ પટેલ હવામાન ગુજરાત",
-        "આંબાલાલ પટેલ",
+        [
+            "આંબાલાલ પટેલ હવામાન ગુજરાત",
+            "Ambalal Patel weather Gujarat",
+        ],
     ),
-
     (
         "🌦️ Paresh Goswami",
-        "પરેશ ગૌસ્વામી હવામાન ગુજરાત",
-        "પરેશ ગૌસ્વામી",
+        [
+            "પરેશ ગૌસ્વામી હવામાન ગુજરાત",
+            "Paresh Goswami weather Gujarat",
+        ],
     ),
-
     (
         "📰 Gujarat Weather",
-        "ગુજરાત હવામાન વરસાદ આગાહી",
-        "ગુજરાત હવામાન સમાચાર",
+        [
+            "ગુજરાત હવામાન વરસાદ આગાહી",
+            "Gujarat weather forecast farmers",
+            "Gujarat rainfall forecast",
+        ],
     ),
 ]
 
 
-def _collect_news(
-    feeds: list[tuple[str, str, str]],
-    limit_each: int = 10,
-):
-
-    items = []
-    errors = []
-
-    for category, query, fallback in feeds:
-
-        try:
-
-            items.extend(
-                fetch_google_news(
-                    category,
-                    query,
-                    fallback,
-                    limit_each,
-                )
-            )
-
-        except Exception as exc:
-
-            errors.append(
-                f"{category}: {str(exc)[:180]}"
-            )
-
-    return items, errors
-
-
-@app.get("/api/v1/weather/news")
-def weather_news():
-
-    items, errors = _collect_news(
-        WEATHER_FEEDS
-    )
-
-    return build_news_response(
-        items,
-        errors,
-        20,
-    )
-
-
 # ============================================================
-# AGRICULTURE NEWS
+# AGRICULTURE CATEGORIES
 # ============================================================
 
-AGRI_FEEDS = [
-
+AGRI_CATEGORIES = [
     (
         "🌱 કૃષિ સમાચાર",
-        "કૃષિ સમાચાર ગુજરાત ખેડૂત ખેતી પાક",
-        "કૃષિ સમાચાર",
+        [
+            "કૃષિ સમાચાર ગુજરાત",
+            "ખેડૂત સમાચાર ગુજરાત",
+            "agriculture Gujarat farmers",
+        ],
     ),
-
     (
         "🦠 રોગ-જીવાત એલર્ટ",
-        "ગુજરાત પાક રોગ જીવાત ખેડૂત એલર્ટ",
-        "કૃષિ રોગ જીવાત સમાચાર",
+        [
+            "પાક રોગ જીવાત ગુજરાત",
+            "કપાસ રોગ જીવાત ગુજરાત",
+            "મગફળી રોગ જીવાત ગુજરાત",
+            "crop disease pest Gujarat",
+        ],
     ),
-
     (
         "🏛 સરકારની કૃષિ યોજનાઓ",
-        "ગુજરાત સરકાર ખેડૂત યોજના સબસિડી સહાય કૃષિ",
-        "સરકારની કૃષિ યોજના",
+        [
+            "ખેડૂત યોજના ગુજરાત",
+            "ખેડૂત સહાય ગુજરાત",
+            "કૃષિ યોજના ગુજરાત સરકાર",
+            "Gujarat farmer scheme subsidy",
+        ],
     ),
-
     (
         "🚜 કૃષિ ટેક્નોલોજી",
-        "ગુજરાત કૃષિ ટેક્નોલોજી ખેડૂત નવી ટેકનોલોજી",
-        "કૃષિ ટેક્નોલોજી",
+        [
+            "કૃષિ ટેક્નોલોજી ગુજરાત",
+            "ખેતી આધુનિક ટેક્નોલોજી",
+            "agriculture technology Gujarat farmers",
+        ],
     ),
 ]
 
 
-@app.get("/api/v1/agri/news")
-def agriculture_news():
-
-    items, errors = _collect_news(
-        AGRI_FEEDS
-    )
-
-    return build_news_response(
-        items,
-        errors,
-        24,
-    )
-
-
 # ============================================================
-# LEGACY /api/v1/news
-# ============================================================
-#
-# IMPORTANT:
-# Existing Android application is calling:
-#
-# GET /api/v1/news?crop=મગફળી
-#
-# Version 10 accidentally removed this route.
-# Therefore Android received HTTP 404.
-#
-# This endpoint is retained for backward compatibility.
+# LEGACY / ANDROID NEWS ENDPOINT
 # ============================================================
 
 @app.get("/api/v1/news")
 def legacy_news(
-    crop: str = ""
+    crop: str = "",
 ):
+    """
+    IMPORTANT:
+    Existing Android app calls this endpoint.
 
-    crop = (crop or "").strip()
+    Do not remove or rename it.
+    """
+
+    crop = crop.strip()
+
+    queries: list[str] = []
 
     if crop:
+        queries.extend(
+            [
+                f"{crop} ગુજરાત ખેતી",
+                f"{crop} ખેડૂત ગુજરાત",
+                f"{crop} બજાર ભાવ ગુજરાત",
+                f"{crop} agriculture Gujarat",
+                f"{crop} farmers Gujarat",
+            ]
+        )
 
-        feeds = [
+    # General fallback queries are important because
+    # Google News may not return enough results for a
+    # specific Gujarati crop query.
+    queries.extend(
+        AGRI_GENERAL_QUERIES
+    )
 
-            (
-                f"🌱 {crop} સમાચાર",
-                f"{crop} ગુજરાત કૃષિ સમાચાર ખેડૂત",
-                "Google News / કૃષિ સમાચાર",
-            ),
-
-            (
-                "🌱 કૃષિ સમાચાર",
-                "કૃષિ સમાચાર ગુજરાત ખેડૂત ખેતી પાક",
-                "કૃષિ સમાચાર",
-            ),
-
-            (
-                "🏛 સરકારની કૃષિ યોજનાઓ",
-                "ગુજરાત સરકાર ખેડૂત યોજના સબસિડી સહાય કૃષિ",
-                "સરકારની કૃષિ યોજના",
-            ),
-        ]
-
-    else:
-
-        feeds = AGRI_FEEDS
-
-    items, errors = _collect_news(
-        feeds
+    items, errors = fetch_news_from_queries(
+        queries=queries,
+        category="કૃષિ સમાચાર",
+        max_items=20,
     )
 
     response = build_news_response(
-        items,
-        errors,
-        20,
+        items=items,
+        errors=errors,
+        crop=crop,
     )
 
-    # Android compatibility fields
-    response["crop"] = crop
     response["category"] = "કૃષિ સમાચાર"
 
     return response
 
 
 # ============================================================
-# MARKET PRICE HELPERS
+# WEATHER NEWS ENDPOINT
 # ============================================================
 
-PRICE_NUMBER = (
-    r"(?:₹\s*)?"
-    r"\d{2,7}"
-    r"(?:[.,]\d{1,2})?"
-)
+@app.get("/api/v1/weather/news")
+def weather_news():
+
+    all_items: list[dict] = []
+    errors: list[str] = []
+
+    for category, queries in WEATHER_QUERIES:
+
+        items, query_errors = fetch_news_from_queries(
+            queries=queries,
+            category=category,
+            max_items=10,
+        )
+
+        all_items.extend(items)
+        errors.extend(query_errors)
+
+    all_items = remove_duplicates(
+        all_items
+    )
+
+    all_items = sort_latest(
+        all_items
+    )
+
+    all_items = all_items[:30]
+
+    return build_news_response(
+        items=all_items,
+        errors=errors,
+    )
+
+
+# ============================================================
+# AGRICULTURE NEWS ENDPOINT
+# ============================================================
+
+@app.get("/api/v1/agri/news")
+def agriculture_news():
+
+    all_items: list[dict] = []
+    errors: list[str] = []
+
+    for category, queries in AGRI_CATEGORIES:
+
+        items, query_errors = fetch_news_from_queries(
+            queries=queries,
+            category=category,
+            max_items=10,
+        )
+
+        all_items.extend(items)
+        errors.extend(query_errors)
+
+    all_items = remove_duplicates(
+        all_items
+    )
+
+    all_items = sort_latest(
+        all_items
+    )
+
+    all_items = all_items[:40]
+
+    return build_news_response(
+        items=all_items,
+        errors=errors,
+    )
+
+
+# ============================================================
+# MARKET PRICE PARSER
+# ============================================================
+
+PRICE_NUMBER = r"(?:₹\s*)?\d+(?:,\d+)*(?:\.\d+)?"
+
+PRICE_RANGE_PATTERNS = [
+    re.compile(
+        rf"({PRICE_NUMBER})\s*[-–—]\s*({PRICE_NUMBER})"
+    ),
+    re.compile(
+        rf"({PRICE_NUMBER})\s*(?:થી|to)\s*({PRICE_NUMBER})",
+        re.I,
+    ),
+]
 
 
 def _price_to_string(
-    value: str
+    value: str,
 ) -> str:
 
     value = (
@@ -713,7 +836,6 @@ def _price_to_string(
     )
 
     try:
-
         number = float(value)
 
         if number.is_integer():
@@ -722,691 +844,390 @@ def _price_to_string(
         return str(number)
 
     except Exception:
-
         return value
 
 
 def _extract_price_range(
-    text: str
-) -> Optional[tuple[str, str]]:
+    text: str,
+) -> tuple[str, str] | None:
 
-    patterns = [
+    for pattern in PRICE_RANGE_PATTERNS:
 
-        rf"({PRICE_NUMBER})\s*[-–—]\s*({PRICE_NUMBER})",
-
-        rf"({PRICE_NUMBER})\s*(?:થી|to)\s*({PRICE_NUMBER})",
-
-        rf"₹?\s*({PRICE_NUMBER})\s+₹?\s*({PRICE_NUMBER})",
-    ]
-
-    for pattern in patterns:
-
-        match = re.search(
-            pattern,
-            text,
-            re.IGNORECASE,
-        )
+        match = pattern.search(text)
 
         if match:
-
-            first = _price_to_string(
-                match.group(1)
+            return (
+                _price_to_string(
+                    match.group(1)
+                ),
+                _price_to_string(
+                    match.group(2)
+                ),
             )
 
-            second = _price_to_string(
-                match.group(2)
-            )
+    # Adjacent rupee values:
+    # ₹1180 ₹1410
+    rupees = re.findall(
+        r"₹\s*(\d[\d,]*(?:\.\d+)?)",
+        text,
+    )
 
-            try:
-
-                if float(first) > float(second):
-                    first, second = second, first
-
-            except Exception:
-                pass
-
-            return first, second
+    if len(rupees) >= 2:
+        return (
+            _price_to_string(
+                rupees[0]
+            ),
+            _price_to_string(
+                rupees[1]
+            ),
+        )
 
     return None
 
 
 def _extract_single_prices(
-    text: str
-) -> Optional[tuple[str, str]]:
+    text: str,
+) -> tuple[str, str] | None:
 
-    pattern = (
-        rf"(?:minimum|min|લઘુત્તમ|ન્યૂનતમ)"
-        rf"\s*[:\-]?\s*₹?\s*({PRICE_NUMBER})"
-        rf".*?"
-        rf"(?:maximum|max|મહત્તમ)"
-        rf"\s*[:\-]?\s*₹?\s*({PRICE_NUMBER})"
-    )
+    min_patterns = [
+        rf"(?:min|minimum|ન્યૂનતમ|લઘુતમ)\s*[:\-]?\s*{PRICE_NUMBER}",
+        rf"(?:મિનિમમ)\s*[:\-]?\s*{PRICE_NUMBER}",
+    ]
 
-    match = re.search(
-        pattern,
-        text,
-        re.IGNORECASE | re.DOTALL,
-    )
+    max_patterns = [
+        rf"(?:max|maximum|મહત્તમ)\s*[:\-]?\s*{PRICE_NUMBER}",
+        rf"(?:મેક્સિમમ)\s*[:\-]?\s*{PRICE_NUMBER}",
+    ]
 
-    if not match:
-        return None
+    min_value = None
+    max_value = None
 
-    return (
-        _price_to_string(
-            match.group(1)
-        ),
-        _price_to_string(
-            match.group(2)
-        ),
-    )
+    for pattern in min_patterns:
+
+        match = re.search(
+            pattern,
+            text,
+            flags=re.I,
+        )
+
+        if match:
+            number = re.search(
+                PRICE_NUMBER,
+                match.group(0),
+            )
+
+            if number:
+                min_value = _price_to_string(
+                    number.group(0)
+                )
+                break
+
+    for pattern in max_patterns:
+
+        match = re.search(
+            pattern,
+            text,
+            flags=re.I,
+        )
+
+        if match:
+            number = re.search(
+                PRICE_NUMBER,
+                match.group(0),
+            )
+
+            if number:
+                max_value = _price_to_string(
+                    number.group(0)
+                )
+                break
+
+    if min_value and max_value:
+        return min_value, max_value
+
+    return None
 
 
 def _detect_crop(
-    text: str
-) -> Optional[str]:
+    text: str,
+) -> str:
 
     crops = {
-
         "મગફળી": [
             "મગફળી",
             "groundnut",
             "peanut",
         ],
-
         "કપાસ": [
             "કપાસ",
             "cotton",
         ],
-
         "જીરૂ": [
             "જીરૂ",
             "જીરું",
             "cumin",
         ],
-
         "ડુંગળી": [
             "ડુંગળી",
             "onion",
         ],
-
         "બટાકા": [
             "બટાકા",
             "potato",
         ],
-
-        "લીંબુ": [
-            "લીંબુ",
-            "lemon",
+        "ટામેટા": [
+            "ટામેટા",
+            "tomato",
         ],
-
         "પપૈયા": [
             "પપૈયા",
             "papaya",
         ],
-
-        "ઘઉં": [
-            "ઘઉં",
-            "wheat",
-        ],
-
-        "બાજરી": [
-            "બાજરી",
-            "bajra",
-            "pearl millet",
-        ],
-
-        "ચણા": [
-            "ચણા",
-            "gram",
-            "chickpea",
-        ],
-
-        "ધાણા": [
-            "ધાણા",
-            "coriander",
-        ],
-
-        "તલ": [
-            "તલ",
-            "sesame",
+        "લીંબુ": [
+            "લીંબુ",
+            "lemon",
         ],
     }
 
-    lower = text.lower()
+    normalized = norm(text)
 
     for crop, aliases in crops.items():
 
-        if any(
-            alias.lower() in lower
-            for alias in aliases
-        ):
-            return crop
+        for alias in aliases:
 
-    return None
+            if norm(alias) in normalized:
+                return crop
+
+    return ""
 
 
 def _detect_apmc(
-    text: str
-) -> Optional[str]:
+    text: str,
+) -> str:
 
-    known = [
-        "રાજકોટ",
-        "ગોંડલ",
-        "જામનગર",
-        "જૂનાગઢ",
-        "મોરબી",
-        "અમદાવાદ",
-        "મહેસાણા",
-        "ઉંઝા",
-        "વિસનગર",
-        "ધોરાજી",
-        "ધ્રોલ",
-        "ભાવનગર",
-        "સુરત",
-        "નવસારી",
-        "વડોદરા",
-        "ગાંધીનગર",
-        "પોરબંદર",
-        "અમરેલી",
-        "ધ્રાંગધ્રા",
+    apmcs = [
+        "રાજકોટ APMC",
+        "જામનગર APMC",
+        "જુનાગઢ APMC",
+        "જૂનાગઢ APMC",
+        "ગોંડલ APMC",
+        "મહુવા APMC",
+        "ગોંડલ માર્કેટ",
+        "રાજકોટ માર્કેટ",
+        "જામનગર માર્કેટ",
+        "જૂનાગઢ માર્કેટ",
+        "જુનાગઢ માર્કેટ",
+        "Navsari APMC",
+        "Rajkot APMC",
+        "Gondal APMC",
+        "Junagadh APMC",
+        "Jamnagar APMC",
     ]
 
-    for market in known:
+    for apmc in apmcs:
 
-        if market in text:
-            return market
+        if norm(apmc) in norm(text):
+            return apmc
 
-    patterns = [
+    match = re.search(
+        r"([A-Za-zÀ-ÿ\u0900-\u097F\u0A80-\u0AFF\s]+APMC)",
+        text,
+        flags=re.I,
+    )
 
-        r"([A-Za-z][A-Za-z\s]{2,40})\s*APMC",
+    if match:
+        return match.group(1).strip()
 
-        r"APMC\s*([A-Za-z][A-Za-z\s]{2,40})",
-    ]
-
-    for pattern in patterns:
-
-        match = re.search(
-            pattern,
-            text,
-            re.IGNORECASE,
-        )
-
-        if match:
-
-            value = clean_html(
-                match.group(1)
-            ).strip()
-
-            if value:
-                return value
-
-    return None
+    return ""
 
 
 def parse_market_prices(
-    items: list[dict[str, Any]]
-) -> list[dict[str, str]]:
+    item: dict,
+) -> list[dict]:
 
-    result = []
-    seen = set()
+    text = " ".join(
+        [
+            item.get("title", ""),
+            item.get("description", ""),
+        ]
+    )
 
-    for item in items:
+    text = clean_html(text)
 
-        text = (
-            f"{item.get('headline', '')} "
-            f"{item.get('summary', '')}"
+    price_range = _extract_price_range(
+        text
+    )
+
+    if price_range is None:
+        price_range = _extract_single_prices(
+            text
         )
 
-        crop = _detect_crop(text)
+    if price_range is None:
+        return []
 
-        if not crop:
-            continue
+    min_price, max_price = price_range
 
-        prices = (
-            _extract_price_range(text)
-            or _extract_single_prices(text)
-        )
+    crop = _detect_crop(text)
 
-        if not prices:
-            continue
+    apmc = _detect_apmc(text)
 
-        apmc = _detect_apmc(text)
+    if not crop:
+        return []
 
-        if not apmc:
-            continue
+    if not apmc:
+        return []
 
-        published_dt = item.get(
-            "_published_dt"
-        )
-
-        if isinstance(
-            published_dt,
-            datetime
-        ):
-
-            date = (
-                published_dt
-                .astimezone()
-                .strftime("%d-%m-%Y")
-            )
-
-        else:
-
-            date = datetime.now().astimezone().strftime(
-                "%d-%m-%Y"
-            )
-
-        row = {
-
-            "date": date,
-
-            "apmc": apmc,
-
+    return [
+        {
+            "date": item.get(
+                "published_at",
+                "",
+            ),
+            "apmc_name": apmc,
             "crop": crop,
-
-            "min_price": prices[0],
-
-            "max_price": prices[1],
+            "min_price": min_price,
+            "max_price": max_price,
+            "source": item.get(
+                "source",
+                "",
+            ),
+            "title": item.get(
+                "title",
+                "",
+            ),
+            "link": item.get(
+                "link",
+                "",
+            ),
         }
-
-        key = tuple(
-            row.values()
-        )
-
-        if key in seen:
-            continue
-
-        seen.add(key)
-
-        result.append(row)
-
-    return result
+    ]
 
 
 # ============================================================
-# OPTIONAL LIVE APMC
+# OPTIONAL LIVE MANDI API
 # ============================================================
 
-MANDI_API_URL = (
-    os.getenv(
-        "MANDI_API_URL",
-        ""
-    ).strip()
-)
-
-MANDI_API_KEY = (
-    os.getenv(
-        "MANDI_API_KEY",
-        ""
-    ).strip()
-)
-
-
-def _first(
-    data: dict[str, Any],
-    keys: tuple[str, ...],
-):
-
-    for key in keys:
-
-        if key in data:
-            return data[key]
-
-    return None
-
-
-def fetch_live_apmc_data():
+def fetch_live_mandi() -> list[dict]:
 
     if not MANDI_API_URL:
         return []
 
-    url = MANDI_API_URL
+    try:
 
-    if MANDI_API_KEY:
+        headers = {
+            "User-Agent": "Smart-Agri-Market-AI/10.2",
+        }
 
-        url += (
-            "&"
-            if "?" in url
-            else "?"
+        if MANDI_API_KEY:
+            headers["X-API-Key"] = MANDI_API_KEY
+
+        request = urllib.request.Request(
+            MANDI_API_URL,
+            headers=headers,
         )
 
-        url += (
-            "api_key="
-            + urllib.parse.quote(
-                MANDI_API_KEY
+        with urllib.request.urlopen(
+            request,
+            timeout=12,
+        ) as response:
+
+            raw = response.read().decode(
+                "utf-8",
+                errors="replace",
             )
-        )
 
-    raw = _fetch_url(
-        url,
-        timeout=10,
-        retries=1,
-    )
+        import json
 
-    payload = json.loads(
-        raw.decode(
-            "utf-8",
-            errors="replace",
-        )
-    )
+        payload = json.loads(raw)
 
-    records = []
+        rows = []
 
-    if isinstance(payload, dict):
+        if isinstance(payload, dict):
 
-        records = (
-            payload.get("records")
-            or payload.get("data")
-            or payload.get("results")
-            or []
-        )
+            for key in (
+                "data",
+                "records",
+                "items",
+                "results",
+            ):
 
-    elif isinstance(payload, list):
+                value = payload.get(key)
 
-        records = payload
+                if isinstance(value, list):
+                    rows = value
+                    break
 
-    if not isinstance(
-        records,
-        list
-    ):
+        elif isinstance(payload, list):
+            rows = payload
+
+        result = []
+
+        for row in rows:
+
+            if not isinstance(row, dict):
+                continue
+
+            result.append(row)
+
+        return result
+
+    except Exception:
         return []
 
-    result = []
-
-    for row in records:
-
-        if not isinstance(
-            row,
-            dict
-        ):
-            continue
-
-        apmc = _first(
-            row,
-            (
-                "apmc",
-                "market",
-                "market_name",
-                "marketName",
-            ),
-        )
-
-        crop = _first(
-            row,
-            (
-                "crop",
-                "commodity",
-                "commodity_name",
-                "commodityName",
-            ),
-        )
-
-        minimum = _first(
-            row,
-            (
-                "min_price",
-                "minPrice",
-                "minimum_price",
-            ),
-        )
-
-        maximum = _first(
-            row,
-            (
-                "max_price",
-                "maxPrice",
-                "maximum_price",
-            ),
-        )
-
-        date = _first(
-            row,
-            (
-                "date",
-                "arrival_date",
-                "arrivalDate",
-                "trade_date",
-            ),
-        )
-
-        if (
-            apmc is None
-            or crop is None
-            or minimum is None
-            or maximum is None
-        ):
-            continue
-
-        result.append(
-            {
-                "date": str(
-                    date
-                    or datetime.now()
-                    .astimezone()
-                    .strftime(
-                        "%d-%m-%Y"
-                    )
-                ),
-
-                "apmc": str(apmc),
-
-                "crop": str(crop),
-
-                "min_price": str(minimum),
-
-                "max_price": str(maximum),
-            }
-        )
-
-    return result
-
 
 # ============================================================
-# MARKET NEWS
+# MARKET NEWS ENDPOINT
 # ============================================================
-
-MARKET_FEEDS = [
-
-    (
-        "APMC Gujarat",
-        "APMC Gujarat બજાર ભાવ",
-        "APMC Gujarat",
-    ),
-
-    (
-        "Rajkot APMC",
-        "રાજકોટ APMC બજાર ભાવ",
-        "Rajkot APMC",
-    ),
-
-    (
-        "Gujarat Market Prices",
-        "ગુજરાત બજાર ભાવ",
-        "ગુજરાત બજાર ભાવ",
-    ),
-
-    (
-        "Groundnut Market Prices",
-        "મગફળી બજાર ભાવ",
-        "મગફળી બજાર ભાવ",
-    ),
-
-    (
-        "Cotton Market Prices",
-        "કપાસ બજાર ભાવ",
-        "કપાસ બજાર ભાવ",
-    ),
-
-    (
-        "Cumin Market Prices",
-        "જીરૂ બજાર ભાવ",
-        "જીરૂ બજાર ભાવ",
-    ),
-
-    (
-        "Onion Market Prices",
-        "ડુંગળી બજાર ભાવ",
-        "ડુંગળી બજાર ભાવ",
-    ),
-
-    (
-        "Agricultural Market",
-        "કૃષિ બજાર ભાવ ગુજરાત",
-        "કૃષિ બજાર",
-    ),
-]
-
 
 @app.get("/api/v1/market/news")
 def market_news():
 
-    errors = []
+    live_items = fetch_live_mandi()
 
-    live_market = []
+    queries = [
+        "APMC Gujarat market price",
+        "Rajkot APMC market price",
+        "Gujarat market prices agriculture",
+        "groundnut market price Gujarat",
+        "cotton market price Gujarat",
+        "cumin market price Gujarat",
+        "onion market price Gujarat",
+        "agricultural market Gujarat",
+    ]
 
-    # --------------------------------------------------------
-    # PART A - LIVE APMC
-    # --------------------------------------------------------
-
-    if MANDI_API_URL:
-
-        try:
-
-            live_market = fetch_live_apmc_data()
-
-        except Exception as exc:
-
-            errors.append(
-                "Live APMC: "
-                + str(exc)[:180]
-            )
-
-    # --------------------------------------------------------
-    # PART B - NEWS MARKET DATA
-    # --------------------------------------------------------
-
-    news_items, news_errors = _collect_news(
-        MARKET_FEEDS
+    news_items, errors = fetch_news_from_queries(
+        queries=queries,
+        category="બજાર ભાવ સમાચાર",
+        max_items=40,
     )
 
-    errors.extend(
-        news_errors
-    )
+    market_table: list[dict] = []
 
-    news_items = sort_latest(
-        remove_duplicates(
-            filter_last_48_hours(
-                news_items
-            )
-        )
-    )
+    for item in news_items:
 
-    news_table = parse_market_prices(
-        news_items
-    )
-
-    combined = []
-
-    seen = set()
-
-    for row in live_market + news_table:
-
-        key = tuple(
-            str(
-                row.get(
-                    field,
-                    ""
-                )
-            )
-            for field in (
-                "date",
-                "apmc",
-                "crop",
-                "min_price",
-                "max_price",
-            )
+        parsed_rows = parse_market_prices(
+            item
         )
 
-        if key in seen:
-            continue
-
-        seen.add(key)
-
-        combined.append(
-            {
-                "date": str(
-                    row.get(
-                        "date",
-                        ""
-                    )
-                ),
-
-                "apmc": str(
-                    row.get(
-                        "apmc",
-                        ""
-                    )
-                ),
-
-                "crop": str(
-                    row.get(
-                        "crop",
-                        ""
-                    )
-                ),
-
-                "min_price": str(
-                    row.get(
-                        "min_price",
-                        ""
-                    )
-                ),
-
-                "max_price": str(
-                    row.get(
-                        "max_price",
-                        ""
-                    )
-                ),
-            }
+        market_table.extend(
+            parsed_rows
         )
 
     return {
-
         "ok": True,
-
-        "updated_at":
-            now_local_string(),
-
+        "updated_at": now_local_string(),
         "items": [
             public_news_item(item)
-            for item in news_items[:24]
+            for item in news_items
         ],
-
-        "market_table":
-            combined[:100],
-
-        "live":
-            bool(
-                live_market
-                or news_items
-            ),
-
-        "live_apmc":
-            bool(live_market),
-
-        "news_available":
-            bool(news_items),
-
-        "source":
-            (
-                "Live APMC + Google News RSS"
-                if live_market
-                else "Google News RSS"
-            ),
-
-        "errors":
-            errors[:6],
+        "market_table": market_table,
+        "live": bool(live_items),
+        "source": (
+            "Live APMC API + "
+            "Google News RSS / original publishers"
+        ),
+        "errors": errors,
     }
 
 
@@ -1414,30 +1235,19 @@ def market_news():
 # ROOT
 # ============================================================
 
-def _root_response():
-
-    return {
-
-        "ok": True,
-
-        "service":
-            "smart-agri-ai",
-
-        "version":
-            APP_VERSION,
-    }
-
-
 @app.get("/")
 def root():
 
-    return _root_response()
+    return {
+        "ok": True,
+        "service": "Smart Agri-Market AI",
+        "version": APP_VERSION,
+        "status": "running",
+    }
 
 
-# Render / monitoring માટે HEAD પણ
 @app.head("/")
 def root_head():
-
     return None
 
 
@@ -1449,48 +1259,10 @@ def root_head():
 def health():
 
     return {
-
         "ok": True,
-
-        "service":
-            "smart-agri-ai",
-
-        "version":
-            APP_VERSION,
-
-        "agent_loaded":
-            _agent is not None,
-
-        "groq_configured":
-            bool(
-                os.getenv(
-                    "GROQ_API_KEY",
-                    ""
-                ).strip()
-            ),
-
-        "gemini_configured":
-            bool(
-                os.getenv(
-                    "GEMINI_API_KEY",
-                    ""
-                ).strip()
-            ),
-
-        "mandi_configured":
-            bool(MANDI_API_URL),
-
-        "text_provider":
-            "groq",
-
-        "text_model":
-            GROQ_MODEL,
-
-        "vision_provider":
-            "gemini",
-
-        "vision_model":
-            VISION_MODEL,
+        "status": "healthy",
+        "service": "smart-agri-market-ai",
+        "version": APP_VERSION,
     }
 
 
@@ -1500,451 +1272,352 @@ def health():
 
 def rule_based_answer(
     question: str,
-    context: dict | None,
-) -> str:
+) -> str | None:
 
-    q = norm(question)
-
-    ctx = context or {}
-
-    selected = (
-        ctx.get(
-            "selected_crop"
-        )
-        or {}
-    )
-
-    crop = str(
-        selected.get(
-            "name",
-            ""
-        )
-        or ""
-    ).strip()
-
-    if not crop and _agent:
-
-        crops = getattr(
-            _agent,
-            "CROPS",
-            {}
-        )
-
-        aliases = getattr(
-            _agent,
-            "ROMAN_ALIASES",
-            {}
-        )
-
-        for key, name in crops.items():
-
-            if (
-                norm(name) in q
-                or norm(key) == q
-            ):
-
-                crop = name
-
-                break
-
-        if not crop:
-
-            for alias, name in aliases.items():
-
-                if alias and alias in q:
-
-                    crop = name
-
-                    break
-
-    data = getattr(
-        _agent,
-        "CROP_DATA",
-        {}
-    ) if _agent else {}
-
-    profile = (
-        data.get(
-            crop,
-            {}
-        )
-        if crop
-        else {}
-    )
-
-    # --------------------------------------------------------
-    # WATER
-    # --------------------------------------------------------
-
-    if any(
-        word in q
-        for word in (
-            "સિંચાઈ",
-            "પા છણી",
-            "પિયત",
-            "irrigation",
-            "water",
-        )
-    ):
-
-        return (
-            f"💧 {crop or 'પાક'} માટે સિંચાઈ સલાહ:\n"
-            f"{profile.get('પાણી', 'પાકની અવસ્થા, જમીનનો ભેજ અને વરસાદ પ્રમાણે સિંચાઈ કરો; પાણી ભરાવું ટાળો.')}\n"
-            "છેલ્લો વરસાદ, જમીનનો પ્રકાર અને પાકની હાલની અવસ્થા જણાવશો તો સલાહ વધુ ચોક્કસ કરી શકું."
-        )
-
-    # --------------------------------------------------------
-    # FERTILIZER
-    # --------------------------------------------------------
-
-    if any(
-        word in q
-        for word in (
-            "ખાતર",
-            "પોષણ",
-            "fertilizer",
-            "npk",
-        )
-    ):
-
-        return (
-            f"🧪 {crop or 'પાક'} માટે પોષણ:\n"
-            "માટી પરીક્ષણ આધારિત N-P-K અને સૂક્ષ્મ તત્ત્વો નક્કી કરો. "
-            "પાકની અવસ્થા પ્રમાણે ખાતર વહેંચીને આપવું યોગ્ય રહે છે. "
-            "માટી રિપોર્ટ વગર ચોક્કસ ડોઝ નક્કી ન કરવો."
-        )
-
-    # --------------------------------------------------------
-    # DISEASE / PEST
-    # --------------------------------------------------------
-
-    if any(
-        word in q
-        for word in (
-            "રોગ",
-            "જીવાત",
-            "ઈયળ",
-            "ઇયળ",
-            "પાન પીળ",
-            "disease",
-            "pest",
-        )
-    ):
-
-        diseases = (
-            getattr(
-                _agent,
-                "_DISEASES",
-                {}
-            ).get(
-                crop,
-                []
-            )
-            if _agent
-            else []
-        )
-
-        extra = "\n".join(
-            f"• {item}"
-            for item in diseases[:3]
-        )
-
-        return (
-            f"🔎 {crop or 'પાક'} માટે રોગ/જીવાત તપાસ:\n"
-            f"{extra or 'પાન, ડાંઠ, મૂળ અને ફળનું નજીકથી નિરીક્ષણ કરો અને પાણી/પોષણની સ્થિતિ તપાસો.'}\n"
-            "ફોટો, પાકની ઉંમર અને નુકસાનનું પ્રમાણ આપશો તો વધુ મદદ કરી શકું."
-        )
-
-    # --------------------------------------------------------
-    # CROP PROFILE
-    # --------------------------------------------------------
-
-    if crop and profile:
-
-        return (
-            f"🌱 {crop} અંગે ઉપયોગી માહિતી:\n"
-            f"• જમીન: {profile.get('જમીન', 'માટી પરીક્ષણ મુજબ')}\n"
-            f"• વાવણી: {profile.get('વાવણી', 'સ્થાનિક ભલામણ મુજબ')}\n"
-            f"• પાણી: {profile.get('પાણી', 'પાકની અવસ્થા અને જમીનના ભેજ મુજબ')}\n"
-            f"• સાવચેતી: {profile.get('સાવચેતી', 'નિયમિત નિરીક્ષણ કરો')}"
-        )
-
-    return (
-        "🤖 ખેડૂત સહાયક: પ્રશ્નનો વધુ ચોક્કસ જવાબ આપવા "
-        "પાકનું નામ, પાકની ઉંમર/વાવણી તારીખ, જમીનનો પ્રકાર, "
-        "છેલ્લું સિંચાઈ/વરસાદ અને સમસ્યાના લક્ષણો લખો. "
-        "ફોટો હોય તો મોકલી શકો."
-    )
-
-
-# ============================================================
-# GROQ CHAT
-# ============================================================
-
-def groq_client():
-
-    key = (
-        os.getenv(
-            "GROQ_API_KEY",
-            ""
-        ).strip()
-    )
-
-    if not key:
+    if AGENT is None:
         return None
 
+    try:
+
+        aliases = getattr(
+            AGENT,
+            "ROMAN_ALIASES",
+            {},
+        )
+
+        crops = getattr(
+            AGENT,
+            "CROPS",
+            {},
+        )
+
+        crop_data = getattr(
+            AGENT,
+            "CROP_DATA",
+            {},
+        )
+
+        diseases = getattr(
+            AGENT,
+            "_DISEASES",
+            {},
+        )
+
+        q = norm(question)
+
+        # Crop detection
+        detected_crop = None
+
+        for crop_name, data in (
+            crops.items()
+            if isinstance(crops, dict)
+            else []
+        ):
+
+            if norm(crop_name) in q:
+                detected_crop = crop_name
+                break
+
+            if isinstance(aliases, dict):
+
+                for alias, mapped in aliases.items():
+
+                    if norm(alias) in q and (
+                        mapped == crop_name
+                        or norm(str(mapped)) == norm(crop_name)
+                    ):
+                        detected_crop = crop_name
+                        break
+
+            if detected_crop:
+                break
+
+        if not detected_crop:
+            return None
+
+        data = crop_data.get(
+            detected_crop
+        )
+
+        if not data:
+            return None
+
+        if isinstance(data, dict):
+
+            parts = [
+                f"પાક: {detected_crop}"
+            ]
+
+            for key, value in data.items():
+
+                if value in (
+                    None,
+                    "",
+                    [],
+                    {},
+                ):
+                    continue
+
+                parts.append(
+                    f"{key}: {value}"
+                )
+
+            return "\n".join(parts)
+
+        return str(data)
+
+    except Exception:
+        return None
+
+
+# ============================================================
+# GROQ CLIENT
+# ============================================================
+
+def groq_client() -> OpenAI:
+
+    if not GROQ_API_KEY:
+        raise HTTPException(
+            status_code=503,
+            detail="GROQ_API_KEY is not configured",
+        )
+
     return OpenAI(
-        api_key=key,
+        api_key=GROQ_API_KEY,
         base_url="https://api.groq.com/openai/v1",
     )
 
 
-@app.post("/api/v1/ai/ask")
-def ask(req: Ask):
+# ============================================================
+# GEMINI CLIENT
+# ============================================================
 
-    question = (
-        req.question
-        or ""
-    ).strip()
+def gemini_client() -> genai.Client:
+
+    if not GEMINI_API_KEY:
+        raise HTTPException(
+            status_code=503,
+            detail="GEMINI_API_KEY is not configured",
+        )
+
+    return genai.Client(
+        api_key=GEMINI_API_KEY
+    )
+
+
+# ============================================================
+# AI ASK
+# ============================================================
+
+@app.post("/api/v1/ai/ask")
+def ai_ask(payload: Ask):
+
+    question = payload.question.strip()
 
     if not question:
-
         raise HTTPException(
             status_code=400,
-            detail="પ્રશ્ન ખાલી છે.",
+            detail="question is required",
         )
+
+    # Rule-based first.
+    try:
+
+        rule_answer = rule_based_answer(
+            question
+        )
+
+        if rule_answer:
+            return {
+                "answer": rule_answer,
+                "mode": "rule_based",
+                "model": "local-rule-engine",
+            }
+
+    except Exception:
+        pass
 
     client = groq_client()
 
-    if client is None:
+    context_text = ""
 
-        raise HTTPException(
-            status_code=503,
-            detail=(
-                "Groq AI configured નથી. "
-                "Render Environment Variables માં "
-                "GROQ_API_KEY સેટ કરો."
-            ),
+    if payload.context:
+
+        context_text = (
+            "\n\nContext:\n"
+            + str(payload.context)
         )
-
-    context = req.context or {}
-
-    prompt = (
-        f"ખેડૂત પ્રશ્ન: {question}\n"
-        f"ખેડૂત સંદર્ભ: {context}\n\n"
-        "આ પ્રશ્નનો સીધો, ઉપયોગી અને વ્યવહારુ જવાબ "
-        "ગુજરાતી ભાષામાં આપો. "
-        "પાક, પાકની અવસ્થા, જમીન, સિંચાઈ, હવામાન "
-        "અને ઉપલબ્ધ સંદર્ભને ધ્યાનમાં લો. "
-        "પ્રશ્ન જે પૂછે છે તેનો જ જવાબ આપો. "
-        "માહિતી અધૂરી હોય તો જરૂરી માહિતી પૂછો. "
-        "એક જ fixed જવાબ વારંવાર ન આપો."
-    )
 
     try:
 
-        response = client.chat.completions.create(
-
+        completion = client.chat.completions.create(
             model=GROQ_MODEL,
-
             messages=[
                 {
                     "role": "system",
                     "content": SYSTEM,
                 },
-
                 {
                     "role": "user",
-                    "content": prompt,
+                    "content": question
+                    + context_text,
                 },
             ],
+            temperature=0.2,
         )
 
         answer = (
-            response
-            .choices[0]
+            completion.choices[0]
             .message
             .content
             or ""
         ).strip()
 
-        if not answer:
-
-            raise HTTPException(
-                status_code=502,
-                detail=(
-                    "Groq તરફથી ખાલી જવાબ મળ્યો."
-                ),
-            )
-
         return {
-
             "answer": answer,
-
             "mode": "groq",
-
             "model": GROQ_MODEL,
         }
-
-    except HTTPException:
-
-        raise
 
     except Exception as exc:
 
         raise HTTPException(
             status_code=502,
-            detail=f"Groq AI error: {exc}",
+            detail=f"AI request failed: {exc}",
         )
 
 
 # ============================================================
-# GEMINI VISION
+# GEMINI VISION / PHOTO AI
 # ============================================================
 
-def gemini_client():
-
-    key = (
-        os.getenv(
-            "GEMINI_API_KEY",
-            ""
-        ).strip()
-    )
-
-    if not key:
-        return None
-
-    return genai.Client(
-        api_key=key
-    )
-
-
 @app.post("/api/v1/ai/diagnose")
-async def diagnose(
-
+async def ai_diagnose(
     image: UploadFile = File(...),
-
     crop: str = Form(""),
-
     context: str = Form(""),
 ):
 
-    data = await image.read()
+    image_bytes = await image.read()
 
-    if not data:
-
+    if not image_bytes:
         raise HTTPException(
             status_code=400,
-            detail="ફોટો ખાલી છે.",
+            detail="Image is empty",
+        )
+
+    if len(image_bytes) > 15 * 1024 * 1024:
+        raise HTTPException(
+            status_code=413,
+            detail="Image too large",
         )
 
     client = gemini_client()
 
-    if client is None:
-
-        return {
-
-            "answer": (
-                "📷 ફોટો મળ્યો છે. "
-                "Vision AI માટે Renderમાં "
-                "GEMINI_API_KEY સેટ કરો અને "
-                "VISION_MODEL ચકાસો."
-            ),
-
-            "mode":
-                "agent_unavailable",
-        }
-
-    mime = (
+    mime_type = (
         image.content_type
         or "image/jpeg"
     )
 
-    if "/" not in mime:
-        mime = "image/jpeg"
+    prompt = f"""
+આ ફોટો ખેડૂત દ્વારા મોકલવામાં આવ્યો છે.
 
-    prompt = (
-        f"આ ખેતીના પાકનો ફોટો છે. "
-        f"પાક: {crop or 'અજ્ઞાત'}. "
-        f"સંદર્ભ: {context}.\n\n"
+પાક:
+{crop or "માહિતી આપવામાં આવી નથી"}
 
-        "ફોટામાં દેખાતા લક્ષણોનું ધ્યાનપૂર્વક "
-        "નિરીક્ષણ કરો. જવાબ ગુજરાતી ભાષામાં આપો.\n"
+વધારાની માહિતી:
+{context or "કોઈ માહિતી નથી"}
 
-        "આ ક્રમમાં જવાબ આપો:\n"
+ફોટાનું ધ્યાનપૂર્વક નિરીક્ષણ કરો.
 
-        "1) દેખાતા લક્ષણો\n"
+જવાબ સંપૂર્ણ ગુજરાતીમાં આપો.
 
-        "2) 1-3 સંભવિત કારણો અથવા રોગ/જીવાત\n"
+જવાબમાં આ મુદ્દાઓ શક્ય હોય ત્યાં સુધી આપો:
 
-        "3) તરત કરી શકાય તેવી IPM/સલામતી સલાહ\n"
+1. ફોટામાં શું દેખાય છે
+2. પાક/છોડની સંભવિત સમસ્યા
+3. સંભવિત રોગ અથવા જીવાત
+4. શા માટે આવું થઈ શકે
+5. શું કરવું
+6. દવા/ઉપચારની સામાન્ય સલાહ
+7. સાવચેતી
+8. જો ફોટાથી ચોક્કસ diagnosis શક્ય ન હોય તો તે સ્પષ્ટ કહો
 
-        "4) ક્યારે સ્થાનિક કૃષિ નિષ્ણાત/KVK/લેબની "
-        "ચકાસણી લેવી\n\n"
+ખાસ સૂચના:
 
-        "ફોટા પરથી નિશ્ચિત નિદાન ન કરો અને "
-        "ચોક્કસ pesticide dose, concentration "
-        "અથવા brand ન આપો. "
-
-        "ફોટો અસ્પષ્ટ હોય તો તે સ્પષ્ટ જણાવો. "
-
-        "જવાબ સંપૂર્ણ આપો."
-    )
+- જવાબ માત્ર 1-3 લાઇનમાં બંધ ન કરો.
+- શક્ય હોય ત્યારે વિગતવાર અને પૂર્ણ જવાબ આપો.
+- કોઈ મહત્વની માહિતી કાપી ન નાખો.
+- Markdown headings અને bullet points ઉપયોગ કરી શકો છો.
+- માત્ર ફોટામાં ખરેખર દેખાતી બાબતોના આધારે નિરીક્ષણ કરો.
+- ખોટી ખાતરી ન આપો.
+"""
 
     try:
 
+        image_part = types.Part.from_bytes(
+            data=image_bytes,
+            mime_type=mime_type,
+        )
+
         response = client.models.generate_content(
-
             model=VISION_MODEL,
-
             contents=[
-                types.Part.from_bytes(
-                    data=data,
-                    mime_type=mime,
-                ),
-
+                image_part,
                 prompt,
             ],
-
             config=types.GenerateContentConfig(
-
                 system_instruction=SYSTEM,
-
                 temperature=0.2,
-
                 max_output_tokens=4096,
-
-                thinking_config=(
-                    types.ThinkingConfig(
-                        thinking_budget=0
-                    )
+                thinking_config=types.ThinkingConfig(
+                    thinking_budget=0
                 ),
             ),
         )
 
         answer = (
-            response.text
+            getattr(response, "text", None)
             or ""
         ).strip()
 
+        if not answer:
+            answer = (
+                "ફોટામાંથી પૂરતી માહિતી મળી નથી. "
+                "કૃપા કરીને પાકનો થોડો વધુ સ્પષ્ટ ફોટો મોકલો."
+            )
+
         return {
-
-            "answer":
-                answer
-                or "ફોટામાંથી પૂરતો જવાબ મળ્યો નથી.",
-
-            "mode":
-                "gemini_vision",
-
-            "model":
-                VISION_MODEL,
+            "answer": answer,
+            "mode": "gemini_vision",
+            "model": VISION_MODEL,
         }
 
     except Exception as exc:
 
         raise HTTPException(
             status_code=502,
-            detail=(
-                f"Vision AI error: {exc}"
-            ),
+            detail=f"Gemini Vision request failed: {exc}",
         )
+
+
+# ============================================================
+# STARTUP LOG
+# ============================================================
+
+@app.on_event("startup")
+def startup_log():
+
+    print(
+        f"Smart Agri-Market AI started: {APP_VERSION}"
+    )
+
+    print(
+        "Legacy News endpoint enabled: "
+        "/api/v1/news"
+    )
+
+    print(
+        "Google News RSS recent-window mode: "
+        "when:2d + strict 48h filter"
+    )
