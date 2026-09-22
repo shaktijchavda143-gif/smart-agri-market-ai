@@ -21,7 +21,6 @@ from openai import OpenAI
 
 from google import genai
 from google.genai import types
-from google.genai import errors as genai_errors
 
 from tenacity import Retrying, stop_after_attempt, wait_exponential, retry_if_exception, RetryCallState
 
@@ -54,7 +53,7 @@ FALLBACK_VISION_MODEL = os.getenv(
     "gemini-2.5-flash",
 )
 
-# Preserve alias for backward compatibility
+# Preserve alias for backward compatibility in config variables
 VISION_MODEL = PRIMARY_VISION_MODEL
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
@@ -146,7 +145,12 @@ class Ask(BaseModel):
 # ============================================================
 
 def now_local_string() -> str:
+    """
+    Render server time may be UTC.
+    Keep API timestamp predictable.
+    """
     now = datetime.now(timezone.utc)
+
     return now.strftime("%d-%m-%Y %H:%M")
 
 
@@ -202,6 +206,11 @@ def clean_html(value: Any) -> str:
 # ============================================================
 
 def parse_rss_datetime(value: Any) -> datetime | None:
+    """
+    Handles normal RSS RFC-822 dates and several common variants.
+    Always returns timezone-aware UTC datetime.
+    """
+
     if not value:
         return None
 
@@ -687,6 +696,11 @@ AGRI_CATEGORIES = [
 def legacy_news(
     crop: str = "",
 ):
+    """
+    Existing Android app calls this endpoint.
+    Do not remove or rename it.
+    """
+
     crop = crop.strip()
 
     queries: list[str] = []
@@ -1393,12 +1407,12 @@ def gemini_client() -> genai.Client:
 def parse_exception_details(exc: Exception) -> tuple[bool, int | None, str]:
     """
     Robustly parses Google GenAI exceptions and generic network errors.
-    Returns: (is_temporary_error: bool, status_code: int, error_message: str)
+    Returns: (is_temporary_error, status_code, error_message)
     """
     status_code = None
     msg = str(exc)
 
-    # In the modern google-genai SDK, APIError and subclasses carry a 'code' attribute.
+    # In the google-genai SDK, APIError and subclasses carry a 'code' attribute.
     if hasattr(exc, "code") and isinstance(getattr(exc, "code"), int):
         status_code = getattr(exc, "code")
     elif hasattr(exc, "status_code") and isinstance(getattr(exc, "status_code"), int):
@@ -1416,6 +1430,7 @@ def parse_exception_details(exc: Exception) -> tuple[bool, int | None, str]:
         if match:
             status_code = int(match.group(1))
 
+    # Identify permanent vs temporary
     permanent_codes = {400, 401, 403, 404}
     if status_code in permanent_codes:
         return False, status_code, msg
@@ -1461,11 +1476,12 @@ def invoke_gemini_vision_model(
 
     def _log_attempt(retry_state: RetryCallState):
         exc = retry_state.outcome.exception()
-        is_temp, code, _ = parse_exception_details(exc)
-        logger.warning(
-            f"[RETRY] Model: {model_name} | Attempt: {retry_state.attempt_number}/3 | "
-            f"Code: {code} | ErrorType: {type(exc).__name__} - Retrying after backoff..."
-        )
+        if exc:
+            is_temp, code, _ = parse_exception_details(exc)
+            logger.warning(
+                f"[RETRY] Model: {model_name} | Attempt: {retry_state.attempt_number}/3 | "
+                f"Code: {code} | ErrorType: {type(exc).__name__} - Retrying after backoff..."
+            )
 
     retryer = Retrying(
         stop=stop_after_attempt(3),
@@ -1477,11 +1493,6 @@ def invoke_gemini_vision_model(
 
     for attempt_state in retryer:
         with attempt_state:
-            logger.info(
-                f"Calling Gemini Vision model '{model_name}' "
-                f"(Attempt {attempt_state.retry_state.attempt_number}/3)..."
-            )
-
             image_part = types.Part.from_bytes(
                 data=image_bytes,
                 mime_type=mime_type,
@@ -1511,9 +1522,6 @@ def invoke_gemini_vision_model(
                     "કૃપા કરીને પાકનો થોડો વધુ સ્પષ્ટ ફોટો મોકલો."
                 )
 
-            logger.info(
-                f"Gemini Vision model '{model_name}' succeeded on attempt {attempt_state.retry_state.attempt_number}."
-            )
             return answer
 
 
@@ -1532,6 +1540,10 @@ def ai_ask(payload: Ask):
             detail="question is required",
         )
 
+    # --------------------------------------------------------
+    # RULE-BASED RESPONSE FIRST
+    # --------------------------------------------------------
+
     try:
 
         rule_answer = rule_based_answer(
@@ -1547,6 +1559,10 @@ def ai_ask(payload: Ask):
 
     except Exception:
         pass
+
+    # --------------------------------------------------------
+    # GROQ AI
+    # --------------------------------------------------------
 
     client = groq_client()
 
@@ -1611,6 +1627,10 @@ async def ai_diagnose(
     context: str = Form(""),
 ):
 
+    # --------------------------------------------------------
+    # READ IMAGE
+    # --------------------------------------------------------
+
     image_bytes = await image.read()
 
     if not image_bytes:
@@ -1619,11 +1639,16 @@ async def ai_diagnose(
             detail="Image is empty",
         )
 
+    # 15 MB safety limit
     if len(image_bytes) > 15 * 1024 * 1024:
         raise HTTPException(
             status_code=413,
             detail="Image too large",
         )
+
+    # --------------------------------------------------------
+    # GEMINI CLIENT
+    # --------------------------------------------------------
 
     client = gemini_client()
 
@@ -1631,6 +1656,10 @@ async def ai_diagnose(
         image.content_type
         or "image/jpeg"
     )
+
+    # --------------------------------------------------------
+    # VISION PROMPT
+    # --------------------------------------------------------
 
     prompt = f"""
 આ ફોટો ખેડૂત દ્વારા મોકલવામાં આવ્યો છે.
@@ -1666,15 +1695,15 @@ async def ai_diagnose(
 - ખોટી ખાતરી ન આપો.
 """
 
-    primary_model = PRIMARY_VISION_MODEL
-    fallback_model = FALLBACK_VISION_MODEL
+    # --------------------------------------------------------
+    # SEND IMAGE TO GEMINI VISION
+    # --------------------------------------------------------
 
     try:
-        # Offload the synchronous SDK call to prevent event-loop starvation
         answer = await run_in_threadpool(
             invoke_gemini_vision_model,
             client,
-            primary_model,
+            PRIMARY_VISION_MODEL,
             image_bytes,
             mime_type,
             prompt
@@ -1683,22 +1712,30 @@ async def ai_diagnose(
         return {
             "answer": answer,
             "mode": "gemini_vision",
-            "model": primary_model,
+            "model": PRIMARY_VISION_MODEL,
         }
 
     except Exception as primary_exc:
         is_temp, code, _ = parse_exception_details(primary_exc)
+        
+        if not is_temp:
+            # Do NOT fallback or blindly retry permanent 400 errors.
+            raise HTTPException(
+                status_code=400,
+                detail="Permanent error encountered during diagnosis. Please ensure the image is valid and try again."
+            )
+
         logger.error(
-            f"[FALLBACK INITIATED] Primary model '{primary_model}' failed after retries. "
-            f"Temporary: {is_temp}, Code: {code}. Switching to fallback model '{fallback_model}'..."
+            f"[FALLBACK INITIATED] Primary model '{PRIMARY_VISION_MODEL}' failed after retries. "
+            f"Temporary: {is_temp}, Code: {code}. Switching to fallback model '{FALLBACK_VISION_MODEL}'..."
         )
 
         try:
-            # Fallback model also leverages the same robust Tenacity wrapper
+            # Fallback model utilizes the exact same function mapping, ensuring image bytes are passed.
             answer = await run_in_threadpool(
                 invoke_gemini_vision_model,
                 client,
-                fallback_model,
+                FALLBACK_VISION_MODEL,
                 image_bytes,
                 mime_type,
                 prompt
@@ -1707,26 +1744,26 @@ async def ai_diagnose(
             return {
                 "answer": answer,
                 "mode": "gemini_vision",
-                "model": fallback_model,
+                "model": FALLBACK_VISION_MODEL,
             }
 
         except Exception as fallback_exc:
             fb_is_temp, fb_code, _ = parse_exception_details(fallback_exc)
             logger.error(
-                f"[FAILURE] Fallback model '{fallback_model}' also failed after retries. "
+                f"[FAILURE] Fallback model '{FALLBACK_VISION_MODEL}' also failed after retries. "
                 f"Temporary: {fb_is_temp}, Code: {fb_code}."
             )
 
-            # Masking raw provider error text from the end client for security
-            if fb_is_temp or is_temp:
+            # Return a clear 503 instead of hiding behind a generic generic 502/fake answer.
+            if fb_is_temp:
                 raise HTTPException(
                     status_code=503,
-                    detail="Gemini Vision service is temporarily unavailable due to high demand. Please try again in a few moments.",
+                    detail="Gemini Vision service is temporarily unavailable due to high demand. Spikes in demand are usually temporary. Please try again later."
                 )
             else:
                 raise HTTPException(
                     status_code=502,
-                    detail="Gemini Vision request failed. Please ensure the image is valid and try again.",
+                    detail="Gemini Vision request failed. Please ensure the image is valid and try again."
                 )
 
 
@@ -1760,4 +1797,3 @@ def startup_log():
         "Gemini Vision endpoint enabled: "
         "/api/v1/ai/diagnose"
     )
-
