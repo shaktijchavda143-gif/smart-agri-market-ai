@@ -1590,6 +1590,144 @@ async def ai_diagnose(
 6. દવા/ઉપચારની સામાન્ય સલાહ
 7. સાવચેતી
 8. જો ફોટાથી ચોક્કસ diagnosis શક્ય ન હોય તો તે સ્પષ્ટ કહો
+# ============================================================
+# AI ASK
+# ============================================================
+
+@app.post("/api/v1/ai/ask")
+def ai_ask(payload: Ask):
+
+    question = payload.question.strip()
+
+    if not question:
+        raise HTTPException(
+            status_code=400,
+            detail="question is required",
+        )
+
+    # Rule-based first.
+    try:
+
+        rule_answer = rule_based_answer(
+            question
+        )
+
+        if rule_answer:
+            return {
+                "answer": rule_answer,
+                "mode": "rule_based",
+                "model": "local-rule-engine",
+            }
+
+    except Exception:
+        pass
+
+    client = groq_client()
+
+    context_text = ""
+
+    if payload.context:
+        context_text = (
+            "\n\nContext:\n"
+            + str(payload.context)
+        )
+
+    try:
+
+        completion = client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": SYSTEM,
+                },
+                {
+                    "role": "user",
+                    "content": question + context_text,
+                },
+            ],
+            temperature=0.2,
+        )
+
+        answer = (
+            completion.choices[0]
+            .message
+            .content
+            or ""
+        ).strip()
+
+        return {
+            "answer": answer,
+            "mode": "groq",
+            "model": GROQ_MODEL,
+        }
+
+    except Exception as exc:
+
+        import traceback
+        traceback.print_exc()
+
+        raise HTTPException(
+            status_code=502,
+            detail=f"Groq AI request failed: {str(exc)}",
+        )
+
+
+# ============================================================
+# GEMINI VISION / PHOTO AI
+# ============================================================
+
+@app.post("/api/v1/ai/diagnose")
+async def ai_diagnose(
+    image: UploadFile = File(...),
+    crop: str = Form(""),
+    context: str = Form(""),
+):
+
+    image_bytes = await image.read()
+
+    if not image_bytes:
+        raise HTTPException(
+            status_code=400,
+            detail="Image is empty",
+        )
+
+    if len(image_bytes) > 15 * 1024 * 1024:
+        raise HTTPException(
+            status_code=413,
+            detail="Image too large",
+        )
+
+    client = gemini_client()
+
+    mime_type = (
+        image.content_type
+        or "image/jpeg"
+    )
+
+    prompt = f"""
+આ ફોટો ખેડૂત દ્વારા મોકલવામાં આવ્યો છે.
+
+પાક:
+{crop or "માહિતી આપવામાં આવી નથી"}
+
+વધારાની માહિતી:
+{context or "કોઈ માહિતી નથી"}
+
+ફોટાનું ધ્યાનપૂર્વક નિરીક્ષણ કરો.
+
+જવાબ સંપૂર્ણ ગુજરાતીમાં આપો.
+
+જવાબમાં આ મુદ્દાઓ શક્ય હોય ત્યાં સુધી આપો:
+
+1. ફોટામાં શું દેખાય છે
+2. પાક/છોડની સંભવિત સમસ્યા
+3. સંભવિત રોગ અથવા જીવાત
+4. શા માટે આવું થઈ શકે
+5. શું કરવું
+6. દવા/ઉપચારની સામાન્ય સલાહ
+7. સાવચેતી
+8. જો ફોટાથી ચોક્કસ diagnosis શક્ય ન હોય તો તે સ્પષ્ટ કહો
 
 ખાસ સૂચના:
 
