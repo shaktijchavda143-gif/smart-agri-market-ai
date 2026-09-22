@@ -2,6 +2,7 @@ import os
 import re
 import html
 import base64
+import logging
 import importlib.util
 import urllib.parse
 import urllib.request
@@ -12,6 +13,7 @@ from email.utils import parsedate_to_datetime
 from typing import Any
 
 from fastapi import FastAPI, File, Form, UploadFile, HTTPException
+from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -19,23 +21,41 @@ from openai import OpenAI
 
 from google import genai
 from google.genai import types
+from google.genai import errors as genai_errors
+
+from tenacity import Retrying, stop_after_attempt, wait_exponential, retry_if_exception, RetryCallState
+
+# ============================================================
+# LOGGING
+# ============================================================
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("smart_agri_ai")
 
 
 # ============================================================
 # APP CONFIG
 # ============================================================
 
-APP_VERSION = "10.2 Android API Bridge - NEWS FIX"
+APP_VERSION = "10.3 Android API Bridge - RESILIENCE FIX"
 
 GROQ_MODEL = os.getenv(
     "GROQ_MODEL",
     "openai/gpt-oss-20b",
 )
 
-VISION_MODEL = os.getenv(
+PRIMARY_VISION_MODEL = os.getenv(
     "GEMINI_VISION_MODEL",
-    "gemini-3.6-flash",
+    "gemini-2.5-pro",
 )
+
+FALLBACK_VISION_MODEL = os.getenv(
+    "GEMINI_FALLBACK_VISION_MODEL",
+    "gemini-2.5-flash",
+)
+
+# Preserve alias for backward compatibility
+VISION_MODEL = PRIMARY_VISION_MODEL
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
@@ -126,12 +146,7 @@ class Ask(BaseModel):
 # ============================================================
 
 def now_local_string() -> str:
-    """
-    Render server time may be UTC.
-    Keep API timestamp predictable.
-    """
     now = datetime.now(timezone.utc)
-
     return now.strftime("%d-%m-%Y %H:%M")
 
 
@@ -187,11 +202,6 @@ def clean_html(value: Any) -> str:
 # ============================================================
 
 def parse_rss_datetime(value: Any) -> datetime | None:
-    """
-    Handles normal RSS RFC-822 dates and several common variants.
-    Always returns timezone-aware UTC datetime.
-    """
-
     if not value:
         return None
 
@@ -677,11 +687,6 @@ AGRI_CATEGORIES = [
 def legacy_news(
     crop: str = "",
 ):
-    """
-    Existing Android app calls this endpoint.
-    Do not remove or rename it.
-    """
-
     crop = crop.strip()
 
     queries: list[str] = []
@@ -1099,7 +1104,7 @@ def fetch_live_mandi() -> list[dict]:
     try:
 
         headers = {
-            "User-Agent": "Smart-Agri-Market-AI/10.2",
+            "User-Agent": "Smart-Agri-Market-AI/10.3",
         }
 
         if MANDI_API_KEY:
@@ -1382,6 +1387,137 @@ def gemini_client() -> genai.Client:
 
 
 # ============================================================
+# ERROR PARSER & RETRY UTILS
+# ============================================================
+
+def parse_exception_details(exc: Exception) -> tuple[bool, int | None, str]:
+    """
+    Robustly parses Google GenAI exceptions and generic network errors.
+    Returns: (is_temporary_error: bool, status_code: int, error_message: str)
+    """
+    status_code = None
+    msg = str(exc)
+
+    # In the modern google-genai SDK, APIError and subclasses carry a 'code' attribute.
+    if hasattr(exc, "code") and isinstance(getattr(exc, "code"), int):
+        status_code = getattr(exc, "code")
+    elif hasattr(exc, "status_code") and isinstance(getattr(exc, "status_code"), int):
+        status_code = getattr(exc, "status_code")
+    elif hasattr(exc, "response_json") and isinstance(getattr(exc, "response_json"), dict):
+        resp_json = getattr(exc, "response_json")
+        if resp_json:
+            code_val = resp_json.get("code") or resp_json.get("error", {}).get("code")
+            if isinstance(code_val, int):
+                status_code = code_val
+
+    # Regex fallback if attributes are missing
+    if status_code is None:
+        match = re.search(r"\b(400|401|403|404|408|429|500|502|503|504)\b", msg)
+        if match:
+            status_code = int(match.group(1))
+
+    permanent_codes = {400, 401, 403, 404}
+    if status_code in permanent_codes:
+        return False, status_code, msg
+
+    temporary_codes = {408, 429, 500, 502, 503, 504}
+    if status_code in temporary_codes:
+        return True, status_code, msg
+
+    # Keyword semantic match
+    temp_keywords = [
+        "503", "429", "500", "502", "504", "408",
+        "UNAVAILABLE", "RESOURCE_EXHAUSTED", "TOO_MANY_REQUESTS",
+        "HIGH_DEMAND", "TEMPORARY", "DEADLINE_EXCEEDED", "INTERNAL"
+    ]
+
+    upper_msg = msg.upper()
+    if any(kw in upper_msg for kw in temp_keywords):
+        return True, status_code, msg
+
+    # Catch SDK-specific explicit ServerError wrapper
+    if "ServerError" in type(exc).__name__:
+        return True, status_code, msg
+
+    return False, status_code, msg
+
+
+def is_retryable_exception(exc: Exception) -> bool:
+    is_temp, _, _ = parse_exception_details(exc)
+    return is_temp
+
+
+def invoke_gemini_vision_model(
+    client: genai.Client,
+    model_name: str,
+    image_bytes: bytes,
+    mime_type: str,
+    prompt: str,
+) -> str:
+    """
+    Synchronous function executing the generative call wrapped in Tenacity's Retrying logic.
+    Must be executed via run_in_threadpool in FastAPI to prevent blocking the event loop.
+    """
+
+    def _log_attempt(retry_state: RetryCallState):
+        exc = retry_state.outcome.exception()
+        is_temp, code, _ = parse_exception_details(exc)
+        logger.warning(
+            f"[RETRY] Model: {model_name} | Attempt: {retry_state.attempt_number}/3 | "
+            f"Code: {code} | ErrorType: {type(exc).__name__} - Retrying after backoff..."
+        )
+
+    retryer = Retrying(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=2, min=2, max=8),
+        retry=retry_if_exception(is_retryable_exception),
+        before_sleep=_log_attempt,
+        reraise=True,
+    )
+
+    for attempt_state in retryer:
+        with attempt_state:
+            logger.info(
+                f"Calling Gemini Vision model '{model_name}' "
+                f"(Attempt {attempt_state.retry_state.attempt_number}/3)..."
+            )
+
+            image_part = types.Part.from_bytes(
+                data=image_bytes,
+                mime_type=mime_type,
+            )
+
+            response = client.models.generate_content(
+                model=model_name,
+                contents=[
+                    image_part,
+                    prompt,
+                ],
+                config=types.GenerateContentConfig(
+                    system_instruction=SYSTEM,
+                    temperature=0.2,
+                    max_output_tokens=4096,
+                ),
+            )
+
+            answer = (
+                getattr(response, "text", None)
+                or ""
+            ).strip()
+
+            if not answer:
+                answer = (
+                    "ફોટામાંથી પૂરતી માહિતી મળી નથી. "
+                    "કૃપા કરીને પાકનો થોડો વધુ સ્પષ્ટ ફોટો મોકલો."
+                )
+
+            logger.info(
+                f"Gemini Vision model '{model_name}' succeeded on attempt {attempt_state.retry_state.attempt_number}."
+            )
+            return answer
+
+
+# ============================================================
 # AI ASK
 # ============================================================
 
@@ -1395,10 +1531,6 @@ def ai_ask(payload: Ask):
             status_code=400,
             detail="question is required",
         )
-
-    # --------------------------------------------------------
-    # RULE-BASED RESPONSE FIRST
-    # --------------------------------------------------------
 
     try:
 
@@ -1415,10 +1547,6 @@ def ai_ask(payload: Ask):
 
     except Exception:
         pass
-
-    # --------------------------------------------------------
-    # GROQ AI
-    # --------------------------------------------------------
 
     client = groq_client()
 
@@ -1483,10 +1611,6 @@ async def ai_diagnose(
     context: str = Form(""),
 ):
 
-    # --------------------------------------------------------
-    # READ IMAGE
-    # --------------------------------------------------------
-
     image_bytes = await image.read()
 
     if not image_bytes:
@@ -1495,16 +1619,11 @@ async def ai_diagnose(
             detail="Image is empty",
         )
 
-    # 15 MB safety limit
     if len(image_bytes) > 15 * 1024 * 1024:
         raise HTTPException(
             status_code=413,
             detail="Image too large",
         )
-
-    # --------------------------------------------------------
-    # GEMINI CLIENT
-    # --------------------------------------------------------
 
     client = gemini_client()
 
@@ -1512,10 +1631,6 @@ async def ai_diagnose(
         image.content_type
         or "image/jpeg"
     )
-
-    # --------------------------------------------------------
-    # VISION PROMPT
-    # --------------------------------------------------------
 
     prompt = f"""
 આ ફોટો ખેડૂત દ્વારા મોકલવામાં આવ્યો છે.
@@ -1551,61 +1666,68 @@ async def ai_diagnose(
 - ખોટી ખાતરી ન આપો.
 """
 
-    # --------------------------------------------------------
-    # SEND IMAGE TO GEMINI VISION
-    # --------------------------------------------------------
+    primary_model = PRIMARY_VISION_MODEL
+    fallback_model = FALLBACK_VISION_MODEL
 
     try:
-
-        image_part = types.Part.from_bytes(
-            data=image_bytes,
-            mime_type=mime_type,
+        # Offload the synchronous SDK call to prevent event-loop starvation
+        answer = await run_in_threadpool(
+            invoke_gemini_vision_model,
+            client,
+            primary_model,
+            image_bytes,
+            mime_type,
+            prompt
         )
-
-        response = client.models.generate_content(
-            model=VISION_MODEL,
-            contents=[
-                image_part,
-                prompt,
-            ],
-            config=types.GenerateContentConfig(
-                system_instruction=SYSTEM,
-                temperature=0.2,
-                max_output_tokens=4096,
-            ),
-        )
-
-        answer = (
-            getattr(response, "text", None)
-            or ""
-        ).strip()
-
-        if not answer:
-            answer = (
-                "ફોટામાંથી પૂરતી માહિતી મળી નથી. "
-                "કૃપા કરીને પાકનો થોડો વધુ સ્પષ્ટ ફોટો મોકલો."
-            )
 
         return {
             "answer": answer,
             "mode": "gemini_vision",
-            "model": VISION_MODEL,
+            "model": primary_model,
         }
 
-    except Exception as exc:
-
-        import traceback
-        traceback.print_exc()
-
-        # IMPORTANT:
-        # Do NOT send the image to Groq as a fallback.
-        # Groq text generation cannot replace the actual
-        # Gemini Vision diagnosis.
-
-        raise HTTPException(
-            status_code=502,
-            detail=f"Gemini Vision request failed: {str(exc)}",
+    except Exception as primary_exc:
+        is_temp, code, _ = parse_exception_details(primary_exc)
+        logger.error(
+            f"[FALLBACK INITIATED] Primary model '{primary_model}' failed after retries. "
+            f"Temporary: {is_temp}, Code: {code}. Switching to fallback model '{fallback_model}'..."
         )
+
+        try:
+            # Fallback model also leverages the same robust Tenacity wrapper
+            answer = await run_in_threadpool(
+                invoke_gemini_vision_model,
+                client,
+                fallback_model,
+                image_bytes,
+                mime_type,
+                prompt
+            )
+
+            return {
+                "answer": answer,
+                "mode": "gemini_vision",
+                "model": fallback_model,
+            }
+
+        except Exception as fallback_exc:
+            fb_is_temp, fb_code, _ = parse_exception_details(fallback_exc)
+            logger.error(
+                f"[FAILURE] Fallback model '{fallback_model}' also failed after retries. "
+                f"Temporary: {fb_is_temp}, Code: {fb_code}."
+            )
+
+            # Masking raw provider error text from the end client for security
+            if fb_is_temp or is_temp:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Gemini Vision service is temporarily unavailable due to high demand. Please try again in a few moments.",
+                )
+            else:
+                raise HTTPException(
+                    status_code=502,
+                    detail="Gemini Vision request failed. Please ensure the image is valid and try again.",
+                )
 
 
 # ============================================================
@@ -1638,3 +1760,4 @@ def startup_log():
         "Gemini Vision endpoint enabled: "
         "/api/v1/ai/diagnose"
     )
+
