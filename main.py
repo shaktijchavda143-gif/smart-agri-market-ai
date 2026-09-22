@@ -34,7 +34,7 @@ GROQ_MODEL = os.getenv(
 
 VISION_MODEL = os.getenv(
     "GEMINI_VISION_MODEL",
-    "gemini-2.5-flash",
+    "gemini-3.6-flash",
 )
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
