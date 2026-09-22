@@ -1479,7 +1479,7 @@ def ai_ask(payload: Ask):
             "model": GROQ_MODEL,
         }
 
-        except Exception as exc:
+            except Exception as exc:
         import traceback
         traceback.print_exc()
 
@@ -1518,6 +1518,7 @@ def ai_ask(payload: Ask):
                 status_code=502,
                 detail=f"Gemini and Groq fallback both failed: {str(exc)}",
             )
+
 
 
 
