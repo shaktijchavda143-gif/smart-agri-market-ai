@@ -53,7 +53,6 @@ app = FastAPI(
     version=APP_VERSION,
 )
 
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -201,7 +200,6 @@ def parse_rss_datetime(value: Any) -> datetime | None:
     if not raw:
         return None
 
-    # Standard RSS / RFC822
     try:
         dt = parsedate_to_datetime(raw)
 
@@ -214,7 +212,6 @@ def parse_rss_datetime(value: Any) -> datetime | None:
     except Exception:
         pass
 
-    # ISO format fallback
     try:
         iso = raw.replace("Z", "+00:00")
 
@@ -228,7 +225,6 @@ def parse_rss_datetime(value: Any) -> datetime | None:
     except Exception:
         pass
 
-    # Manual formats
     formats = [
         "%a, %d %b %Y %H:%M:%S %z",
         "%a, %d %b %Y %H:%M %z",
@@ -396,7 +392,6 @@ def build_google_news_url(
     query: str,
 ) -> str:
 
-    # when:2d forces Google News search toward the recent window.
     final_query = f"{query} when:2d"
 
     params = {
@@ -468,14 +463,12 @@ def fetch_google_news(
             )
 
         if not source:
-            # Google News often puts publisher after " - "
             if " - " in title:
                 source = title.rsplit(
                     " - ",
                     1,
                 )[-1].strip()
 
-        # Remove publisher suffix from title.
         clean_title = title
 
         if source and clean_title.endswith(
@@ -537,18 +530,15 @@ def fetch_news_from_queries(
 
         all_items.extend(items)
 
-    # First deduplicate.
     all_items = remove_duplicates(
         all_items
     )
 
-    # Then apply the strict 48-hour requirement.
     all_items = filter_last_48_hours(
         all_items,
         hours=48,
     )
 
-    # Latest first.
     all_items = sort_latest(
         all_items
     )
@@ -688,9 +678,7 @@ def legacy_news(
     crop: str = "",
 ):
     """
-    IMPORTANT:
     Existing Android app calls this endpoint.
-
     Do not remove or rename it.
     """
 
@@ -709,9 +697,6 @@ def legacy_news(
             ]
         )
 
-    # General fallback queries are important because
-    # Google News may not return enough results for a
-    # specific Gujarati crop query.
     queries.extend(
         AGRI_GENERAL_QUERIES
     )
@@ -865,8 +850,6 @@ def _extract_price_range(
                 ),
             )
 
-    # Adjacent rupee values:
-    # ₹1180 ₹1410
     rupees = re.findall(
         r"₹\s*(\d[\d,]*(?:\.\d+)?)",
         text,
@@ -1297,15 +1280,8 @@ def rule_based_answer(
             {},
         )
 
-        diseases = getattr(
-            AGENT,
-            "_DISEASES",
-            {},
-        )
-
         q = norm(question)
 
-        # Crop detection
         detected_crop = None
 
         for crop_name, data in (
@@ -1420,7 +1396,10 @@ def ai_ask(payload: Ask):
             detail="question is required",
         )
 
-    # Rule-based first.
+    # --------------------------------------------------------
+    # RULE-BASED RESPONSE FIRST
+    # --------------------------------------------------------
+
     try:
 
         rule_answer = rule_based_answer(
@@ -1437,196 +1416,16 @@ def ai_ask(payload: Ask):
     except Exception:
         pass
 
-    client = groq_client()
-
-    context_text = ""
-
-    if payload.context:
-
-        context_text = (
-            "\n\nContext:\n"
-            + str(payload.context)
-        )
-
-    try:
-
-        completion = client.chat.completions.create(
-            model=GROQ_MODEL,
-# ============================================================
-# AI ASK
-# ============================================================
-
-@app.post("/api/v1/ai/ask")
-def ai_ask(payload: Ask):
-
-    question = payload.question.strip()
-
-    if not question:
-        raise HTTPException(
-            status_code=400,
-            detail="question is required",
-        )
-
-    # Rule-based first.
-    try:
-        rule_answer = rule_based_answer(
-            question
-        )
-
-        if rule_answer:
-            return {
-                "answer": rule_answer,
-                "mode": "rule_based",
-                "model": "local-rule-engine",
-            }
-
-    except Exception:
-        pass
+    # --------------------------------------------------------
+    # GROQ AI
+    # --------------------------------------------------------
 
     client = groq_client()
 
     context_text = ""
 
     if payload.context:
-        context_text = (
-            "\n\nContext:\n"
-            + str(payload.context)
-        )
 
-    try:
-
-        completion = client.chat.completions.create(
-            model=GROQ_MODEL,
-            messages=[
-                {
-                    "role": "system",
-                    "content": SYSTEM,
-                },
-                {
-                    "role": "user",
-                    "content": question + context_text,
-                },
-            ],
-            temperature=0.2,
-        )
-
-        answer = (
-            completion.choices[0]
-            .message
-            .content
-            or ""
-        ).strip()
-
-        return {
-            "answer": answer,
-            "mode": "groq",
-            "model": GROQ_MODEL,
-        }
-
-    except Exception as exc:
-
-        import traceback
-        traceback.print_exc()
-
-        raise HTTPException(
-            status_code=502,
-            detail=f"Groq AI request failed: {str(exc)}",
-        )
-
-
-
-    # ============================================================
-# GEMINI VISION / PHOTO AI
-# ============================================================
-
-@app.post("/api/v1/ai/diagnose")
-async def ai_diagnose(
-    image: UploadFile = File(...),
-    crop: str = Form(""),
-    context: str = Form(""),
-):
-
-    image_bytes = await image.read()
-
-    if not image_bytes:
-        raise HTTPException(
-            status_code=400,
-            detail="Image is empty",
-        )
-
-    if len(image_bytes) > 15 * 1024 * 1024:
-        raise HTTPException(
-            status_code=413,
-            detail="Image too large",
-        )
-
-    client = gemini_client()
-
-    mime_type = (
-        image.content_type
-        or "image/jpeg"
-    )
-
-    prompt = f"""
-આ ફોટો ખેડૂત દ્વારા મોકલવામાં આવ્યો છે.
-
-પાક:
-{crop or "માહિતી આપવામાં આવી નથી"}
-
-વધારાની માહિતી:
-{context or "કોઈ માહિતી નથી"}
-
-ફોટાનું ધ્યાનપૂર્વક નિરીક્ષણ કરો.
-
-જવાબ સંપૂર્ણ ગુજરાતીમાં આપો.
-
-જવાબમાં આ મુદ્દાઓ શક્ય હોય ત્યાં સુધી આપો:
-
-1. ફોટામાં શું દેખાય છે
-2. પાક/છોડની સંભવિત સમસ્યા
-3. સંભવિત રોગ અથવા જીવાત
-4. શા માટે આવું થઈ શકે
-5. શું કરવું
-6. દવા/ઉપચારની સામાન્ય સલાહ
-7. સાવચેતી
-8. જો ફોટાથી ચોક્કસ diagnosis શક્ય ન હોય તો તે સ્પષ્ટ કહો
-# ============================================================
-# AI ASK
-# ============================================================
-
-@app.post("/api/v1/ai/ask")
-def ai_ask(payload: Ask):
-
-    question = payload.question.strip()
-
-    if not question:
-        raise HTTPException(
-            status_code=400,
-            detail="question is required",
-        )
-
-    # Rule-based first.
-    try:
-
-        rule_answer = rule_based_answer(
-            question
-        )
-
-        if rule_answer:
-            return {
-                "answer": rule_answer,
-                "mode": "rule_based",
-                "model": "local-rule-engine",
-            }
-
-    except Exception:
-        pass
-
-    client = groq_client()
-
-    context_text = ""
-
-    if payload.context:
         context_text = (
             "\n\nContext:\n"
             + str(payload.context)
@@ -1684,6 +1483,10 @@ async def ai_diagnose(
     context: str = Form(""),
 ):
 
+    # --------------------------------------------------------
+    # READ IMAGE
+    # --------------------------------------------------------
+
     image_bytes = await image.read()
 
     if not image_bytes:
@@ -1692,11 +1495,16 @@ async def ai_diagnose(
             detail="Image is empty",
         )
 
+    # 15 MB safety limit
     if len(image_bytes) > 15 * 1024 * 1024:
         raise HTTPException(
             status_code=413,
             detail="Image too large",
         )
+
+    # --------------------------------------------------------
+    # GEMINI CLIENT
+    # --------------------------------------------------------
 
     client = gemini_client()
 
@@ -1704,6 +1512,10 @@ async def ai_diagnose(
         image.content_type
         or "image/jpeg"
     )
+
+    # --------------------------------------------------------
+    # VISION PROMPT
+    # --------------------------------------------------------
 
     prompt = f"""
 આ ફોટો ખેડૂત દ્વારા મોકલવામાં આવ્યો છે.
@@ -1738,6 +1550,10 @@ async def ai_diagnose(
 - માત્ર ફોટામાં ખરેખર દેખાતી બાબતોના આધારે નિરીક્ષણ કરો.
 - ખોટી ખાતરી ન આપો.
 """
+
+    # --------------------------------------------------------
+    # SEND IMAGE TO GEMINI VISION
+    # --------------------------------------------------------
 
     try:
 
@@ -1781,13 +1597,15 @@ async def ai_diagnose(
         import traceback
         traceback.print_exc()
 
+        # IMPORTANT:
+        # Do NOT send the image to Groq as a fallback.
+        # Groq text generation cannot replace the actual
+        # Gemini Vision diagnosis.
+
         raise HTTPException(
             status_code=502,
             detail=f"Gemini Vision request failed: {str(exc)}",
         )
-
-
-
 
 
 # ============================================================
@@ -1809,4 +1627,14 @@ def startup_log():
     print(
         "Google News RSS recent-window mode: "
         "when:2d + strict 48h filter"
+    )
+
+    print(
+        "AI Ask endpoint enabled: "
+        "/api/v1/ai/ask"
+    )
+
+    print(
+        "Gemini Vision endpoint enabled: "
+        "/api/v1/ai/diagnose"
     )
