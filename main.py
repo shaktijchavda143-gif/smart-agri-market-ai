@@ -1560,6 +1560,7 @@ async def ai_diagnose(
             mime_type=mime_type,
         )
 
+        # સુધારો: thinking_config હટાવી દેવામાં આવ્યું છે
         response = client.models.generate_content(
             model=VISION_MODEL,
             contents=[
@@ -1570,9 +1571,6 @@ async def ai_diagnose(
                 system_instruction=SYSTEM,
                 temperature=0.2,
                 max_output_tokens=4096,
-                thinking_config=types.ThinkingConfig(
-                    thinking_budget=0
-                ),
             ),
         )
 
@@ -1594,11 +1592,15 @@ async def ai_diagnose(
         }
 
     except Exception as exc:
+        # ટર્મિનલ/લોગમાં અસલી એરર જોવા માટે
+        import traceback
+        traceback.print_exc()
 
         raise HTTPException(
             status_code=502,
-            detail=f"Gemini Vision request failed: {exc}",
+            detail=f"Gemini Vision request failed: {str(exc)}",
         )
+
 
 
 # ============================================================
