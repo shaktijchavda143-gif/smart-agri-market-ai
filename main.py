@@ -1480,46 +1480,45 @@ def ai_ask(payload: Ask):
         }
 
         except Exception as exc:
-        import traceback
-        traceback.print_exc()
+    import traceback
+    traceback.print_exc()
 
-        # જો Gemini 503 કે અન્ય એરર આપે, તો Groq દ્વારા બેકઅપ જવાબ આપવો
-        try:
-            groq_cl = groq_client()
-            fallback_completion = groq_cl.chat.completions.create(
-                model=GROQ_MODEL,
-                messages=[
-                    {
-                        "role": "system", 
-                        "content": SYSTEM
-                    },
-                    {
-                        "role": "user", 
-                        "content": f"ખેડૂતે પાકનો ફોટો અપલોડ કર્યો હતો પરંતુ વિઝન સર્વર હાલ વ્યસ્ત (503) છે. પાક: {crop or 'અજ્ઞાત'}, વધારાની માહિતી: {context or 'કોઈ નથી'}. કૃપા કરીને આ પાક અને સામાન્ય લક્ષણો વિશે ગુજરાતીમાં માર્ગદર્શન આપો."
-                    }
-                ],
-                temperature=0.2,
-            )
-            answer = (
-                fallback_completion.choices[0]
-                .message
-                .content
-                or ""
-            ).strip()
+    # જો Gemini 503 કે અન્ય એરર આપે, તો Groq દ્વારા બેકઅપ જવાબ આપવો
+    try:
+        groq_cl = groq_client()
+        fallback_completion = groq_cl.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": SYSTEM
+                },
+                {
+                    "role": "user",
+                    "content": f"ખેડૂતે પાકનો ફોટો અપલોડ કર્યો હતો પરંતુ વિઝન સર્વર હાલ વ્યસ્ત (503) છે. પાક: {crop or 'અજ્ઞાત'}, વધારાની માહિતી: {context or 'કોઈ નથી'}. કૃપા કરીને આ પાક અને સામાન્ય લક્ષણો વિશે ગુજરાતીમાં માર્ગદર્શન આપો."
+                }
+            ],
+            temperature=0.2,
+        )
 
-            return {
-                "answer": "⚠️ નોંધ: હાલમાં ઇમેજ વિઝન સર્વર પર ભારે ભારણ (High Demand) હોવાથી ફોટો સીધો સ્કેન થઈ શક્યો નથી. તેમ છતાં, તમારી માહિતીના આધારે કૃષિ માર્ગદર્શન નીચે મુજબ છે:\n\n" + answer,
-                "mode": "groq_fallback",
-                "model": GROQ_MODEL,
-            }
+        answer = (
+            fallback_completion.choices[0]
+            .message
+            .content
+            or ""
+        ).strip()
 
-        except Exception as fallback_exc:
-            raise HTTPException(
-                status_code=502,
-                detail=f"Gemini and Groq fallback both failed: {str(exc)}",
-            )
+        return {
+            "answer": "⚠️ નોંધ: હાલમાં ઇમેજ વિઝન સર્વર પર ભારે ભારણ (High Demand) હોવાથી ફોટો સીધો સ્કેન થઈ શક્યો નથી. તેમ છતાં, તમારી માહિતીના આધારે કૃષિ માર્ગદર્શન નીચે મુજબ છે:\n\n" + answer,
+            "mode": "groq_fallback",
+            "model": GROQ_MODEL,
+        }
 
-
+    except Exception as fallback_exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Gemini and Groq fallback both failed: {str(exc)}",
+        )
 # ============================================================
 # GEMINI VISION / PHOTO AI
 # ============================================================
