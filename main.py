@@ -723,7 +723,7 @@ async def ai_diagnose(
 
     # અપડેટ: Gemini API 7MB થી મોટી સાઇઝની ઇમેજને 400 Bad Request માં નકારી દે છે.
     # તેથી લિમિટ 15MB થી ઘટાડીને 7MB કરવામાં આવી છે.
-        if len(image_bytes) > 7 * 1024 * 1024:
+    if len(image_bytes) > 7 * 1024 * 1024:
         raise HTTPException(status_code=413, detail="Image must be under 7MB")
 
     client = gemini_client()
@@ -757,7 +757,7 @@ async def ai_diagnose(
         )
 
         # અપડેટ: 'await client.aio.models.generate_content' નો ઉપયોગ કરવાથી FastAPI નું ઇવેન્ટ લૂપ બ્લોક થતું અટકશે. 
-        # ઉપરાંત, AFC (Automatic Function Calling) વોર્નિંગને બંધ કરવાથી સંભવિત ખામીઓને અટકાવી શકાય છે[span_27](start_span)[span_27](end_span)[span_28](start_span)[span_28](end_span)[span_29](start_span)[span_29](end_span).
+        # ઉપરાંત, AFC (Automatic Function Calling) વોર્નિંગને બંધ કરવાથી સંભવિત ખામીઓને અટકાવી શકાય છે.
         response = await client.aio.models.generate_content(
             model=VISION_MODEL,
             contents=[image_part, prompt],
