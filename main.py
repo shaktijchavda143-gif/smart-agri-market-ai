@@ -1,3 +1,7 @@
+# -*- coding: utf-8 -*-
+"""Smart Agri-Market AI HTTP backend.
+Wraps the supplied Smart Agri-Market Agent so the Android app can call it.
+"""
 import os
 import re
 import logging
@@ -352,4 +356,3 @@ async def diagnose(image: UploadFile = File(...), crop: str = Form(""), context:
         return {"answer": response.output_text, "mode": "openai_vision", "model": MODEL}
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Vision AI error: {exc}")
-```
