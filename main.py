@@ -3,8 +3,6 @@
 Wraps the supplied Smart Agri-Market Agent so the Android app can call it.
 """
 import os
-import re
-import logging
 import base64
 import importlib.util
 import urllib.parse
@@ -21,7 +19,6 @@ from openai import OpenAI
 
 APP_VERSION = "9.0 Android API Bridge"
 MODEL = os.getenv("OPENAI_MODEL", "gpt-5.6-luna").strip() or "gpt-5.6-luna"
-logger = logging.getLogger("smart_agri_news")
 
 app = FastAPI(title="Smart Agri Market AI Backend", version=APP_VERSION)
 app.add_middleware(
@@ -139,8 +136,6 @@ def health():
 
 
 NEWS_DEFAULT_MAX_AGE_HOURS = 48
-NEWS_FETCH_TIMEOUT_SECONDS = 15
-
 
 def _news_max_age_hours() -> int:
     try:
@@ -149,144 +144,77 @@ def _news_max_age_hours() -> int:
     except Exception:
         return NEWS_DEFAULT_MAX_AGE_HOURS
 
-
 def _parse_news_date(value: str):
     if not value:
         return None
-    value = value.strip()
     try:
         dt = parsedate_to_datetime(value)
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
         return dt.astimezone(timezone.utc)
     except Exception:
-        pass
-    # A few publishers/feeds emit ISO-8601 dates rather than RFC-822 pubDate.
-    try:
-        normalized = value.replace("Z", "+00:00")
-        dt = datetime.fromisoformat(normalized)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(timezone.utc)
-    except Exception:
         return None
 
-
-def _feed_queries(query: str):
-    base = [
-        "ગુજરાત ખેડૂત ખેતી કૃષિ",
+def _fetch_news_items(query: str, limit: int = 20):
+    queries = [
+        "ગુજરાત ખેડૂત ખેતી કૃષિ યોજના સહાય",
         "ગુજરાત APMC બજાર ભાવ ખેડૂત",
-        "ગુજરાત કૃષિ યોજના સહાય ખેડૂત",
-        "ગુજરાત હવામાન વરસાદ ખેડૂતો",
+        "ગુજરાત હવામાન વરસાદ આગાહી IMD",
+        "અંબાલાલ પટેલ ગુજરાત આગાહી",
+        "પરેશ ગોસ્વામી ગુજરાત આગાહી",
     ]
     if query.strip():
-        base.insert(0, query.strip())
-    # Keep queries narrow enough that Google's recent-window search is useful.
-    return list(dict.fromkeys(base))
-
-
-def _fetch_news_items(query: str, limit: int = 20):
-    queries = _feed_queries(query)
+        queries.append(query.strip())
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(hours=_news_max_age_hours())
     india_tz = timezone(timedelta(hours=5, minutes=30))
     items = []
     seen = set()
-    diagnostics = {
-        "feeds_scanned": 0, "feed_items": 0, "dated_items": 0,
-        "fresh_items": 0, "returned_items": 0, "fetch_errors": 0,
-        "parse_errors": 0, "queries": [],
-    }
-
     for search_query in queries:
-        diagnostics["feeds_scanned"] += 1
-        recent_query = f"{search_query} when:2d"
-        url = "https://news.google.com/rss/search?" + urllib.parse.urlencode({
-            "q": recent_query, "hl": "gu", "gl": "IN", "ceid": "IN:gu"
-        })
-        diagnostics["queries"].append(search_query)
-        request = urllib.request.Request(url, headers={
-            "User-Agent": "Mozilla/5.0 (Linux; Android 15) SmartAgriMarketAI/1.0"
-        })
+        url = "https://news.google.com/rss/search?" + urllib.parse.urlencode({"q": search_query, "hl": "gu", "gl": "IN", "ceid": "IN:gu"})
+        request = urllib.request.Request(url, headers={"User-Agent": "SmartAgriMarketAI/1.0"})
         try:
-            with urllib.request.urlopen(request, timeout=NEWS_FETCH_TIMEOUT_SECONDS) as response:
-                payload = response.read()
-            root = ET.fromstring(payload)
-        except Exception as exc:
-            # Fallback: fetch the same query without Google's undocumented time operator;
-            # the server-side timestamp filter below remains authoritative.
-            logger.warning("News RSS recent query failed query=%r error=%s; trying plain RSS", search_query, exc)
-            try:
-                fallback_url = "https://news.google.com/rss/search?" + urllib.parse.urlencode({
-                    "q": search_query, "hl": "gu", "gl": "IN", "ceid": "IN:gu"
-                })
-                fallback_request = urllib.request.Request(fallback_url, headers={
-                    "User-Agent": "Mozilla/5.0 (Linux; Android 15) SmartAgriMarketAI/1.0"
-                })
-                with urllib.request.urlopen(fallback_request, timeout=NEWS_FETCH_TIMEOUT_SECONDS) as response:
-                    payload = response.read()
-                root = ET.fromstring(payload)
-            except Exception as fallback_exc:
-                diagnostics["fetch_errors"] += 1
-                logger.warning("News RSS fallback failed query=%r error=%s", search_query, fallback_exc)
-                continue
-
-        for item in root.findall(".//item")[:100]:
-            diagnostics["feed_items"] += 1
+            with urllib.request.urlopen(request, timeout=12) as response:
+                root = ET.fromstring(response.read())
+        except Exception:
+            continue
+        for item in root.findall(".//item")[:50]:
             title = (item.findtext("title") or "").strip()
             link = (item.findtext("link") or "").strip()
-            date_text = (item.findtext("pubDate") or item.findtext("date") or "").strip()
-            source_node = item.find("source")
-            source = (source_node.text if source_node is not None else "") or ""
-            source = source.strip()
+            date_text = (item.findtext("pubDate") or "").strip()
+            source = (item.findtext("source") or "").strip()
             published = _parse_news_date(date_text)
-            if not title or not link:
+            if not title or not link or published is None:
                 continue
-            if published is None:
-                diagnostics["parse_errors"] += 1
-                continue
-            diagnostics["dated_items"] += 1
             if published < cutoff or published > now + timedelta(minutes=10):
                 continue
-            diagnostics["fresh_items"] += 1
-            # Title + publisher is more stable than the Google redirect URL.
-            key = re.sub(r"\s+", " ", title.casefold()) + "|" + source.casefold()
+            key = title.casefold()
             if key in seen:
                 continue
             seen.add(key)
             items.append({
-                "title": title,
-                "link": link,
-                "published_at": published.isoformat(),
+                "title": title, "link": link, "published_at": published.isoformat(),
                 "published_text": published.astimezone(india_tz).strftime("%d-%m-%Y %I:%M %p"),
                 "source": source or "સમાચાર સ્ત્રોત",
             })
-
     items.sort(key=lambda x: x["published_at"], reverse=True)
-    final = items[:limit]
-    diagnostics["returned_items"] = len(final)
-    logger.info(
-        "NEWS_DIAGNOSTICS feeds=%s feed_items=%s dated=%s fresh=%s returned=%s fetch_errors=%s parse_errors=%s",
-        diagnostics["feeds_scanned"], diagnostics["feed_items"], diagnostics["dated_items"],
-        diagnostics["fresh_items"], diagnostics["returned_items"], diagnostics["fetch_errors"],
-        diagnostics["parse_errors"],
-    )
-    return final, diagnostics
-
+    return items[:limit]
 
 @app.get("/api/v1/news")
 def news(crop: str = ""):
     crop_name = crop.strip()
-    query = f"{crop_name} ગુજરાત ખેડૂત ખેતી કૃષિ બજાર" if crop_name else "ગુજરાત ખેડૂત ખેતી કૃષિ બજાર"
-    items, diagnostics = _fetch_news_items(query, 12)
+    if crop_name:
+        query = f"{crop_name} ગુજરાત ખેડૂત ખેતી કૃષિ બજાર"
+    else:
+        query = "ગુજરાત ખેડૂત ખેતી કૃષિ બજાર"
+    items = _fetch_news_items(query, 12)
     return {
         "ok": True,
         "crop": crop_name,
         "max_age_hours": _news_max_age_hours(),
         "checked_at": datetime.now(timezone.utc).isoformat(),
-        "diagnostics": diagnostics,
         "items": items,
-        "message": "આજના પ્રકાશિત થયેલા સમાચાર" if items else "હાલમાં તાજા સમાચાર મળ્યા નથી.",
+        "message": "આજના પ્રકાશિત થયેલા સમાચાર" if items else "આજે નવા સમાચાર મળ્યા નથી."
     }
 
 @app.post("/api/v1/ai/ask")
