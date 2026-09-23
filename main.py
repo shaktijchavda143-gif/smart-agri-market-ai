@@ -24,7 +24,7 @@ from google.genai import types
 # APP CONFIG
 # ============================================================
 
-APP_VERSION = "10.3 Android API Bridge - VISION & NEWS FIXED"
+APP_VERSION = "10.4 Android API Bridge - VISION & NEWS FIXED"
 
 GROQ_MODEL = os.getenv(
     "GROQ_MODEL",
@@ -84,7 +84,6 @@ try:
             AGENT = module
 
 except Exception as e:
-    # પ્રોડક્શન સિસ્ટમ માટે લોગિંગ અત્યંત આવશ્યક છે
     print(f"Failed to load smart_agri_agent: {e}")
     AGENT = None
 
@@ -202,25 +201,6 @@ def rss_datetime(value: Any) -> str:
 # NEWS FILTERS
 # ============================================================
 
-def filter_recent_news(items: list[dict], hours: int = 168) -> list[dict]:
-    """
-    અગાઉની 48 કલાકની કડક મર્યાદા દૂર કરી, અહીં 168 કલાક (7 દિવસ) નો સમયગાળો 
-    વ્યાખ્યાયિત કરવામાં આવ્યો છે. આનાથી પ્રાદેશિક સમાચાર ફીડમાં ખાલી પરિણામો 
-    મળવાની શક્યતા નહિવત્ થઈ જશે.
-    """
-    now = datetime.now(timezone.utc)
-    cutoff = now - timedelta(hours=hours)
-    result: list[dict] = []
-
-    for item in items:
-        dt = item.get("_published_dt")
-        if not isinstance(dt, datetime):
-            continue
-        if cutoff <= dt <= now + timedelta(minutes=10):
-            result.append(item)
-
-    return result
-
 def remove_duplicates(items: list[dict]) -> list[dict]:
     result: list[dict] = []
     seen: set[str] = set()
@@ -289,11 +269,6 @@ def _fetch_url(url: str, timeout: int = 15, retries: int = 2) -> bytes:
 # ============================================================
 
 def build_google_news_url(query: str) -> str:
-    """
-    અહીંથી 'when:2d' પેરામીટર દૂર કરવામાં આવ્યું છે, કારણ કે Google News 
-    પ્રાદેશિક ભાષાઓમાં કડક સમય મર્યાદા (operator) માટે ખાલી ફીડ પરત કરતું હતું.
-    આનાથી ડેટા સ્ટારવેશનની સમસ્યા કાયમ માટે ઉકેલાશે.
-    """
     params = {
         "q": query,
         "hl": "gu",
@@ -367,8 +342,8 @@ def fetch_news_from_queries(queries: list[str], category: str, max_items: int = 
 
     all_items = remove_duplicates(all_items)
     
-    # સમય મર્યાદા વધારીને 168 કલાક કરી છે, જેથી તાજા સમાચાર હંમેશા ઉપલબ્ધ રહે
-    all_items = filter_recent_news(all_items, hours=168) 
+    # અગાઉનું કડક સમય ફિલ્ટર દૂર કરવામાં આવ્યું છે
+    # જેથી જો સમાચાર જૂના હોય તો પણ ક્યારેય ખાલી સ્ક્રીન ન દેખાય.
     all_items = sort_latest(all_items)
 
     return all_items[:max_items], errors
@@ -587,7 +562,7 @@ def fetch_live_mandi() -> list[dict]:
     if not MANDI_API_URL:
         return []
     try:
-        headers = {"User-Agent": "Smart-Agri-Market-AI/10.3"}
+        headers = {"User-Agent": "Smart-Agri-Market-AI/10.4"}
         if MANDI_API_KEY:
             headers["X-API-Key"] = MANDI_API_KEY
         request = urllib.request.Request(MANDI_API_URL, headers=headers)
@@ -742,16 +717,14 @@ async def ai_diagnose(
     crop: Optional[str] = Form(default=None),
     context: Optional[str] = Form(default=None),
 ):
-    """
-    અપડેટ: Form() ને બદલે Form(default=None) નો ઉપયોગ જેથી પાયડેન્ટિક 
-    ક્લાયન્ટના પેલોડને કડક રીતે નકારીને 422 એરર જનરેટ ન કરે.
-    """
     image_bytes = await image.read()
     if not image_bytes:
         raise HTTPException(status_code=400, detail="Image is empty")
 
-    if len(image_bytes) > 15 * 1024 * 1024:
-        raise HTTPException(status_code=413, detail="Image too large")
+    # અપડેટ: Gemini API 7MB થી મોટી સાઇઝની ઇમેજને 400 Bad Request માં નકારી દે છે.
+    # તેથી લિમિટ 15MB થી ઘટાડીને 7MB કરવામાં આવી છે.
+    if len(image_bytes) > 7 * 1024 * 1024:
+        raise HTT[span_9](start_span)[span_9](end_span)[span_11](start_span)[span_11](end_span)PException(status_code=413, detail="Image must be under 7MB")
 
     client = gemini_client()
     mime_type = image.content_type or "image/jpeg"
@@ -783,16 +756,16 @@ async def ai_diagnose(
             mime_type=mime_type,
         )
 
-        # અપડેટ: અગાઉના કોડમાંથી thinking_config સંપૂર્ણપણે દૂર કરવામાં આવ્યું છે.
-        # આનાથી મોડેલને અનુકૂળ ન હોય તેવા કન્ફિગરેશન પેરામીટર્સના કારણે આવતી 
-        # 400 Bad Request એરર ટાળી શકાશે.
-        response = client.models.generate_content(
+        # અપડેટ: 'await client.aio.models.generate_content' નો ઉપયોગ કરવાથી FastAPI નું ઇવેન્ટ લૂપ બ્લોક થતું અટકશે. 
+        # ઉપરાંત, AFC (Automatic Function Calling) વોર્નિંગને બંધ કરવાથી સંભવિત ખામીઓને અટકાવી શકાય છે[span_27](start_span)[span_27](end_span)[span_28](start_span)[span_28](end_span)[span_29](start_span)[span_29](end_span).
+        response = await client.aio.models.generate_content(
             model=VISION_MODEL,
             contents=[image_part, prompt],
             config=types.GenerateContentConfig(
                 system_instruction=SYSTEM,
                 temperature=0.2,
                 max_output_tokens=4096,
+                automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True)
             ),
         )
 
@@ -807,7 +780,7 @@ async def ai_diagnose(
         }
 
     except Exception as exc:
-        print(f"Gemini API Error: {exc}") # વ્યવસ્થિત એક્સેપ્શન હેન્ડલિંગ માટે
+        print(f"Gemini API Error: {exc}") 
         raise HTTPException(status_code=502, detail=f"Gemini Vision request failed: {exc}")
 
 # ============================================================
