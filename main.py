@@ -1,8 +1,3 @@
-```python
-# -*- coding: utf-8 -*-
-"""Smart Agri-Market AI HTTP backend.
-Wraps the supplied Smart Agri-Market Agent so the Android app can call it.
-"""
 import os
 import re
 import logging
