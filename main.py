@@ -723,8 +723,8 @@ async def ai_diagnose(
 
     # અપડેટ: Gemini API 7MB થી મોટી સાઇઝની ઇમેજને 400 Bad Request માં નકારી દે છે.
     # તેથી લિમિટ 15MB થી ઘટાડીને 7MB કરવામાં આવી છે.
-    if len(image_bytes) > 7 * 1024 * 1024:
-        raise HTT[span_9](start_span)[span_9](end_span)[span_11](start_span)[span_11](end_span)PException(status_code=413, detail="Image must be under 7MB")
+        if len(image_bytes) > 7 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="Image must be under 7MB")
 
     client = gemini_client()
     mime_type = image.content_type or "image/jpeg"
