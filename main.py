@@ -1,1799 +1,360 @@
+```python
+# -*- coding: utf-8 -*-
+"""Smart Agri-Market AI HTTP backend.
+Wraps the supplied Smart Agri-Market Agent so the Android app can call it.
+"""
 import os
 import re
-import html
-import base64
 import logging
+import base64
 import importlib.util
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
-
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone, timedelta
 from email.utils import parsedate_to_datetime
 from typing import Any
 
-from fastapi import FastAPI, File, Form, UploadFile, HTTPException
-from fastapi.concurrency import run_in_threadpool
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-
 from openai import OpenAI
 
-from google import genai
-from google.genai import types
+APP_VERSION = "9.0 Android API Bridge"
+MODEL = os.getenv("OPENAI_MODEL", "gpt-5.6-luna").strip() or "gpt-5.6-luna"
+logger = logging.getLogger("smart_agri_news")
 
-from tenacity import Retrying, stop_after_attempt, wait_exponential, retry_if_exception, RetryCallState
-
-# ============================================================
-# LOGGING
-# ============================================================
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("smart_agri_ai")
-
-
-# ============================================================
-# APP CONFIG
-# ============================================================
-
-APP_VERSION = "10.3 Android API Bridge - RESILIENCE FIX"
-
-GROQ_MODEL = os.getenv(
-    "GROQ_MODEL",
-    "openai/gpt-oss-20b",
-)
-
-PRIMARY_VISION_MODEL = os.getenv(
-    "GEMINI_VISION_MODEL",
-    "gemini-2.5-pro",
-)
-
-FALLBACK_VISION_MODEL = os.getenv(
-    "GEMINI_FALLBACK_VISION_MODEL",
-    "gemini-2.5-flash",
-)
-
-# Preserve alias for backward compatibility in config variables
-VISION_MODEL = PRIMARY_VISION_MODEL
-
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-
-MANDI_API_URL = os.getenv("MANDI_API_URL", "")
-MANDI_API_KEY = os.getenv("MANDI_API_KEY", "")
-
-
-# ============================================================
-# FASTAPI
-# ============================================================
-
-app = FastAPI(
-    title="Smart Agri-Market AI",
-    version=APP_VERSION,
-)
-
+app = FastAPI(title="Smart Agri Market AI Backend", version=APP_VERSION)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=["*"], allow_credentials=False,
+    allow_methods=["*"], allow_headers=["*"],
 )
 
-
-# ============================================================
-# SMART AGRI AGENT
-# ============================================================
-
-AGENT = None
-
+# Load the user's supplied agent file without executing its CLI main().
+_agent = None
 try:
-    agent_path = os.path.join(
-        os.path.dirname(__file__),
-        "smart_agri_agent.py",
-    )
+    _path = os.path.join(os.path.dirname(__file__), "smart_agri_agent.py")
+    _spec = importlib.util.spec_from_file_location("smart_agri_agent", _path)
+    if _spec and _spec.loader:
+        _agent = importlib.util.module_from_spec(_spec)
+        _spec.loader.exec_module(_agent)
+except Exception as exc:
+    _agent = None
+    print(f"Agent import warning: {exc}")
 
-    if os.path.exists(agent_path):
-        spec = importlib.util.spec_from_file_location(
-            "smart_agri_agent",
-            agent_path,
-        )
-
-        if spec and spec.loader:
-            module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(module)
-            AGENT = module
-
-except Exception:
-    AGENT = None
-
-
-# ============================================================
-# SYSTEM PROMPT
-# ============================================================
-
-SYSTEM = """
-તમે Smart Agri-Market AI ના ગુજરાતી કૃષિ સહાયક છો.
-
-જવાબ સરળ, સ્પષ્ટ અને ખેડૂત માટે ઉપયોગી ગુજરાતીમાં આપો.
-
-જ્યારે પાક, રોગ, જીવાત, દવા, ખાતર અથવા ખેતી વિશે પૂછવામાં આવે:
-- પાકનું નામ સ્પષ્ટ કરો.
-- સમસ્યા/લક્ષણ સમજાવો.
-- શક્ય કારણ જણાવો.
-- વ્યવહારુ ઉપાય આપો.
-- દવા/કૃષિ રસાયણની સલાહ આપતી વખતે label મુજબ ઉપયોગ અને સ્થાનિક કૃષિ અધિકારીની સલાહ લેવાની નોંધ આપો.
-- ખોટી ખાતરી ન આપો.
-- ફોટો પરથી diagnosis હોય તો શું દેખાય છે અને શું ખાતરીથી કહી શકાય નહીં તે સ્પષ્ટ કરો.
-
-જવાબ અધૂરો ન રાખો.
-પૂર્ણ અને વાંચી શકાય તેવો જવાબ આપો.
-"""
-
-
-# ============================================================
-# MODELS
-# ============================================================
+SYSTEM = (
+    "તમે Smart Agri-Market AI ગુજરાતી ખેડૂત સહાયક છો. "
+    "જવાબ સરળ, વ્યવહારુ અને પાક/ખેડૂતના સંદર્ભ મુજબ આપો. "
+    "પાક, સિંચાઈ, પોષણ, રોગ-જીવાત, હવામાન અને બજાર અંગે માર્ગદર્શન આપો. "
+    "ફોટો આધારિત જવાબમાં માત્ર ટૂંકું નિદાન ન આપો; ખેડૂતને કામ લાગે એટલી વિગત આપો. "
+    "દવા અંગે માત્ર ફોટાના લક્ષણો અને પાકને અનુરૂપ સંભવિત નિયંત્રણ વિકલ્પો જણાવો; ચોક્કસ દવા/ડોઝ ત્યારે જ લખો જ્યારે પાક-સમસ્યા પૂરતી વિશ્વસનીય રીતે ઓળખાય અને નોંધાયેલ લેબલ/સ્થાનિક કૃષિ ભલામણ સાથે મેળ ખાતી હોય. "
+    "નિશ્ચિત રોગનિદાન અથવા અનિશ્ચિત pesticide doseને તથ્ય તરીકે રજૂ ન કરો; જરૂર પડે ત્યારે સ્થાનિક કૃષિ નિષ્ણાત/KVK/લેબ ચકાસણી જરૂરી હોવાનું સ્પષ્ટ જણાવો."
+)
 
 class Ask(BaseModel):
     question: str
     context: dict | None = None
 
 
-# ============================================================
-# COMMON HELPERS
-# ============================================================
-
-def now_local_string() -> str:
-    """
-    Render server time may be UTC.
-    Keep API timestamp predictable.
-    """
-    now = datetime.now(timezone.utc)
-
-    return now.strftime("%d-%m-%Y %H:%M")
-
-
-def norm(value: Any) -> str:
-    if value is None:
-        return ""
-
-    return " ".join(
-        str(value)
-        .strip()
-        .lower()
-        .split()
-    )
-
-
-def clean_html(value: Any) -> str:
-    if not value:
-        return ""
-
-    text = html.unescape(str(value))
-
-    text = re.sub(
-        r"<script.*?>.*?</script>",
-        " ",
-        text,
-        flags=re.I | re.S,
-    )
-
-    text = re.sub(
-        r"<style.*?>.*?</style>",
-        " ",
-        text,
-        flags=re.I | re.S,
-    )
-
-    text = re.sub(
-        r"<[^>]+>",
-        " ",
-        text,
-    )
-
-    text = re.sub(
-        r"\s+",
-        " ",
-        text,
-    )
-
-    return text.strip()
-
-
-# ============================================================
-# RSS DATE PARSER
-# ============================================================
-
-def parse_rss_datetime(value: Any) -> datetime | None:
-    """
-    Handles normal RSS RFC-822 dates and several common variants.
-    Always returns timezone-aware UTC datetime.
-    """
-
-    if not value:
-        return None
-
-    raw = str(value).strip()
-
-    if not raw:
-        return None
-
-    try:
-        dt = parsedate_to_datetime(raw)
-
-        if dt is not None:
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-
-            return dt.astimezone(timezone.utc)
-
-    except Exception:
-        pass
-
-    try:
-        iso = raw.replace("Z", "+00:00")
-
-        dt = datetime.fromisoformat(iso)
-
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-
-        return dt.astimezone(timezone.utc)
-
-    except Exception:
-        pass
-
-    formats = [
-        "%a, %d %b %Y %H:%M:%S %z",
-        "%a, %d %b %Y %H:%M %z",
-        "%d %b %Y %H:%M:%S %z",
-        "%d %b %Y %H:%M %z",
-    ]
-
-    for fmt in formats:
-        try:
-            dt = datetime.strptime(raw, fmt)
-
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-
-            return dt.astimezone(timezone.utc)
-
-        except Exception:
-            continue
-
-    return None
-
-
-def rss_datetime(value: Any) -> str:
-    dt = parse_rss_datetime(value)
-
-    if dt is None:
-        return ""
-
-    return dt.strftime("%d-%m-%Y %H:%M")
-
-
-# ============================================================
-# NEWS FILTERS
-# ============================================================
-
-def filter_last_48_hours(
-    items: list[dict],
-    hours: int = 48,
-) -> list[dict]:
-
-    now = datetime.now(timezone.utc)
-
-    cutoff = now - timedelta(hours=hours)
-
-    result: list[dict] = []
-
-    for item in items:
-        dt = item.get("_published_dt")
-
-        if not isinstance(dt, datetime):
-            continue
-
-        if cutoff <= dt <= now + timedelta(minutes=10):
-            result.append(item)
-
-    return result
-
-
-def remove_duplicates(
-    items: list[dict],
-) -> list[dict]:
-
-    result: list[dict] = []
-    seen: set[str] = set()
-
-    for item in items:
-
-        title = norm(item.get("title"))
-        link = norm(item.get("link"))
-
-        key = title or link
-
-        if not key:
-            continue
-
-        if key in seen:
-            continue
-
-        seen.add(key)
-        result.append(item)
-
-    return result
-
-
-def sort_latest(
-    items: list[dict],
-) -> list[dict]:
-
-    return sorted(
-        items,
-        key=lambda item: (
-            item.get("_published_dt")
-            or datetime.min.replace(tzinfo=timezone.utc)
-        ),
-        reverse=True,
-    )
-
-
-def public_news_item(item: dict) -> dict:
-    return {
-        "title": item.get("title", ""),
-        "source": item.get("source", ""),
-        "published_at": item.get("published_at", ""),
-        "link": item.get("link", ""),
-        "category": item.get("category", ""),
-    }
-
-
-# ============================================================
-# HTTP FETCH
-# ============================================================
-
-def _fetch_url(
-    url: str,
-    timeout: int = 15,
-    retries: int = 2,
-) -> bytes:
-
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 "
-            "(Linux; Android 10) "
-            "AppleWebKit/537.36 "
-            "Chrome/120 Safari/537.36"
-        ),
-        "Accept": (
-            "application/rss+xml, "
-            "application/xml, "
-            "text/xml, "
-            "*/*"
-        ),
-        "Accept-Language": "gu-IN,gu;q=0.9,en-IN;q=0.8,en;q=0.7",
-    }
-
-    last_error = None
-
-    for _ in range(max(1, retries)):
-
-        try:
-            request = urllib.request.Request(
-                url,
-                headers=headers,
-            )
-
-            with urllib.request.urlopen(
-                request,
-                timeout=timeout,
-            ) as response:
-
-                return response.read()
-
-        except Exception as exc:
-            last_error = exc
-
-    raise RuntimeError(
-        f"RSS fetch failed: {last_error}"
-    )
-
-
-# ============================================================
-# GOOGLE NEWS RSS
-# ============================================================
-
-def build_google_news_url(
-    query: str,
-) -> str:
-
-    final_query = f"{query} when:2d"
-
-    params = {
-        "q": final_query,
-        "hl": "gu",
-        "gl": "IN",
-        "ceid": "IN:gu",
-    }
-
-    return (
-        "https://news.google.com/rss/search?"
-        + urllib.parse.urlencode(
-            params,
-            quote_via=urllib.parse.quote,
-        )
-    )
-
-
-def fetch_google_news(
-    query: str,
-    category: str = "",
-    timeout: int = 15,
-) -> tuple[list[dict], str | None]:
-
-    url = build_google_news_url(query)
-
-    try:
-        data = _fetch_url(
-            url,
-            timeout=timeout,
-            retries=2,
-        )
-
-        root = ET.fromstring(data)
-
-    except Exception as exc:
-        return [], str(exc)
-
-    items: list[dict] = []
-
-    for xml_item in root.findall(".//item"):
-
-        title = clean_html(
-            xml_item.findtext("title")
-        )
-
-        link = (
-            xml_item.findtext("link")
-            or ""
-        ).strip()
-
-        description = clean_html(
-            xml_item.findtext("description")
-        )
-
-        pub_raw = (
-            xml_item.findtext("pubDate")
-            or ""
-        ).strip()
-
-        source_node = xml_item.find("source")
-
-        source = ""
-
-        if source_node is not None:
-            source = clean_html(
-                source_node.text
-                or ""
-            )
-
-        if not source:
-            if " - " in title:
-                source = title.rsplit(
-                    " - ",
-                    1,
-                )[-1].strip()
-
-        clean_title = title
-
-        if source and clean_title.endswith(
-            f" - {source}"
-        ):
-            clean_title = clean_title[
-                : -(len(source) + 3)
-            ].strip()
-
-        published_dt = parse_rss_datetime(
-            pub_raw
-        )
-
-        if not clean_title:
-            continue
-
-        if not link:
-            continue
-
-        items.append(
-            {
-                "title": clean_title,
-                "source": source or "Google News",
-                "published_at": rss_datetime(pub_raw),
-                "link": link,
-                "description": description,
-                "category": category,
-                "_published_dt": published_dt,
-            }
-        )
-
-    return items, None
-
-
-# ============================================================
-# MULTI-QUERY NEWS ENGINE
-# ============================================================
-
-def fetch_news_from_queries(
-    queries: list[str],
-    category: str,
-    max_items: int = 20,
-) -> tuple[list[dict], list[str]]:
-
-    all_items: list[dict] = []
-    errors: list[str] = []
-
-    for query in queries:
-
-        items, error = fetch_google_news(
-            query=query,
-            category=category,
-        )
-
-        if error:
-            errors.append(
-                f"{query}: {error}"
-            )
-
-        all_items.extend(items)
-
-    all_items = remove_duplicates(
-        all_items
-    )
-
-    all_items = filter_last_48_hours(
-        all_items,
-        hours=48,
-    )
-
-    all_items = sort_latest(
-        all_items
-    )
-
-    return all_items[:max_items], errors
-
-
-# ============================================================
-# NEWS RESPONSE
-# ============================================================
-
-def build_news_response(
-    items: list[dict],
-    errors: list[str] | None = None,
-    crop: str = "",
-) -> dict:
-
-    errors = errors or []
-
-    public_items = [
-        public_news_item(item)
-        for item in items
-    ]
-
-    return {
-        "ok": True,
-        "updated_at": now_local_string(),
-        "items": public_items,
-        "live": False,
-        "source": "Google News RSS / original publishers",
-        "errors": errors,
-        "crop": crop,
-    }
-
-
-# ============================================================
-# AGRICULTURE NEWS QUERIES
-# ============================================================
-
-AGRI_GENERAL_QUERIES = [
-    "કૃષિ સમાચાર ગુજરાત",
-    "ખેડૂત સમાચાર ગુજરાત",
-    "ખેડૂત યોજના ગુજરાત",
-    "ખેડૂત સહાય ગુજરાત",
-    "કૃષિ યોજના ગુજરાત",
-    "agriculture Gujarat farmers",
-    "Gujarat farmers agriculture",
-]
-
-
-# ============================================================
-# WEATHER NEWS
-# ============================================================
-
-WEATHER_QUERIES = [
-    (
-        "🌧️ IMD Gujarat",
-        [
-            "IMD Gujarat weather",
-            "IMD Gujarat rainfall forecast",
-            "હવામાન વિભાગ ગુજરાત વરસાદ આગાહી",
-        ],
-    ),
-    (
-        "☀️ Ambalal Patel",
-        [
-            "આંબાલાલ પટેલ હવામાન ગુજરાત",
-            "Ambalal Patel weather Gujarat",
-        ],
-    ),
-    (
-        "🌦️ Paresh Goswami",
-        [
-            "પરેશ ગૌસ્વામી હવામાન ગુજરાત",
-            "Paresh Goswami weather Gujarat",
-        ],
-    ),
-    (
-        "📰 Gujarat Weather",
-        [
-            "ગુજરાત હવામાન વરસાદ આગાહી",
-            "Gujarat weather forecast farmers",
-            "Gujarat rainfall forecast",
-        ],
-    ),
-]
-
-
-# ============================================================
-# AGRICULTURE CATEGORIES
-# ============================================================
-
-AGRI_CATEGORIES = [
-    (
-        "🌱 કૃષિ સમાચાર",
-        [
-            "કૃષિ સમાચાર ગુજરાત",
-            "ખેડૂત સમાચાર ગુજરાત",
-            "agriculture Gujarat farmers",
-        ],
-    ),
-    (
-        "🦠 રોગ-જીવાત એલર્ટ",
-        [
-            "પાક રોગ જીવાત ગુજરાત",
-            "કપાસ રોગ જીવાત ગુજરાત",
-            "મગફળી રોગ જીવાત ગુજરાત",
-            "crop disease pest Gujarat",
-        ],
-    ),
-    (
-        "🏛 સરકારની કૃષિ યોજનાઓ",
-        [
-            "ખેડૂત યોજના ગુજરાત",
-            "ખેડૂત સહાય ગુજરાત",
-            "કૃષિ યોજના ગુજરાત સરકાર",
-            "Gujarat farmer scheme subsidy",
-        ],
-    ),
-    (
-        "🚜 કૃષિ ટેક્નોલોજી",
-        [
-            "કૃષિ ટેક્નોલોજી ગુજરાત",
-            "ખેતી આધુનિક ટેક્નોલોજી",
-            "agriculture technology Gujarat farmers",
-        ],
-    ),
-]
-
-
-# ============================================================
-# LEGACY / ANDROID NEWS ENDPOINT
-# ============================================================
-
-@app.get("/api/v1/news")
-def legacy_news(
-    crop: str = "",
-):
-    """
-    Existing Android app calls this endpoint.
-    Do not remove or rename it.
-    """
-
-    crop = crop.strip()
-
-    queries: list[str] = []
-
-    if crop:
-        queries.extend(
-            [
-                f"{crop} ગુજરાત ખેતી",
-                f"{crop} ખેડૂત ગુજરાત",
-                f"{crop} બજાર ભાવ ગુજરાત",
-                f"{crop} agriculture Gujarat",
-                f"{crop} farmers Gujarat",
-            ]
-        )
-
-    queries.extend(
-        AGRI_GENERAL_QUERIES
-    )
-
-    items, errors = fetch_news_from_queries(
-        queries=queries,
-        category="કૃષિ સમાચાર",
-        max_items=20,
-    )
-
-    response = build_news_response(
-        items=items,
-        errors=errors,
-        crop=crop,
-    )
-
-    response["category"] = "કૃષિ સમાચાર"
-
-    return response
-
-
-# ============================================================
-# WEATHER NEWS ENDPOINT
-# ============================================================
-
-@app.get("/api/v1/weather/news")
-def weather_news():
-
-    all_items: list[dict] = []
-    errors: list[str] = []
-
-    for category, queries in WEATHER_QUERIES:
-
-        items, query_errors = fetch_news_from_queries(
-            queries=queries,
-            category=category,
-            max_items=10,
-        )
-
-        all_items.extend(items)
-        errors.extend(query_errors)
-
-    all_items = remove_duplicates(
-        all_items
-    )
-
-    all_items = sort_latest(
-        all_items
-    )
-
-    all_items = all_items[:30]
-
-    return build_news_response(
-        items=all_items,
-        errors=errors,
-    )
-
-
-# ============================================================
-# AGRICULTURE NEWS ENDPOINT
-# ============================================================
-
-@app.get("/api/v1/agri/news")
-def agriculture_news():
-
-    all_items: list[dict] = []
-    errors: list[str] = []
-
-    for category, queries in AGRI_CATEGORIES:
-
-        items, query_errors = fetch_news_from_queries(
-            queries=queries,
-            category=category,
-            max_items=10,
-        )
-
-        all_items.extend(items)
-        errors.extend(query_errors)
-
-    all_items = remove_duplicates(
-        all_items
-    )
-
-    all_items = sort_latest(
-        all_items
-    )
-
-    all_items = all_items[:40]
-
-    return build_news_response(
-        items=all_items,
-        errors=errors,
-    )
-
-
-# ============================================================
-# MARKET PRICE PARSER
-# ============================================================
-
-PRICE_NUMBER = r"(?:₹\s*)?\d+(?:,\d+)*(?:\.\d+)?"
-
-PRICE_RANGE_PATTERNS = [
-    re.compile(
-        rf"({PRICE_NUMBER})\s*[-–—]\s*({PRICE_NUMBER})"
-    ),
-    re.compile(
-        rf"({PRICE_NUMBER})\s*(?:થી|to)\s*({PRICE_NUMBER})",
-        re.I,
-    ),
-]
-
-
-def _price_to_string(
-    value: str,
-) -> str:
-
-    value = (
-        value
-        .replace("₹", "")
-        .replace(",", "")
-        .strip()
-    )
-
-    try:
-        number = float(value)
-
-        if number.is_integer():
-            return str(int(number))
-
-        return str(number)
-
-    except Exception:
-        return value
-
-
-def _extract_price_range(
-    text: str,
-) -> tuple[str, str] | None:
-
-    for pattern in PRICE_RANGE_PATTERNS:
-
-        match = pattern.search(text)
-
-        if match:
-            return (
-                _price_to_string(
-                    match.group(1)
-                ),
-                _price_to_string(
-                    match.group(2)
-                ),
-            )
-
-    rupees = re.findall(
-        r"₹\s*(\d[\d,]*(?:\.\d+)?)",
-        text,
-    )
-
-    if len(rupees) >= 2:
-        return (
-            _price_to_string(
-                rupees[0]
-            ),
-            _price_to_string(
-                rupees[1]
-            ),
-        )
-
-    return None
-
-
-def _extract_single_prices(
-    text: str,
-) -> tuple[str, str] | None:
-
-    min_patterns = [
-        rf"(?:min|minimum|ન્યૂનતમ|લઘુતમ)\s*[:\-]?\s*{PRICE_NUMBER}",
-        rf"(?:મિનિમમ)\s*[:\-]?\s*{PRICE_NUMBER}",
-    ]
-
-    max_patterns = [
-        rf"(?:max|maximum|મહત્તમ)\s*[:\-]?\s*{PRICE_NUMBER}",
-        rf"(?:મેક્સિમમ)\s*[:\-]?\s*{PRICE_NUMBER}",
-    ]
-
-    min_value = None
-    max_value = None
-
-    for pattern in min_patterns:
-
-        match = re.search(
-            pattern,
-            text,
-            flags=re.I,
-        )
-
-        if match:
-            number = re.search(
-                PRICE_NUMBER,
-                match.group(0),
-            )
-
-            if number:
-                min_value = _price_to_string(
-                    number.group(0)
-                )
+def openai_client():
+    key = os.getenv("OPENAI_API_KEY", "").strip()
+    return OpenAI(api_key=key) if key else None
+
+
+def norm(text: str) -> str:
+    return " ".join((text or "").strip().lower().replace("-", " ").split())
+
+
+def rule_based_answer(question: str, context: dict | None) -> str:
+    """Use the supplied agent's crop knowledge even when OpenAI is not configured."""
+    q = norm(question)
+    ctx = context or {}
+    selected = ctx.get("selected_crop") or {}
+    crop = str(selected.get("name") or "").strip()
+    if not crop and _agent:
+        aliases = getattr(_agent, "ROMAN_ALIASES", {})
+        crops = getattr(_agent, "CROPS", {})
+        for key, name in crops.items():
+            if norm(name) in q or norm(key) == q:
+                crop = name
                 break
-
-    for pattern in max_patterns:
-
-        match = re.search(
-            pattern,
-            text,
-            flags=re.I,
-        )
-
-        if match:
-            number = re.search(
-                PRICE_NUMBER,
-                match.group(0),
-            )
-
-            if number:
-                max_value = _price_to_string(
-                    number.group(0)
-                )
-                break
-
-    if min_value and max_value:
-        return min_value, max_value
-
-    return None
-
-
-def _detect_crop(
-    text: str,
-) -> str:
-
-    crops = {
-        "મગફળી": [
-            "મગફળી",
-            "groundnut",
-            "peanut",
-        ],
-        "કપાસ": [
-            "કપાસ",
-            "cotton",
-        ],
-        "જીરૂ": [
-            "જીરૂ",
-            "જીરું",
-            "cumin",
-        ],
-        "ડુંગળી": [
-            "ડુંગળી",
-            "onion",
-        ],
-        "બટાકા": [
-            "બટાકા",
-            "potato",
-        ],
-        "ટામેટા": [
-            "ટામેટા",
-            "tomato",
-        ],
-        "પપૈયા": [
-            "પપૈયા",
-            "papaya",
-        ],
-        "લીંબુ": [
-            "લીંબુ",
-            "lemon",
-        ],
-    }
-
-    normalized = norm(text)
-
-    for crop, aliases in crops.items():
-
-        for alias in aliases:
-
-            if norm(alias) in normalized:
-                return crop
-
-    return ""
-
-
-def _detect_apmc(
-    text: str,
-) -> str:
-
-    apmcs = [
-        "રાજકોટ APMC",
-        "જામનગર APMC",
-        "જુનાગઢ APMC",
-        "જૂનાગઢ APMC",
-        "ગોંડલ APMC",
-        "મહુવા APMC",
-        "ગોંડલ માર્કેટ",
-        "રાજકોટ માર્કેટ",
-        "જામનગર માર્કેટ",
-        "જૂનાગઢ માર્કેટ",
-        "જુનાગઢ માર્કેટ",
-        "Navsari APMC",
-        "Rajkot APMC",
-        "Gondal APMC",
-        "Junagadh APMC",
-        "Jamnagar APMC",
-    ]
-
-    for apmc in apmcs:
-
-        if norm(apmc) in norm(text):
-            return apmc
-
-    match = re.search(
-        r"([A-Za-zÀ-ÿ\u0900-\u097F\u0A80-\u0AFF\s]+APMC)",
-        text,
-        flags=re.I,
-    )
-
-    if match:
-        return match.group(1).strip()
-
-    return ""
-
-
-def parse_market_prices(
-    item: dict,
-) -> list[dict]:
-
-    text = " ".join(
-        [
-            item.get("title", ""),
-            item.get("description", ""),
-        ]
-    )
-
-    text = clean_html(text)
-
-    price_range = _extract_price_range(
-        text
-    )
-
-    if price_range is None:
-        price_range = _extract_single_prices(
-            text
-        )
-
-    if price_range is None:
-        return []
-
-    min_price, max_price = price_range
-
-    crop = _detect_crop(text)
-
-    apmc = _detect_apmc(text)
-
-    if not crop:
-        return []
-
-    if not apmc:
-        return []
-
-    return [
-        {
-            "date": item.get(
-                "published_at",
-                "",
-            ),
-            "apmc_name": apmc,
-            "crop": crop,
-            "min_price": min_price,
-            "max_price": max_price,
-            "source": item.get(
-                "source",
-                "",
-            ),
-            "title": item.get(
-                "title",
-                "",
-            ),
-            "link": item.get(
-                "link",
-                "",
-            ),
-        }
-    ]
-
-
-# ============================================================
-# OPTIONAL LIVE MANDI API
-# ============================================================
-
-def fetch_live_mandi() -> list[dict]:
-
-    if not MANDI_API_URL:
-        return []
-
-    try:
-
-        headers = {
-            "User-Agent": "Smart-Agri-Market-AI/10.3",
-        }
-
-        if MANDI_API_KEY:
-            headers["X-API-Key"] = MANDI_API_KEY
-
-        request = urllib.request.Request(
-            MANDI_API_URL,
-            headers=headers,
-        )
-
-        with urllib.request.urlopen(
-            request,
-            timeout=12,
-        ) as response:
-
-            raw = response.read().decode(
-                "utf-8",
-                errors="replace",
-            )
-
-        import json
-
-        payload = json.loads(raw)
-
-        rows = []
-
-        if isinstance(payload, dict):
-
-            for key in (
-                "data",
-                "records",
-                "items",
-                "results",
-            ):
-
-                value = payload.get(key)
-
-                if isinstance(value, list):
-                    rows = value
+        if not crop:
+            for alias, name in aliases.items():
+                if alias and alias in q:
+                    crop = name
                     break
 
-        elif isinstance(payload, list):
-            rows = payload
+    data = getattr(_agent, "CROP_DATA", {}) if _agent else {}
+    profile = data.get(crop, {}) if crop else {}
 
-        result = []
-
-        for row in rows:
-
-            if not isinstance(row, dict):
-                continue
-
-            result.append(row)
-
-        return result
-
-    except Exception:
-        return []
-
-
-# ============================================================
-# MARKET NEWS ENDPOINT
-# ============================================================
-
-@app.get("/api/v1/market/news")
-def market_news():
-
-    live_items = fetch_live_mandi()
-
-    queries = [
-        "APMC Gujarat market price",
-        "Rajkot APMC market price",
-        "Gujarat market prices agriculture",
-        "groundnut market price Gujarat",
-        "cotton market price Gujarat",
-        "cumin market price Gujarat",
-        "onion market price Gujarat",
-        "agricultural market Gujarat",
-    ]
-
-    news_items, errors = fetch_news_from_queries(
-        queries=queries,
-        category="બજાર ભાવ સમાચાર",
-        max_items=40,
+    if any(x in q for x in ("સિંચાઈ", "પાણી", "પિયત", "irrigation", "water")):
+        return (
+            f"💧 {crop or 'પાક'} માટે સિંચાઈ સલાહ:\n"
+            f"{profile.get('પાણી', 'પાકની અવસ્થા, જમીનનો ભેજ અને વરસાદ પ્રમાણે સિંચાઈ કરો; પાણી ભરાવું ટાળો.')}\n"
+            "છેલ્લો વરસાદ, જમીનનો પ્રકાર અને પાકની હાલની અવસ્થા જણાવશો તો સલાહ વધુ ચોક્કસ કરી શકું."
+        )
+    if any(x in q for x in ("ખાતર", "પોષણ", "fertilizer", "npk")):
+        return (
+            f"🧪 {crop or 'પાક'} માટે પોષણ:\n"
+            "માટી પરીક્ષણ આધારિત N-P-K અને સૂક્ષ્મ તત્ત્વો નક્કી કરો. પાકની અવસ્થા પ્રમાણે ખાતર વહેંચીને આપવું વધુ યોગ્ય રહે છે. "
+            "માટી રિપોર્ટ વગર ચોક્કસ ડોઝ નક્કી ન કરવો."
+        )
+    if any(x in q for x in ("રોગ", "જીવાત", "ઈયળ", "ઇયળ", "પાન પીળ", "disease", "pest")):
+        disease = getattr(_agent, "_DISEASES", {}).get(crop, []) if _agent else []
+        extra = "\n".join(f"• {x}" for x in disease[:3])
+        return (
+            f"🔎 {crop or 'પાક'} માટે રોગ/જીવાત તપાસ:\n"
+            f"{extra or 'પાન, ડાંઠ, મૂળ અને ફળનું નજીકથી નિરીક્ષણ કરો અને પાણી/પોષણની સ્થિતિ તપાસો.'}\n"
+            "ફોટો, પાકની ઉંમર અને નુકસાનનું પ્રમાણ આપશો તો વધુ મદદ કરી શકું. દવા/માત્રા સ્થાનિક નોંધાયેલ ભલામણ મુજબ જ નક્કી કરો."
+        )
+    if crop and profile:
+        return (
+            f"🌱 {crop} અંગે ઉપયોગી માહિતી:\n"
+            f"• જમીન: {profile.get('જમીન', 'માટી પરીક્ષણ મુજબ')}\n"
+            f"• વાવણી: {profile.get('વાવણી', 'સ્થાનિક ભલામણ મુજબ')}\n"
+            f"• પાણી: {profile.get('પાણી', 'પાકની અવસ્થા અને જમીનના ભેજ મુજબ')}\n"
+            f"• સાવચેતી: {profile.get('સાવચેતી', 'નિયમિત નિરીક્ષણ કરો')}"
+        )
+    return (
+        "🤖 ખેડૂત સહાયક: પ્રશ્નનો વધુ ચોક્કસ જવાબ આપવા પાકનું નામ, પાકની ઉંમર/વાવણી તારીખ, "
+        "જમીનનો પ્રકાર, છેલ્લું સિંચાઈ/વરસાદ અને સમસ્યાના લક્ષણો લખો. ફોટો હોય તો મોકલી શકો."
     )
 
-    market_table: list[dict] = []
-
-    for item in news_items:
-
-        parsed_rows = parse_market_prices(
-            item
-        )
-
-        market_table.extend(
-            parsed_rows
-        )
-
-    return {
-        "ok": True,
-        "updated_at": now_local_string(),
-        "items": [
-            public_news_item(item)
-            for item in news_items
-        ],
-        "market_table": market_table,
-        "live": bool(live_items),
-        "source": (
-            "Live APMC API + "
-            "Google News RSS / original publishers"
-        ),
-        "errors": errors,
-    }
-
-
-# ============================================================
-# ROOT
-# ============================================================
 
 @app.get("/")
 def root():
+    return {"ok": True, "service": "smart-agri-ai", "version": APP_VERSION}
 
-    return {
-        "ok": True,
-        "service": "Smart Agri-Market AI",
-        "version": APP_VERSION,
-        "status": "running",
-    }
-
-
-@app.head("/")
-def root_head():
-    return None
-
-
-# ============================================================
-# HEALTH
-# ============================================================
 
 @app.get("/api/v1/health")
 def health():
-
     return {
         "ok": True,
-        "status": "healthy",
-        "service": "smart-agri-market-ai",
+        "service": "smart-agri-ai",
         "version": APP_VERSION,
+        "agent_loaded": _agent is not None,
+        "openai_configured": bool(os.getenv("OPENAI_API_KEY", "").strip()),
+        "model": MODEL,
     }
 
 
-# ============================================================
-# RULE BASED ANSWER
-# ============================================================
+NEWS_DEFAULT_MAX_AGE_HOURS = 48
+NEWS_FETCH_TIMEOUT_SECONDS = 15
 
-def rule_based_answer(
-    question: str,
-) -> str | None:
 
-    if AGENT is None:
-        return None
-
+def _news_max_age_hours() -> int:
     try:
-
-        aliases = getattr(
-            AGENT,
-            "ROMAN_ALIASES",
-            {},
-        )
-
-        crops = getattr(
-            AGENT,
-            "CROPS",
-            {},
-        )
-
-        crop_data = getattr(
-            AGENT,
-            "CROP_DATA",
-            {},
-        )
-
-        q = norm(question)
-
-        detected_crop = None
-
-        for crop_name, data in (
-            crops.items()
-            if isinstance(crops, dict)
-            else []
-        ):
-
-            if norm(crop_name) in q:
-                detected_crop = crop_name
-                break
-
-            if isinstance(aliases, dict):
-
-                for alias, mapped in aliases.items():
-
-                    if norm(alias) in q and (
-                        mapped == crop_name
-                        or norm(str(mapped)) == norm(crop_name)
-                    ):
-                        detected_crop = crop_name
-                        break
-
-            if detected_crop:
-                break
-
-        if not detected_crop:
-            return None
-
-        data = crop_data.get(
-            detected_crop
-        )
-
-        if not data:
-            return None
-
-        if isinstance(data, dict):
-
-            parts = [
-                f"પાક: {detected_crop}"
-            ]
-
-            for key, value in data.items():
-
-                if value in (
-                    None,
-                    "",
-                    [],
-                    {},
-                ):
-                    continue
-
-                parts.append(
-                    f"{key}: {value}"
-                )
-
-            return "\n".join(parts)
-
-        return str(data)
-
+        value = int(os.getenv("NEWS_MAX_AGE_HOURS", str(NEWS_DEFAULT_MAX_AGE_HOURS)))
+        return max(1, min(value, 168))
     except Exception:
+        return NEWS_DEFAULT_MAX_AGE_HOURS
+
+
+def _parse_news_date(value: str):
+    if not value:
         return None
-
-
-# ============================================================
-# GROQ CLIENT
-# ============================================================
-
-def groq_client() -> OpenAI:
-
-    if not GROQ_API_KEY:
-        raise HTTPException(
-            status_code=503,
-            detail="GROQ_API_KEY is not configured",
-        )
-
-    return OpenAI(
-        api_key=GROQ_API_KEY,
-        base_url="https://api.groq.com/openai/v1",
-    )
-
-
-# ============================================================
-# GEMINI CLIENT
-# ============================================================
-
-def gemini_client() -> genai.Client:
-
-    if not GEMINI_API_KEY:
-        raise HTTPException(
-            status_code=503,
-            detail="GEMINI_API_KEY is not configured",
-        )
-
-    return genai.Client(
-        api_key=GEMINI_API_KEY
-    )
-
-
-# ============================================================
-# ERROR PARSER & RETRY UTILS
-# ============================================================
-
-def parse_exception_details(exc: Exception) -> tuple[bool, int | None, str]:
-    """
-    Robustly parses Google GenAI exceptions and generic network errors.
-    Returns: (is_temporary_error, status_code, error_message)
-    """
-    status_code = None
-    msg = str(exc)
-
-    # In the google-genai SDK, APIError and subclasses carry a 'code' attribute.
-    if hasattr(exc, "code") and isinstance(getattr(exc, "code"), int):
-        status_code = getattr(exc, "code")
-    elif hasattr(exc, "status_code") and isinstance(getattr(exc, "status_code"), int):
-        status_code = getattr(exc, "status_code")
-    elif hasattr(exc, "response_json") and isinstance(getattr(exc, "response_json"), dict):
-        resp_json = getattr(exc, "response_json")
-        if resp_json:
-            code_val = resp_json.get("code") or resp_json.get("error", {}).get("code")
-            if isinstance(code_val, int):
-                status_code = code_val
-
-    # Regex fallback if attributes are missing
-    if status_code is None:
-        match = re.search(r"\b(400|401|403|404|408|429|500|502|503|504)\b", msg)
-        if match:
-            status_code = int(match.group(1))
-
-    # Identify permanent vs temporary
-    permanent_codes = {400, 401, 403, 404}
-    if status_code in permanent_codes:
-        return False, status_code, msg
-
-    temporary_codes = {408, 429, 500, 502, 503, 504}
-    if status_code in temporary_codes:
-        return True, status_code, msg
-
-    # Keyword semantic match
-    temp_keywords = [
-        "503", "429", "500", "502", "504", "408",
-        "UNAVAILABLE", "RESOURCE_EXHAUSTED", "TOO_MANY_REQUESTS",
-        "HIGH_DEMAND", "TEMPORARY", "DEADLINE_EXCEEDED", "INTERNAL"
-    ]
-
-    upper_msg = msg.upper()
-    if any(kw in upper_msg for kw in temp_keywords):
-        return True, status_code, msg
-
-    # Catch SDK-specific explicit ServerError wrapper
-    if "ServerError" in type(exc).__name__:
-        return True, status_code, msg
-
-    return False, status_code, msg
-
-
-def is_retryable_exception(exc: Exception) -> bool:
-    is_temp, _, _ = parse_exception_details(exc)
-    return is_temp
-
-
-def invoke_gemini_vision_model(
-    client: genai.Client,
-    model_name: str,
-    image_bytes: bytes,
-    mime_type: str,
-    prompt: str,
-) -> str:
-    """
-    Synchronous function executing the generative call wrapped in Tenacity's Retrying logic.
-    Must be executed via run_in_threadpool in FastAPI to prevent blocking the event loop.
-    """
-
-    def _log_attempt(retry_state: RetryCallState):
-        exc = retry_state.outcome.exception()
-        if exc:
-            is_temp, code, _ = parse_exception_details(exc)
-            logger.warning(
-                f"[RETRY] Model: {model_name} | Attempt: {retry_state.attempt_number}/3 | "
-                f"Code: {code} | ErrorType: {type(exc).__name__} - Retrying after backoff..."
-            )
-
-    retryer = Retrying(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=2, min=2, max=8),
-        retry=retry_if_exception(is_retryable_exception),
-        before_sleep=_log_attempt,
-        reraise=True,
-    )
-
-    for attempt_state in retryer:
-        with attempt_state:
-            image_part = types.Part.from_bytes(
-                data=image_bytes,
-                mime_type=mime_type,
-            )
-
-            response = client.models.generate_content(
-                model=model_name,
-                contents=[
-                    image_part,
-                    prompt,
-                ],
-                config=types.GenerateContentConfig(
-                    system_instruction=SYSTEM,
-                    temperature=0.2,
-                    max_output_tokens=4096,
-                ),
-            )
-
-            answer = (
-                getattr(response, "text", None)
-                or ""
-            ).strip()
-
-            if not answer:
-                answer = (
-                    "ફોટામાંથી પૂરતી માહિતી મળી નથી. "
-                    "કૃપા કરીને પાકનો થોડો વધુ સ્પષ્ટ ફોટો મોકલો."
-                )
-
-            return answer
-
-
-# ============================================================
-# AI ASK
-# ============================================================
-
-@app.post("/api/v1/ai/ask")
-def ai_ask(payload: Ask):
-
-    question = payload.question.strip()
-
-    if not question:
-        raise HTTPException(
-            status_code=400,
-            detail="question is required",
-        )
-
-    # --------------------------------------------------------
-    # RULE-BASED RESPONSE FIRST
-    # --------------------------------------------------------
-
+    value = value.strip()
     try:
-
-        rule_answer = rule_based_answer(
-            question
-        )
-
-        if rule_answer:
-            return {
-                "answer": rule_answer,
-                "mode": "rule_based",
-                "model": "local-rule-engine",
-            }
-
+        dt = parsedate_to_datetime(value)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
     except Exception:
         pass
-
-    # --------------------------------------------------------
-    # GROQ AI
-    # --------------------------------------------------------
-
-    client = groq_client()
-
-    context_text = ""
-
-    if payload.context:
-
-        context_text = (
-            "\n\nContext:\n"
-            + str(payload.context)
-        )
-
+    # A few publishers/feeds emit ISO-8601 dates rather than RFC-822 pubDate.
     try:
+        normalized = value.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(normalized)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
 
-        completion = client.chat.completions.create(
-            model=GROQ_MODEL,
-            messages=[
-                {
-                    "role": "system",
-                    "content": SYSTEM,
-                },
-                {
-                    "role": "user",
-                    "content": question + context_text,
-                },
-            ],
-            temperature=0.2,
-        )
 
-        answer = (
-            completion.choices[0]
-            .message
-            .content
-            or ""
-        ).strip()
+def _feed_queries(query: str):
+    base = [
+        "ગુજરાત ખેડૂત ખેતી કૃષિ",
+        "ગુજરાત APMC બજાર ભાવ ખેડૂત",
+        "ગુજરાત કૃષિ યોજના સહાય ખેડૂત",
+        "ગુજરાત હવામાન વરસાદ ખેડૂતો",
+    ]
+    if query.strip():
+        base.insert(0, query.strip())
+    # Keep queries narrow enough that Google's recent-window search is useful.
+    return list(dict.fromkeys(base))
 
+
+def _fetch_news_items(query: str, limit: int = 20):
+    queries = _feed_queries(query)
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(hours=_news_max_age_hours())
+    india_tz = timezone(timedelta(hours=5, minutes=30))
+    items = []
+    seen = set()
+    diagnostics = {
+        "feeds_scanned": 0, "feed_items": 0, "dated_items": 0,
+        "fresh_items": 0, "returned_items": 0, "fetch_errors": 0,
+        "parse_errors": 0, "queries": [],
+    }
+
+    for search_query in queries:
+        diagnostics["feeds_scanned"] += 1
+        recent_query = f"{search_query} when:2d"
+        url = "https://news.google.com/rss/search?" + urllib.parse.urlencode({
+            "q": recent_query, "hl": "gu", "gl": "IN", "ceid": "IN:gu"
+        })
+        diagnostics["queries"].append(search_query)
+        request = urllib.request.Request(url, headers={
+            "User-Agent": "Mozilla/5.0 (Linux; Android 15) SmartAgriMarketAI/1.0"
+        })
+        try:
+            with urllib.request.urlopen(request, timeout=NEWS_FETCH_TIMEOUT_SECONDS) as response:
+                payload = response.read()
+            root = ET.fromstring(payload)
+        except Exception as exc:
+            # Fallback: fetch the same query without Google's undocumented time operator;
+            # the server-side timestamp filter below remains authoritative.
+            logger.warning("News RSS recent query failed query=%r error=%s; trying plain RSS", search_query, exc)
+            try:
+                fallback_url = "https://news.google.com/rss/search?" + urllib.parse.urlencode({
+                    "q": search_query, "hl": "gu", "gl": "IN", "ceid": "IN:gu"
+                })
+                fallback_request = urllib.request.Request(fallback_url, headers={
+                    "User-Agent": "Mozilla/5.0 (Linux; Android 15) SmartAgriMarketAI/1.0"
+                })
+                with urllib.request.urlopen(fallback_request, timeout=NEWS_FETCH_TIMEOUT_SECONDS) as response:
+                    payload = response.read()
+                root = ET.fromstring(payload)
+            except Exception as fallback_exc:
+                diagnostics["fetch_errors"] += 1
+                logger.warning("News RSS fallback failed query=%r error=%s", search_query, fallback_exc)
+                continue
+
+        for item in root.findall(".//item")[:100]:
+            diagnostics["feed_items"] += 1
+            title = (item.findtext("title") or "").strip()
+            link = (item.findtext("link") or "").strip()
+            date_text = (item.findtext("pubDate") or item.findtext("date") or "").strip()
+            source_node = item.find("source")
+            source = (source_node.text if source_node is not None else "") or ""
+            source = source.strip()
+            published = _parse_news_date(date_text)
+            if not title or not link:
+                continue
+            if published is None:
+                diagnostics["parse_errors"] += 1
+                continue
+            diagnostics["dated_items"] += 1
+            if published < cutoff or published > now + timedelta(minutes=10):
+                continue
+            diagnostics["fresh_items"] += 1
+            # Title + publisher is more stable than the Google redirect URL.
+            key = re.sub(r"\s+", " ", title.casefold()) + "|" + source.casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            items.append({
+                "title": title,
+                "link": link,
+                "published_at": published.isoformat(),
+                "published_text": published.astimezone(india_tz).strftime("%d-%m-%Y %I:%M %p"),
+                "source": source or "સમાચાર સ્ત્રોત",
+            })
+
+    items.sort(key=lambda x: x["published_at"], reverse=True)
+    final = items[:limit]
+    diagnostics["returned_items"] = len(final)
+    logger.info(
+        "NEWS_DIAGNOSTICS feeds=%s feed_items=%s dated=%s fresh=%s returned=%s fetch_errors=%s parse_errors=%s",
+        diagnostics["feeds_scanned"], diagnostics["feed_items"], diagnostics["dated_items"],
+        diagnostics["fresh_items"], diagnostics["returned_items"], diagnostics["fetch_errors"],
+        diagnostics["parse_errors"],
+    )
+    return final, diagnostics
+
+
+@app.get("/api/v1/news")
+def news(crop: str = ""):
+    crop_name = crop.strip()
+    query = f"{crop_name} ગુજરાત ખેડૂત ખેતી કૃષિ બજાર" if crop_name else "ગુજરાત ખેડૂત ખેતી કૃષિ બજાર"
+    items, diagnostics = _fetch_news_items(query, 12)
+    return {
+        "ok": True,
+        "crop": crop_name,
+        "max_age_hours": _news_max_age_hours(),
+        "checked_at": datetime.now(timezone.utc).isoformat(),
+        "diagnostics": diagnostics,
+        "items": items,
+        "message": "આજના પ્રકાશિત થયેલા સમાચાર" if items else "હાલમાં તાજા સમાચાર મળ્યા નથી.",
+    }
+
+@app.post("/api/v1/ai/ask")
+def ask(req: Ask):
+    if not req.question.strip():
+        raise HTTPException(status_code=400, detail="પ્રશ્ન ખાલી છે.")
+    try:
+        client = openai_client()
+        if client is None:
+            return {"answer": rule_based_answer(req.question, req.context), "mode": "agent"}
+        ctx = req.context or {}
+        prompt = f"ખેડૂત પ્રશ્ન: {req.question.strip()}\nખેડૂત સંદર્ભ: {ctx}"
+        response = client.responses.create(model=MODEL, instructions=SYSTEM, input=prompt)
+        answer = (response.output_text or "").strip()
+        if not answer:
+            answer = rule_based_answer(req.question, req.context)
+        return {"answer": answer, "mode": "openai", "model": MODEL}
+    except Exception as exc:
+        # Never make the Android button fail just because the external AI service failed.
         return {
-            "answer": answer,
-            "mode": "groq",
-            "model": GROQ_MODEL,
+            "answer": rule_based_answer(req.question, req.context),
+            "mode": "agent_fallback",
+            "warning": str(exc),
         }
 
-    except Exception as exc:
-
-        import traceback
-        traceback.print_exc()
-
-        raise HTTPException(
-            status_code=502,
-            detail=f"Groq AI request failed: {str(exc)}",
-        )
-
-
-# ============================================================
-# GEMINI VISION / PHOTO AI
-# ============================================================
 
 @app.post("/api/v1/ai/diagnose")
-async def ai_diagnose(
-    image: UploadFile = File(...),
-    crop: str = Form(""),
-    context: str = Form(""),
-):
-
-    # --------------------------------------------------------
-    # READ IMAGE
-    # --------------------------------------------------------
-
-    image_bytes = await image.read()
-
-    if not image_bytes:
-        raise HTTPException(
-            status_code=400,
-            detail="Image is empty",
-        )
-
-    # 15 MB safety limit
-    if len(image_bytes) > 15 * 1024 * 1024:
-        raise HTTPException(
-            status_code=413,
-            detail="Image too large",
-        )
-
-    # --------------------------------------------------------
-    # GEMINI CLIENT
-    # --------------------------------------------------------
-
-    client = gemini_client()
-
-    mime_type = (
-        image.content_type
-        or "image/jpeg"
-    )
-
-    # --------------------------------------------------------
-    # VISION PROMPT
-    # --------------------------------------------------------
-
-    prompt = f"""
-આ ફોટો ખેડૂત દ્વારા મોકલવામાં આવ્યો છે.
-
-પાક:
-{crop or "માહિતી આપવામાં આવી નથી"}
-
-વધારાની માહિતી:
-{context or "કોઈ માહિતી નથી"}
-
-ફોટાનું ધ્યાનપૂર્વક નિરીક્ષણ કરો.
-
-જવાબ સંપૂર્ણ ગુજરાતીમાં આપો.
-
-જવાબમાં આ મુદ્દાઓ શક્ય હોય ત્યાં સુધી આપો:
-
-1. ફોટામાં શું દેખાય છે
-2. પાક/છોડની સંભવિત સમસ્યા
-3. સંભવિત રોગ અથવા જીવાત
-4. શા માટે આવું થઈ શકે
-5. શું કરવું
-6. દવા/ઉપચારની સામાન્ય સલાહ
-7. સાવચેતી
-8. જો ફોટાથી ચોક્કસ diagnosis શક્ય ન હોય તો તે સ્પષ્ટ કહો
-
-ખાસ સૂચના:
-
-- જવાબ માત્ર 1-3 લાઇનમાં બંધ ન કરો.
-- શક્ય હોય ત્યારે વિગતવાર અને પૂર્ણ જવાબ આપો.
-- કોઈ મહત્વની માહિતી કાપી ન નાખો.
-- Markdown headings અને bullet points ઉપયોગ કરી શકો છો.
-- માત્ર ફોટામાં ખરેખર દેખાતી બાબતોના આધારે નિરીક્ષણ કરો.
-- ખોટી ખાતરી ન આપો.
-"""
-
-    # --------------------------------------------------------
-    # SEND IMAGE TO GEMINI VISION
-    # --------------------------------------------------------
-
-    try:
-        answer = await run_in_threadpool(
-            invoke_gemini_vision_model,
-            client,
-            PRIMARY_VISION_MODEL,
-            image_bytes,
-            mime_type,
-            prompt
-        )
-
+async def diagnose(image: UploadFile = File(...), crop: str = Form(""), context: str = Form("")):
+    data = await image.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="ફોટો ખાલી છે.")
+    client = openai_client()
+    if client is None:
         return {
-            "answer": answer,
-            "mode": "gemini_vision",
-            "model": PRIMARY_VISION_MODEL,
+            "answer": "📷 ફોટો મળ્યો છે, પરંતુ ફોટો આધારિત AI વિશ્લેષણ સેવા હાલમાં ઉપલબ્ધ નથી. થોડા સમય પછી ફરી પ્રયાસ કરો. હાલમાં ફોટા પરથી નિશ્ચિત રોગનિદાન અથવા દવા/ડોઝ આપવો યોગ્ય નથી.",
+            "mode": "agent_unavailable",
         }
+    mime = image.content_type or "image/jpeg"
+    b64 = base64.b64encode(data).decode("ascii")
+    prompt = f"""
+આ ખેતીના પાકનો ફોટો છે. પાક: {crop or 'અજ્ઞાત'}. સંદર્ભ: {context}.
 
-    except Exception as primary_exc:
-        is_temp, code, _ = parse_exception_details(primary_exc)
-        
-        if not is_temp:
-            # Do NOT fallback or blindly retry permanent 400 errors.
-            raise HTTPException(
-                status_code=400,
-                detail="Permanent error encountered during diagnosis. Please ensure the image is valid and try again."
-            )
+ફોટો ખૂબ ધ્યાનથી જુઓ: પાનની ઉપર અને નીચેની સપાટી, ડાઘ, છિદ્રો, વળાંક, ચાંદી જેવા નિશાન, કીડા/ઈંડા/લાર્વા, જાળું, સૂકાવું, સડવું, રંગ બદલાવ અને અન્ય દેખાતા લક્ષણો અલગથી નોંધો.
 
-        logger.error(
-            f"[FALLBACK INITIATED] Primary model '{PRIMARY_VISION_MODEL}' failed after retries. "
-            f"Temporary: {is_temp}, Code: {code}. Switching to fallback model '{FALLBACK_VISION_MODEL}'..."
+ખેડૂતને ઉપયોગી થાય એવો વિગતવાર ગુજરાતી જવાબ આપો. જવાબ ઓછામાં ઓછા 8 સ્પષ્ટ વિભાગમાં આપો અને દરેક વિભાગમાં જરૂર મુજબ બુલેટ આપો:
+1) 📷 ફોટામાં ખરેખર શું દેખાય છે — માત્ર દેખાતી બાબતો, અનુમાન નહીં.
+2) 🔎 સૌથી સંભવિત સમસ્યા — રોગ/જીવાત/પોષણ/હવામાન વગેરેમાંથી શું લાગે છે અને કેમ. 1 થી 3 સંભાવનાઓ આપો અને વિશ્વાસનું સ્તર જણાવો.
+3) 🌱 પાકને થતી સંભવિત અસર — પાન, વૃદ્ધિ, ફૂલ/ફળ અને ઉપજ પર શું અસર થઈ શકે.
+4) 🐛 કઈ જીવાત અથવા રોગની વધુ તપાસ કરવી — ઓળખ માટે પાન/ડાંઠ/ફળના કયા ભાગો ફરી જોવાના.
+5) 💊 દવા/નિયંત્રણ — જો ફોટાના લક્ષણોથી કોઈ ચોક્કસ જીવાત/રોગની સંભાવના પૂરતી મજબૂત હોય તો યોગ્ય pesticide/દવા માટે સક્રિય ઘટક (active ingredient), દવાનો પ્રકાર અને સામાન્ય ઉપયોગનો હેતુ જણાવો. શક્ય હોય તો ભારતમાં નોંધાયેલ લેબલ/સ્થાનિક કૃષિ ભલામણ ચકાસવાની જરૂરિયાત લખો. ચોક્કસ બ્રાન્ડને અનિવાર્ય ન બનાવો. ખોટી ઓળખ હોય તો દવા ન છાંટવાની ચેતવણી આપો.
+6) 🧑‍🌾 હમણાં શું કરવું — IPM, અસરગ્રસ્ત પાન/ભાગ દૂર કરવો, સફાઈ, સિંચાઈ/નાઇટ્રોજન જેવી બાબતોમાં યોગ્ય પગલાં.
+7) ⚠️ સલામતી — દવા વાપરવી પડે તો લેબલ મુજબ માત્રા, PPE, waiting period અને સ્થાનિક નિયમોનું પાલન કરવાની સ્પષ્ટ સલાહ. ફોટાથી ખાતરી ન હોય તો ડોઝ ન બનાવો.
+8) 📸 આગળની તપાસ — વધુ ચોક્કસ જવાબ માટે કયો નજીકનો ફોટો, પાનની પાછળની બાજુ, જીવાતનો ફોટો, પાકની ઉંમર અને નુકસાનનું પ્રમાણ જોઈએ.
+
+ફક્ત 1-2 લીટીનો જવાબ ન આપો. સામાન્ય રીતે 500-900 ગુજરાતી શબ્દો જેટલો વિગતવાર જવાબ આપો, પરંતુ બિનજરૂરી વાતો ન ઉમેરો. ફોટામાં જે દેખાતું નથી તે જોયું હોવાનું ન કહો. ફોટા પરથી નિશ્ચિત રોગનિદાન ન કરો. ચોક્કસ pesticide dose માત્ર વિશ્વસનીય રીતે ઓળખાય અને યોગ્ય નોંધાયેલ ભલામણ ઉપલબ્ધ હોય ત્યારે જ આપો; નહીં તો સક્રિય ઘટક/નિયંત્રણ વિકલ્પ જણાવો અને સ્થાનિક કૃષિ નિષ્ણાત/KVK પાસેથી ડોઝ ચકાસવા કહો.
+"""
+    try:
+        response = client.responses.create(
+            model=MODEL,
+            instructions=SYSTEM,
+            max_output_tokens=3000,
+            input=[{"role": "user", "content": [
+                {"type": "input_text", "text": prompt},
+                {"type": "input_image", "image_url": f"data:{mime};base64,{b64}"},
+            ]}],
         )
-
-        try:
-            # Fallback model utilizes the exact same function mapping, ensuring image bytes are passed.
-            answer = await run_in_threadpool(
-                invoke_gemini_vision_model,
-                client,
-                FALLBACK_VISION_MODEL,
-                image_bytes,
-                mime_type,
-                prompt
-            )
-
-            return {
-                "answer": answer,
-                "mode": "gemini_vision",
-                "model": FALLBACK_VISION_MODEL,
-            }
-
-        except Exception as fallback_exc:
-            fb_is_temp, fb_code, _ = parse_exception_details(fallback_exc)
-            logger.error(
-                f"[FAILURE] Fallback model '{FALLBACK_VISION_MODEL}' also failed after retries. "
-                f"Temporary: {fb_is_temp}, Code: {fb_code}."
-            )
-
-            # Return a clear 503 instead of hiding behind a generic generic 502/fake answer.
-            if fb_is_temp:
-                raise HTTPException(
-                    status_code=503,
-                    detail="Gemini Vision service is temporarily unavailable due to high demand. Spikes in demand are usually temporary. Please try again later."
-                )
-            else:
-                raise HTTPException(
-                    status_code=502,
-                    detail="Gemini Vision request failed. Please ensure the image is valid and try again."
-                )
-
-
-# ============================================================
-# STARTUP LOG
-# ============================================================
-
-@app.on_event("startup")
-def startup_log():
-
-    print(
-        f"Smart Agri-Market AI started: {APP_VERSION}"
-    )
-
-    print(
-        "Legacy News endpoint enabled: "
-        "/api/v1/news"
-    )
-
-    print(
-        "Google News RSS recent-window mode: "
-        "when:2d + strict 48h filter"
-    )
-
-    print(
-        "AI Ask endpoint enabled: "
-        "/api/v1/ai/ask"
-    )
-
-    print(
-        "Gemini Vision endpoint enabled: "
-        "/api/v1/ai/diagnose"
-    )
+        return {"answer": response.output_text, "mode": "openai_vision", "model": MODEL}
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Vision AI error: {exc}")
+```
