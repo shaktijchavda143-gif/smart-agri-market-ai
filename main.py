@@ -3,11 +3,13 @@
 Wraps the supplied Smart Agri-Market Agent so the Android app can call it.
 """
 import os
+import asyncio
 import base64
 import importlib.util
 import urllib.parse
 import urllib.request
 import re
+import time
 import json
 import xml.etree.ElementTree as ET
 from html.parser import HTMLParser
@@ -23,7 +25,7 @@ from openai import OpenAI
 from google import genai
 from google.genai import types
 
-APP_VERSION = "11.0 Gemini Vision Stable"
+APP_VERSION = "11.1 Gemini Vision + Mandi Normalized"
 MODEL = os.getenv("OPENAI_MODEL", "gpt-5.6-luna").strip() or "gpt-5.6-luna"
 GEMINI_VISION_MODEL = os.getenv("GEMINI_VISION_MODEL", "gemini-3.6-flash").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
@@ -139,6 +141,10 @@ def health():
         "version": APP_VERSION,
         "agent_loaded": _agent is not None,
         "openai_configured": bool(os.getenv("OPENAI_API_KEY", "").strip()),
+        "gemini_vision_configured": bool(GEMINI_API_KEY),
+        "gemini_vision_model": GEMINI_VISION_MODEL,
+        "mandi_api_configured": bool(os.getenv("DATA_GOV_API_KEY", "").strip()),
+        "news_service": "google-news-rss",
         "model": MODEL,
     }
 
@@ -366,29 +372,35 @@ async def diagnose(image: UploadFile = File(...), crop: str = Form(""), context:
 ફોટામાં ન દેખાતી બાબતોની કલ્પના ન કરો. ચોક્કસ દવા/ડોઝ અંગે સાવચેતી રાખો.
 """
 
-    try:
-        client = genai.Client(api_key=GEMINI_API_KEY)
-        part = types.Part.from_bytes(data=data, mime_type=image.content_type or "image/jpeg")
-        response = await client.aio.models.generate_content(
-            model=GEMINI_VISION_MODEL,
-            contents=[part, prompt],
-            config=types.GenerateContentConfig(
-                system_instruction=SYSTEM,
-                temperature=0.2,
-                max_output_tokens=8192,
-            ),
-        )
-        answer = (getattr(response, "text", "") or "").strip()
-        if not answer:
-            raise RuntimeError("Empty Gemini response")
-        return {
-            "success": True,
-            "answer": answer,
-            "mode": "gemini_vision",
-            "model": GEMINI_VISION_MODEL,
-        }
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Gemini Vision error: {exc}")
+    last_error = "Gemini Vision service unavailable"
+    for attempt in range(4):
+        try:
+            client = genai.Client(api_key=GEMINI_API_KEY)
+            part = types.Part.from_bytes(data=data, mime_type=image.content_type or "image/jpeg")
+            response = await client.aio.models.generate_content(
+                model=GEMINI_VISION_MODEL,
+                contents=[part, prompt],
+                config=types.GenerateContentConfig(
+                    system_instruction=SYSTEM,
+                    temperature=0.2,
+                    max_output_tokens=8192,
+                ),
+            )
+            answer = (getattr(response, "text", "") or "").strip()
+            if not answer:
+                raise RuntimeError("Empty Gemini response")
+            return {
+                "success": True,
+                "answer": answer,
+                "mode": "gemini_vision",
+                "model": GEMINI_VISION_MODEL,
+            }
+        except Exception as exc:
+            last_error = str(exc)[:500]
+            if attempt < 3:
+                await asyncio.sleep(float(2 ** attempt))
+
+    raise HTTPException(status_code=502, detail=f"Gemini Vision error after 3 retries: {last_error}")
 
 # ---------------- Secure Mandi price bridge ----------------
 MANDI_RESOURCE_ID = os.getenv("DATA_GOV_RESOURCE_ID", "9ef84268-d588-465a-a308-a864a43d0070").strip()
@@ -405,30 +417,145 @@ GUJARATI_CROP_ALIASES = {
 
 
 def _mandi_api_get(state: str, district: str, commodity: str):
-    if not MANDI_API_KEY:
-        return None, "Live Mandi API server પર configure થયેલી નથી."
-    params = {"api-key": MANDI_API_KEY, "format": "json", "limit": "100"}
-    if state.strip():
-        params["filters[state]"] = state.strip()
-    if district.strip():
-        params["filters[district]"] = district.strip()
-    if commodity.strip():
-        params["filters[commodity]"] = GUJARATI_CROP_ALIASES.get(commodity.strip(), commodity.strip())
-    url = "https://api.data.gov.in/resource/" + MANDI_RESOURCE_ID + "?" + urllib.parse.urlencode(params)
-    req = urllib.request.Request(url, headers={"Accept": "application/json", "User-Agent": "SmartAgriMarketAI/1.0"})
-    try:
-        with urllib.request.urlopen(req, timeout=12) as response:
-            body = response.read().decode("utf-8", "ignore")
-            return json.loads(body), ""
-    except urllib.error.HTTPError as exc:
-        if exc.code == 429:
-            return None, "Live Mandi API limit પર છે."
-        if exc.code in (401, 403):
-            return None, "Live Mandi API authentication/permission error."
-        return None, f"Live Mandi HTTP error {exc.code}."
-    except Exception:
-        return None, "Live Mandi service હાલમાં ઉપલબ્ધ નથી."
+    """Fetch live mandi rows from the official data.gov.in mandi resource.
 
+    Keep the API key server-side. The Android app never receives it. We also
+    normalize common field-name variants so a harmless upstream schema change
+    does not silently produce blank price cells.
+    """
+    if not MANDI_API_KEY:
+        return None, "Live Mandi API key server પર configure નથી. Renderમાં DATA_GOV_API_KEY ઉમેરો."
+
+    normalized_commodity = commodity.strip()
+    api_commodity = GUJARATI_CROP_ALIASES.get(normalized_commodity, normalized_commodity)
+
+    def request_once(use_district: bool):
+        params = {"api-key": MANDI_API_KEY, "format": "json", "limit": "100"}
+        if state.strip():
+            params["filters[state]"] = state.strip()
+        if use_district and district.strip():
+            params["filters[district]"] = district.strip()
+        if api_commodity and api_commodity.upper() != "ALL":
+            params["filters[commodity]"] = api_commodity
+        url = "https://api.data.gov.in/resource/" + MANDI_RESOURCE_ID + "?" + urllib.parse.urlencode(params)
+        last_error = "Live Mandi service હાલમાં ઉપલબ્ધ નથી."
+        for attempt in range(3):
+            req = urllib.request.Request(
+                url,
+                headers={"Accept": "application/json", "User-Agent": "SmartAgriMarketAI/1.1"},
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=12) as response:
+                    body = response.read().decode("utf-8", "ignore")
+                    payload = json.loads(body)
+                    return payload, ""
+            except urllib.error.HTTPError as exc:
+                if exc.code == 429:
+                    return None, "Live Mandi API limit પર છે."
+                if exc.code in (401, 403):
+                    return None, "Live Mandi API authentication/permission error."
+                last_error = f"Live Mandi HTTP error {exc.code}."
+                if exc.code not in (502, 503):
+                    return None, last_error
+            except Exception:
+                last_error = "Live Mandi service હાલમાં ઉપલબ્ધ નથી."
+            if attempt < 2:
+                time.sleep(float(2 ** attempt))
+        return None, last_error
+
+    data, error = request_once(bool(district.strip()))
+    if isinstance(data, dict) and data.get("records"):
+        raw_records = data.get("records") or []
+        normalized = _normalise_mandi_records(raw_records)
+        raw_keys = sorted(list(raw_records[0].keys())) if isinstance(raw_records[0], dict) else []
+        return {**data, "records": normalized, "_diagnostics": {"raw_record_count": len(raw_records), "raw_sample_keys": raw_keys[:30]}}, ""
+    if error and error not in ("Live Mandi service હાલમાં ઉપલબ્ધ નથી.",):
+        return None, error
+
+    # Some data.gov installations have inconsistent district filter values.
+    # If a district-filtered request returns no rows, retry once without the
+    # district filter. The caller will only show these rows when no district
+    # was requested, preventing a misleading cross-district result.
+    if district.strip():
+        fallback, fallback_error = request_once(False)
+        if isinstance(fallback, dict) and fallback.get("records"):
+            raw_records = fallback.get("records") or []
+            normalized = _normalise_mandi_records(raw_records)
+            raw_keys = sorted(list(raw_records[0].keys())) if isinstance(raw_records[0], dict) else []
+            return {**fallback, "records": normalized, "_diagnostics": {"raw_record_count": len(raw_records), "raw_sample_keys": raw_keys[:30]}, "district_filter_miss": True}, ""
+        return None, fallback_error or error or "આ જિલ્લો માટે હાલ Live Mandi record મળ્યો નથી."
+
+    return data, error
+
+
+def _parse_mandi_date(value: str):
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    raw = raw.replace("T", " ").replace("Z", "").strip()
+    formats = (
+        "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d",
+        "%d/%m/%Y %H:%M:%S", "%d/%m/%Y %H:%M", "%d/%m/%Y",
+        "%d-%m-%Y %H:%M:%S", "%d-%m-%Y %H:%M", "%d-%m-%Y",
+        "%d %b %Y", "%d %B %Y"
+    )
+    for fmt in formats:
+        try:
+            return datetime.strptime(raw, fmt).replace(tzinfo=timezone(timedelta(hours=5, minutes=30)))
+        except ValueError:
+            continue
+    return None
+
+
+def _normalise_price(value: str):
+    if value is None:
+        return ""
+    text = str(value).strip().replace(",", "").replace("₹", "").replace("રૂ.", "").replace("રૂ", "").strip()
+    text = text.translate(str.maketrans("૦૧૨૩૪૫૬૭૮૯", "0123456789"))
+    m = re.search(r"(?<!\d)(\d+(?:\.\d+)?)", text)
+    if not m:
+        return ""
+    try:
+        number = float(m.group(1))
+    except ValueError:
+        return ""
+    if not (0 < number < 10000000):
+        return ""
+    return str(int(number)) if number.is_integer() else f"{number:.2f}"
+
+
+def _normalise_mandi_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def pick(row, *keys):
+        for key in keys:
+            value = row.get(key)
+            if value is not None and str(value).strip():
+                return str(value).strip()
+        return ""
+
+    normalized = []
+    for row in records:
+        if not isinstance(row, dict):
+            continue
+        arrival = pick(row, "arrival_date", "Arrival_Date", "arrival date", "date", "Date")
+        parsed = _parse_mandi_date(arrival)
+        min_price = _normalise_price(pick(row, "min_price", "Min Price", "min price", "Min_Price", "Min_x0020_Price"))
+        modal_price = _normalise_price(pick(row, "modal_price", "Modal Price", "modal price", "Modal_Price", "Modal_x0020_Price"))
+        max_price = _normalise_price(pick(row, "max_price", "Max Price", "max price", "Max_Price", "Max_x0020_Price"))
+        if not any((min_price, modal_price, max_price)):
+            continue
+        normalized.append({
+            "state": pick(row, "state", "State"),
+            "district": pick(row, "district", "District"),
+            "market": pick(row, "market", "Market", "market_name"),
+            "commodity": pick(row, "commodity", "Commodity"),
+            "variety": pick(row, "variety", "Variety"),
+            "arrival_date": arrival,
+            "arrival_date_iso": parsed.isoformat() if parsed else "",
+            "min_price": min_price,
+            "modal_price": modal_price,
+            "max_price": max_price,
+        })
+    return normalized
 
 def _news_price_number(text: str):
     if not text:
@@ -697,37 +824,42 @@ def mandi_news(commodity: str = ""):
 
 
 @app.get("/api/v1/mandi")
-def mandi(state: str = "Gujarat", district: str = "", commodity: str = ""):
+def mandi(state: str = "Gujarat", district: str = "", commodity: str = "ALL"):
     checked_at = datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=5, minutes=30))).strftime("%d-%m-%Y %H:%M")
 
-    # Keep the legacy combined response too, but the Android client no longer
-    # depends on this endpoint for news prices.
-    try:
-        news_prices = _news_market_prices(commodity, 20)
-    except Exception:
-        news_prices = []
-
+    # Live Mandi is deliberately isolated from general/news price content.
     data, error = _mandi_api_get(state, district, commodity)
     records = []
     if isinstance(data, dict):
         records = data.get("records") or []
+        if district and data.get("district_filter_miss"):
+            records = []
+            error = error or "આ જિલ્લો માટે Live Mandi record મળ્યો નથી."
 
     live_available = bool(records)
     if live_available:
-        message = "Live Mandi ભાવ મળ્યા. સાથે છેલ્લા 2 દિવસના સમાચાર આધારિત ભાવ પણ ઉપલબ્ધ છે."
+        message = "Live Mandi ભાવ મળ્યા."
     else:
-        live_error = error or "Live Mandi APIમાંથી હાલ કોઈ record મળ્યો નથી."
-        message = live_error + ("\n\nછેલ્લા 2 દિવસના સમાચાર આધારિત ભાવ બતાવ્યા છે." if news_prices else "\n\nછેલ્લા 2 દિવસમાં વિશ્વસનીય સમાચાર ભાવ મળ્યો નથી.")
+        message = error or "Live Mandi APIમાંથી હાલ કોઈ usable price record મળ્યો નથી."
+
+    raw_diag = data.get("_diagnostics", {}) if isinstance(data, dict) else {}
+    raw_count = int(raw_diag.get("raw_record_count", 0) or 0)
+    sample_keys = list(raw_diag.get("raw_sample_keys", []) or [])
+    diagnostics = {
+        "raw_record_count": raw_count,
+        "normalized_record_count": len(records),
+        "sample_record_keys": sample_keys[:30],
+        "summary": f"API configured={bool(MANDI_API_KEY)}; raw={raw_count}; usable_price_rows={len(records)}" + (f"; sample keys={', '.join(sample_keys[:8])}" if sample_keys else "")
+    }
 
     return {
         "ok": True,
         "live_available": live_available,
         "live_api_configured": bool(MANDI_API_KEY),
         "live_error": "" if live_available else (error or "no_records"),
-        "source": "data.gov.in Live Mandi API" if live_available else "news",
+        "source": "data.gov.in Live Mandi API" if live_available else "none",
         "checked_at": checked_at,
-        "news_window_hours": _news_max_age_hours(),
         "records": records[:50],
-        "news_prices": news_prices,
         "message": message,
+        "diagnostics": diagnostics,
     }
