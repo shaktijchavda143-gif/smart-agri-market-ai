@@ -438,7 +438,7 @@ GUJARATI_CROP_ALIASES = {
 
 def _mandi_cache_key(state: str, district: str, commodity: str) -> str:
     normalized = GUJARATI_CROP_ALIASES.get((commodity or "").strip(), (commodity or "").strip())
-    return "|".join((state or "").strip().lower(), (district or "").strip().lower(), normalized.lower())
+    return "|".join(((state or "").strip().lower(), (district or "").strip().lower(), normalized.lower()))
 
 
 def _mandi_cached_result(key: str, now: float, allow_stale: bool = False):
