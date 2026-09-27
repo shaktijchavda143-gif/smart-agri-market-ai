@@ -242,19 +242,41 @@ def _fetch_article_text(link: str, max_chars: int = 60000, timeout_seconds: int 
         return ""
 
 
-_LAST_NEWS_FETCH_DIAGNOSTICS = {"rss_search_failed": 0, "rss_items_seen": 0, "fresh_items_kept": 0}
+_LAST_NEWS_FETCH_DIAGNOSTICS = {
+    "rss_search_failed": 0,
+    "rss_items_seen": 0,
+    "fresh_items_kept": 0,
+    "queries_tried": 0,
+    "empty_feeds": 0,
+    "english_headlines_rejected": 0,
+    "fallback_used": False,
+    "fallback_reason": "",
+}
 
 NEWS_QUERY_SUFFIX = "when:2d"
 
-# Google News RSS can return an empty feed for some Gujarati + when:2d
-# combinations even when the same topic has RSS results without that operator.
-# Freshness is therefore enforced locally from pubDate; the search operator is
-# only an optional accelerator, never the sole freshness mechanism.
+# Gujarati-first fallback chain. Keep the existing local publication-date
+# freshness check below; `when:2d` is only an RSS search accelerator.
 NEWS_QUERY_VARIANTS = (
     "ગુજરાત ખેડૂત ખેતી કૃષિ સમાચાર",
-    "Gujarat agriculture farmer news",
-    "Gujarat agriculture farmers crop news",
+    "ગુજરાત કૃષિ ખેડૂત પાક સમાચાર",
+    "ગુજરાત ખેડૂત મહત્વના કૃષિ સમાચાર",
 )
+
+NEWS_IMPORTANT_FALLBACK_QUERIES = (
+    "ગુજરાત ખેડૂત ખેતી કૃષિ તાજા સમાચાર",
+    "ગુજરાત કૃષિ ખેડૂત પાક સરકાર યોજના સમાચાર",
+    "ગુજરાત ખેડૂતો માટે મહત્વના કૃષિ સમાચાર",
+)
+
+
+def _is_gujarati_headline(title: str) -> bool:
+    """Accept headlines containing Gujarati script; reject English-only titles."""
+    text = (title or "").strip()
+    if not text:
+        return False
+    return bool(re.search(r"[\u0A80-\u0AFF]", text))
+
 
 def _news_query_for_category(crop: str, category: str) -> str:
     crop = crop.strip()
@@ -272,13 +294,19 @@ def _news_query_for_category(crop: str, category: str) -> str:
     return base[0] if base else (f"{crop} ગુજરાત ખેડૂત ખેતી" if crop else "ગુજરાત ખેડૂત ખેતી કૃષિ")
 
 
-def _fetch_news_items(query: str, limit: int = 24, include_article_text: bool = False, category: str = "agriculture"):
-    """Fetch fresh Google News RSS items with resilient query fallbacks.
+def _fetch_news_items(
+    query: str,
+    limit: int = 24,
+    include_article_text: bool = False,
+    category: str = "agriculture",
+    requested_crop: str = "",
+):
+    """Fetch fresh Gujarati-first Google News RSS items with safe fallbacks.
 
-    We do NOT trust the Google `when:2d` search operator as the freshness
-    mechanism because some localized feeds return an empty RSS document for
-    that operator. Every accepted item is still required to have a valid
-    publication timestamp inside NEWS_MAX_AGE_HOURS.
+    Existing freshness/diagnostic behavior is preserved. Crop-specific news is
+    tried first; if it yields no usable Gujarati headlines, relevant Gujarati
+    agriculture/farmer queries are used as the fallback instead of returning
+    an empty screen. No English-only headline is exposed to the app.
     """
     global _LAST_NEWS_FETCH_DIAGNOSTICS
     _LAST_NEWS_FETCH_DIAGNOSTICS = {
@@ -287,32 +315,38 @@ def _fetch_news_items(query: str, limit: int = 24, include_article_text: bool = 
         "fresh_items_kept": 0,
         "queries_tried": 0,
         "empty_feeds": 0,
+        "english_headlines_rejected": 0,
+        "fallback_used": False,
+        "fallback_reason": "",
     }
+
     candidates = []
-    for value in [query.strip(), *NEWS_QUERY_VARIANTS]:
+    for value in [query.strip(), *NEWS_QUERY_VARIANTS, *NEWS_IMPORTANT_FALLBACK_QUERIES]:
         value = value.strip()
         if value and value not in candidates:
             candidates.append(value)
+
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(hours=_news_max_age_hours())
     india_tz = timezone(timedelta(hours=5, minutes=30))
     items, seen = [], set()
+    primary_found = False
 
     # Keep the number of RSS calls bounded. The publication timestamp below is
-    # the authoritative freshness check, so there is no need to issue a second
-    # `when:2d` request for every query.
-    for effective_query in candidates[:4]:
+    # the authoritative freshness check; the Google `when:2d` operator is only
+    # an optional accelerator.
+    for query_index, effective_query in enumerate(candidates[:7]):
         if len(items) >= limit:
             break
         effective_query = effective_query.replace(" when:2d", "").replace(" when:1d", "")
         _LAST_NEWS_FETCH_DIAGNOSTICS["queries_tried"] += 1
         url = "https://news.google.com/rss/search?" + urllib.parse.urlencode(
-            {"q": effective_query, "hl": "en-IN", "gl": "IN", "ceid": "IN:en"}
+            {"q": effective_query, "hl": "gu", "gl": "IN", "ceid": "IN:gu"}
         )
         request = urllib.request.Request(
             url,
             headers={
-                "User-Agent": "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/126.0 SmartAgriMarketAI/1.4",
+                "User-Agent": "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/126.0 SmartAgriMarketAI/1.5",
                 "Accept": "application/rss+xml,application/xml,text/xml,*/*;q=0.8",
             },
         )
@@ -331,22 +365,39 @@ def _fetch_news_items(query: str, limit: int = 24, include_article_text: bool = 
         if not rss_items:
             _LAST_NEWS_FETCH_DIAGNOSTICS["empty_feeds"] += 1
             continue
-        for item in rss_items[:40]:
+
+        for rss_item in rss_items[:40]:
             _LAST_NEWS_FETCH_DIAGNOSTICS["rss_items_seen"] += 1
-            title = (item.findtext("title") or "").strip()
-            link = (item.findtext("link") or "").strip()
-            date_text = (item.findtext("pubDate") or "").strip()
-            source = (item.findtext("source") or "").strip()
-            description = (item.findtext("description") or "").strip()
+            title = (rss_item.findtext("title") or "").strip()
+            link = (rss_item.findtext("link") or "").strip()
+            date_text = (rss_item.findtext("pubDate") or "").strip()
+            source = (rss_item.findtext("source") or "").strip()
+            description = (rss_item.findtext("description") or "").strip()
             published = _parse_news_date(date_text)
+
             if not title or not link or published is None:
                 continue
             if published < cutoff or published > now + timedelta(minutes=10):
                 continue
+            if not _is_gujarati_headline(title):
+                _LAST_NEWS_FETCH_DIAGNOSTICS["english_headlines_rejected"] += 1
+                continue
+
             key = link.split("?", 1)[0].casefold()
             if key in seen:
                 continue
             seen.add(key)
+
+            if query_index == 0:
+                primary_found = True
+            elif not primary_found:
+                _LAST_NEWS_FETCH_DIAGNOSTICS["fallback_used"] = True
+                _LAST_NEWS_FETCH_DIAGNOSTICS["fallback_reason"] = (
+                    "crop-specific Gujarati news unavailable; relevant Gujarati agriculture/farmer news used"
+                    if requested_crop else
+                    "primary Gujarati agriculture news unavailable; relevant Gujarati agriculture/farmer news used"
+                )
+
             _LAST_NEWS_FETCH_DIAGNOSTICS["fresh_items_kept"] += 1
             items.append({
                 "title": title,
@@ -359,6 +410,13 @@ def _fetch_news_items(query: str, limit: int = 24, include_article_text: bool = 
             })
             if len(items) >= limit:
                 break
+
+    if not primary_found and len(candidates) > 1:
+        _LAST_NEWS_FETCH_DIAGNOSTICS["fallback_used"] = True
+        if not _LAST_NEWS_FETCH_DIAGNOSTICS["fallback_reason"]:
+            _LAST_NEWS_FETCH_DIAGNOSTICS["fallback_reason"] = (
+                "crop-specific/primary Gujarati news unavailable; fallback queries checked"
+            )
 
     items.sort(key=lambda x: x["published_at"], reverse=True)
     if not include_article_text:
@@ -382,7 +440,7 @@ def news(crop: str = "", category: str = "agriculture"):
     crop_name = crop.strip()
     category_name = (category or "agriculture").strip().lower()
     query = _news_query_for_category(crop_name, category_name) + " " + NEWS_QUERY_SUFFIX
-    items = _fetch_news_items(query, 12, category=category_name)
+    items = _fetch_news_items(query, 12, category=category_name, requested_crop=crop_name)
     diagnostics = dict(_LAST_NEWS_FETCH_DIAGNOSTICS)
     diagnostics["max_age_hours"] = _news_max_age_hours()
     return {
@@ -393,7 +451,7 @@ def news(crop: str = "", category: str = "agriculture"):
         "checked_at": datetime.now(timezone.utc).isoformat(),
         "items": items,
         "diagnostics": diagnostics,
-        "message": "આજના પ્રકાશિત થયેલા સમાચાર" if items else "છેલ્લા 48 કલાકમાં ચકાસેલા તાજા સમાચાર મળ્યા નથી.",
+        "message": "તાજા ગુજરાતી સમાચાર" if items else "છેલ્લા 48 કલાકમાં ચકાસેલા તાજા ગુજરાતી કૃષિ સમાચાર મળ્યા નથી.",
     }
 
 @app.post("/api/v1/ai/ask")
@@ -627,7 +685,7 @@ def _mandi_normalized_result(payload: dict[str, Any], requested_commodity: str, 
 
 def _mandi_api_get(state: str, district: str, commodity: str):
     global _mandi_global_rate_limit_until, _mandi_upstream_failure_until
-    """Fetch live Mandi data with small requests, controlled fallback and cache protection."""
+    """Hybrid live Mandi fetch: old working fallbacks + current cache/429 protection."""
     if not MANDI_API_KEY:
         return None, "Live Mandi API key server પર configure નથી. Renderમાં DATA_GOV_API_KEY ઉમેરો."
 
@@ -637,7 +695,6 @@ def _mandi_api_get(state: str, district: str, commodity: str):
     api_commodity = GUJARATI_CROP_ALIASES.get(normalized_commodity, normalized_commodity)
     if api_commodity.upper() == "ALL":
         api_commodity = ""
-
     key = _mandi_cache_key(state, district, normalized_commodity)
     now = time.monotonic()
 
@@ -664,180 +721,94 @@ def _mandi_api_get(state: str, district: str, commodity: str):
                 return _mandi_cached_payload(data, age, reason), ""
             return None, "Live Mandi API limit પર છે; server cooldown ચાલુ છે. થોડા સમય પછી ફરી પ્રયાસ કરો."
 
-        attempts_log = []
-
         def request_once(*, use_state: bool, use_district: bool, use_commodity: bool):
             global _mandi_global_rate_limit_until, _mandi_upstream_failure_until
-            params = {
-                "api-key": MANDI_API_KEY,
-                "format": "json",
-                # Keep the upstream response small. We only need the latest usable rows.
-                "limit": "25",
-                "offset": "0",
-            }
+            params = {"api-key": MANDI_API_KEY, "format": "json", "limit": "25", "offset": "0"}
             if use_state and state:
                 params["filters[state]"] = state
             if use_district and district:
                 params["filters[district]"] = district
             if use_commodity and api_commodity:
                 params["filters[commodity]"] = api_commodity
-
             url = "https://api.data.gov.in/resource/" + MANDI_RESOURCE_ID + "?" + urllib.parse.urlencode(params)
             last_error = "Live Mandi service હાલમાં ઉપલબ્ધ નથી."
-
-            # One short retry per query. Do not hammer data.gov.in with the same request.
             for attempt in range(2):
-                req = urllib.request.Request(
-                    url,
-                    headers={
-                        "Accept": "application/json",
-                        "User-Agent": "SmartAgriMarketAI/1.3",
-                    },
-                )
+                req = urllib.request.Request(url, headers={"Accept": "application/json", "User-Agent": "SmartAgriMarketAI/1.2"})
                 try:
                     with urllib.request.urlopen(req, timeout=10) as response:
                         body = response.read().decode("utf-8", "ignore")
                         payload = json.loads(body)
-                        if not isinstance(payload, dict):
-                            last_error = "Live Mandi APIએ માન્ય JSON object આપ્યો નથી."
-                            break
-                        return payload, "", 0, attempt + 1
+                        return payload, "", 0
                 except urllib.error.HTTPError as exc:
                     if exc.code == 429:
                         cooldown = _mandi_retry_after_seconds(exc)
                         _mandi_rate_limit_until[key] = time.monotonic() + cooldown
                         _mandi_global_rate_limit_until = time.monotonic() + cooldown
-                        return None, f"Live Mandi API limit પર છે; server cooldown {cooldown} સેકન્ડ માટે સક્રિય છે.", cooldown, attempt + 1
+                        return None, f"Live Mandi API limit પર છે; server cooldown {cooldown} સેકન્ડ માટે સક્રિય છે.", cooldown
                     if exc.code in (401, 403):
-                        return None, "Live Mandi API authentication/permission error.", 0, attempt + 1
+                        return None, "Live Mandi API authentication/permission error.", 0
                     last_error = f"Live Mandi HTTP error {exc.code}."
+                    # 502/503 can be transient; retry this exact query briefly.
                     if exc.code not in (502, 503, 504):
-                        return None, last_error, 0, attempt + 1
-                except urllib.error.URLError as exc:
+                        return None, last_error, 0
+                except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
                     last_error = "Live Mandi service હાલમાં ઉપલબ્ધ નથી."
-                except TimeoutError:
-                    last_error = "Live Mandi service timeout થયું."
-                except json.JSONDecodeError:
-                    last_error = "Live Mandi APIએ invalid JSON આપ્યો."
                 except Exception as exc:
                     last_error = f"Live Mandi request error: {str(exc)[:180]}"
-
-                if attempt == 0:
-                    time.sleep(1.0)
-
-            if (
-                "HTTP error 502" in last_error
-                or "HTTP error 503" in last_error
-                or "HTTP error 504" in last_error
-                or "service હાલમાં ઉપલબ્ધ નથી" in last_error
-                or "timeout" in last_error.lower()
-            ):
+                if attempt < 2:
+                    time.sleep(float(2 ** attempt))
+            if "HTTP error 502" in last_error or "HTTP error 503" in last_error or "HTTP error 504" in last_error or "service હાલમાં ઉપલબ્ધ નથી" in last_error:
                 _mandi_upstream_failure_until = time.monotonic() + MANDI_UPSTREAM_FAILURE_COOLDOWN_SECONDS
-            return None, last_error, 0, 2
+            return None, last_error, 0
 
-        # Fallback order:
-        # 1) district + commodity (when both are requested)
-        # 2) Gujarat/state + commodity
-        # 3) commodity without state
-        # 4) Gujarat/state without commodity
-        # 5) all records without filters (only as final ALL fallback)
+        # Preserve the old working order. District-specific first; if it has no usable
+        # rows, broaden gradually instead of repeatedly asking the same failing query.
         attempts = []
-        seen_attempts = set()
-
-        def add_attempt(use_state, use_district, use_commodity):
-            signature = (bool(use_state), bool(use_district), bool(use_commodity))
-            if signature not in seen_attempts:
-                seen_attempts.add(signature)
-                attempts.append(signature)
-
-        if district and api_commodity:
-            add_attempt(True, True, True)
-        elif district:
-            add_attempt(True, True, False)
-
+        if district:
+            attempts.append((True, True, bool(api_commodity)))
         if state and api_commodity:
-            add_attempt(True, False, True)
+            attempts.append((True, False, True))
         if api_commodity:
-            add_attempt(False, False, True)
+            attempts.append((False, False, True))
         if state:
-            add_attempt(True, False, False)
-
-        # Final broad fallback for the ALL/state case. It is still capped at 25
-        # rows, and the normalizer will select the latest available date.
-        add_attempt(False, False, False)
+            attempts.append((True, False, False))
+        # For ALL-commodity requests, broaden once to an unfiltered resource
+        # request instead of stopping after the state-filtered gateway failure.
+        if not api_commodity:
+            attempts.append((False, False, False))
+        if not attempts:
+            attempts.append((False, False, False))
 
         last_error = "Live Mandi service હાલમાં ઉપલબ્ધ નથી."
+        fallback_used = False
         for index, (use_state, use_district, use_commodity) in enumerate(attempts):
-            data, error, cooldown, tries = request_once(
-                use_state=use_state,
-                use_district=use_district,
-                use_commodity=use_commodity,
-            )
-            attempt_name = "state"
-            if use_district:
-                attempt_name = "district+commodity" if use_commodity else "district"
-            elif use_commodity:
-                attempt_name = "state+commodity" if use_state else "commodity"
-            elif not use_state:
-                attempt_name = "all"
-
-            attempts_log.append({
-                "query": attempt_name,
-                "http_retries": tries,
-                "error": error or "",
-            })
-
+            data, error, cooldown = request_once(use_state=use_state, use_district=use_district, use_commodity=use_commodity)
             if cooldown:
                 stale = _mandi_cached_result(key, time.monotonic(), allow_stale=True)
                 if stale:
                     cached_data, age = stale
-                    payload = _mandi_cached_payload(cached_data, age, error)
-                    payload.setdefault("_diagnostics", {})["attempts"] = attempts_log
-                    return payload, ""
+                    return _mandi_cached_payload(cached_data, age, error), ""
                 return None, error
 
             last_error = error or last_error
             if isinstance(data, dict):
-                result = _mandi_normalized_result(
-                    data,
-                    normalized_commodity,
-                    fallback_used=(index > 0),
-                )
-                result.setdefault("_diagnostics", {})["attempt"] = index + 1
-                result["_diagnostics"]["fallback_used"] = index > 0
-                result["_diagnostics"]["attempts"] = attempts_log
-
+                result = _mandi_normalized_result(data, normalized_commodity, fallback_used=(index > 0))
                 if result.get("records"):
+                    result["_diagnostics"]["attempt"] = index + 1
+                    result["_diagnostics"]["fallback_used"] = index > 0
                     _mandi_cache_response(key, result, time.monotonic())
                     _mandi_rate_limit_until.pop(key, None)
                     _mandi_global_rate_limit_until = 0.0
                     _mandi_upstream_failure_until = 0.0
                     return result, ""
-
-                # A successful HTTP response with zero usable rows is a valid reason
-                # to continue to the next broader query.
-                last_error = "Live Mandi response મળ્યો, પરંતુ usable price rows મળ્યા નથી."
+            fallback_used = True
 
         stale = _mandi_cached_result(key, time.monotonic(), allow_stale=True)
         if stale:
             cached_data, age = stale
-            payload = _mandi_cached_payload(cached_data, age, last_error)
-            payload.setdefault("_diagnostics", {})["attempts"] = attempts_log
-            return payload, ""
+            return _mandi_cached_payload(cached_data, age, last_error), ""
+        return None, last_error
 
-        # Return diagnostics to /api/v1/mandi even when every upstream query fails.
-        return {
-            "records": [],
-            "source": "none",
-            "_diagnostics": {
-                "raw_record_count": 0,
-                "raw_sample_keys": [],
-                "latest_date": "",
-                "fallback_used": len(attempts) > 1,
-                "attempt": len(attempts),
-                "attempts": attempts_log,
-            },
-        }, last_error
 
 def _parse_mandi_date(value: str):
     raw = str(value or "").strip()
