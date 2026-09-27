@@ -264,6 +264,32 @@ NEWS_CROP_ENGLISH = {
     "દાડમ": "pomegranate",
 }
 
+
+# Sources allowed for the 7-day fallback. The fallback must show Gujarati
+# news-channel/news-paper sources, not an English agriculture publication.
+GUJARATI_NEWS_SOURCE_NAMES = (
+    "tv9 gujarati", "tv9gujarati", "abp asmita", "abp gujarati",
+    "sandesh", "divya bhaskar", "divyabhaskar", "gujarat samachar",
+    "gujarat first", "vtv gujarati", "zee 24 kalak", "news18 gujarati",
+    "gstv", "gujarat mitra", "aajkaal", "aaj kaal",
+)
+
+def _is_gujarati_news_source(source: str) -> bool:
+    low = " ".join((source or "").casefold().split())
+    return any(name in low for name in GUJARATI_NEWS_SOURCE_NAMES)
+
+def _has_gujarati_text(text: str) -> bool:
+    # Require actual Gujarati Unicode characters so an English headline is
+    # never accepted merely because its display title was replaced.
+    return any("\u0a80" <= ch <= "\u0aff" for ch in (text or ""))
+
+def _is_approved_gujarati_news_item(source: str, title: str) -> bool:
+    # This is a hard gate for BOTH the 48-hour feed and the 7-day fallback.
+    # An English article must never be displayed with an artificial Gujarati
+    # title. The source itself must be a known Gujarati news publisher and the
+    # RSS headline must contain real Gujarati Unicode text.
+    return _is_gujarati_news_source(source) and _has_gujarati_text(title)
+
 NEWS_QUERY_VARIANTS = (
     "Gujarat agriculture farmer news",
     "Gujarat agriculture farmers crop news",
@@ -365,6 +391,8 @@ def _fetch_news_items(query: str, limit: int = 24, include_article_text: bool = 
         "date_parse_failed": 0,
         "older_than_window": 0,
         "irrelevant_items_rejected": 0,
+        "non_gujarati_source_rejected": 0,
+        "non_gujarati_headline_rejected": 0,
     }
     candidates = []
     # Never send a Gujarati-only query to Google News RSS: the endpoint can
@@ -451,6 +479,16 @@ def _fetch_news_items(query: str, limit: int = 24, include_article_text: bool = 
             if published > now + timedelta(minutes=10):
                 continue
             candidate_item = {"original_title": title, "description": _html_to_text(description), "source": source}
+            # Hard Gujarati-only gate for EVERY accepted article, including
+            # the normal 48-hour feed. Previously this check existed only in
+            # the 7-day fallback, which allowed English publications to pass
+            # through and then receive a fake/generated Gujarati title.
+            if not _is_gujarati_news_source(source):
+                _LAST_NEWS_FETCH_DIAGNOSTICS["non_gujarati_source_rejected"] = _LAST_NEWS_FETCH_DIAGNOSTICS.get("non_gujarati_source_rejected", 0) + 1
+                continue
+            if not _has_gujarati_text(title):
+                _LAST_NEWS_FETCH_DIAGNOSTICS["non_gujarati_headline_rejected"] = _LAST_NEWS_FETCH_DIAGNOSTICS.get("non_gujarati_headline_rejected", 0) + 1
+                continue
             if not _news_relevance(candidate_item, relevance_crop, require_crop=require_crop):
                 _LAST_NEWS_FETCH_DIAGNOSTICS["irrelevant_items_rejected"] = _LAST_NEWS_FETCH_DIAGNOSTICS.get("irrelevant_items_rejected", 0) + 1
                 continue
@@ -462,7 +500,9 @@ def _fetch_news_items(query: str, limit: int = 24, include_article_text: bool = 
             item_age_hours = max(0.0, (now - published).total_seconds() / 3600.0)
             items.append({
                 "title": title,
-                "display_title": _gujarati_news_title(title, "", category or "agriculture"),
+                # Preserve the publisher's real Gujarati headline. Never
+                # translate or synthesize an English headline for display.
+                "display_title": title,
                 "original_title": title,
                 "link": link,
                 "published_at": published.isoformat(),
@@ -529,15 +569,17 @@ def news(crop: str = "", category: str = "agriculture"):
             diagnostics[key] = diagnostics.get(key, 0) + fallback_diag.get(key, 0)
 
     for item in items:
-        item["display_title"] = _gujarati_news_title(item.get("original_title") or item.get("title", ""), crop_name, category_name)
-        # Android can safely render this Gujarati field without exposing an
-        # English headline directly. Keep original_title for source/debug only.
-        item["title"] = item["display_title"]
+        # Both the fresh feed and the 7-day fallback are already hard-gated to
+        # Gujarati publisher + real Gujarati headline. Preserve that exact
+        # headline; never generate a Gujarati title from an English article.
+        original_title = item.get("original_title") or item.get("title", "")
+        item["display_title"] = original_title
+        item["title"] = original_title
 
     diagnostics["max_age_hours"] = _news_max_age_hours()
     diagnostics["fallback_used"] = fallback_used
     diagnostics["fallback_reason"] = fallback_reason
-    diagnostics["english_headlines_rejected"] = 0
+    diagnostics["english_headlines_rejected"] = diagnostics.get("non_gujarati_headline_rejected", 0)
     diagnostics["irrelevant_items_rejected"] = diagnostics.get("irrelevant_items_rejected", 0)
     diagnostics["fresh_48h_items"] = sum(1 for item in items if item.get("is_fresh"))
     diagnostics["important_older_items"] = sum(1 for item in items if item.get("news_age_type") == "important_older")
