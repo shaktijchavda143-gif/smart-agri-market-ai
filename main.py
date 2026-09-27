@@ -63,15 +63,12 @@ class Ask(BaseModel):
     question: str
     context: dict | None = None
 
-
 def openai_client():
     key = os.getenv("OPENAI_API_KEY", "").strip()
     return OpenAI(api_key=key) if key else None
 
-
 def norm(text: str) -> str:
     return " ".join((text or "").strip().lower().replace("-", " ").split())
-
 
 def rule_based_answer(question: str, context: dict | None) -> str:
     """Use the supplied agent's crop knowledge even when OpenAI is not configured."""
@@ -128,11 +125,9 @@ def rule_based_answer(question: str, context: dict | None) -> str:
         "જમીનનો પ્રકાર, છેલ્લું સિંચાઈ/વરસાદ અને સમસ્યાના લક્ષણો લખો. ફોટો હોય તો મોકલી શકો."
     )
 
-
 @app.get("/")
 def root():
     return {"ok": True, "service": "smart-agri-ai", "version": APP_VERSION}
-
 
 @app.get("/api/v1/health")
 def health():
@@ -151,7 +146,6 @@ def health():
         "news_service": "google-news-rss",
         "model": MODEL,
     }
-
 
 NEWS_DEFAULT_MAX_AGE_HOURS = 48
 
@@ -213,7 +207,6 @@ class _VisibleTextParser(HTMLParser):
         text = re.sub(r" *\n+ *", "\n", text)
         return text.strip()
 
-
 def _html_to_text(html: str) -> str:
     parser = _VisibleTextParser()
     try:
@@ -222,7 +215,6 @@ def _html_to_text(html: str) -> str:
         return parser.text()
     except Exception:
         return ""
-
 
 def _fetch_article_text(link: str, max_chars: int = 60000, timeout_seconds: int = 8) -> str:
     """Fetch one publisher page with a hard per-article timeout."""
@@ -240,7 +232,6 @@ def _fetch_article_text(link: str, max_chars: int = 60000, timeout_seconds: int 
         return _html_to_text(html)[:max_chars]
     except Exception:
         return ""
-
 
 _LAST_NEWS_FETCH_DIAGNOSTICS = {"rss_search_failed": 0, "rss_items_seen": 0, "fresh_items_kept": 0}
 
@@ -284,7 +275,6 @@ def _news_query_for_category(crop: str, category: str) -> str:
         return f"Gujarat {crop_en} APMC market price farmer" if crop else "Gujarat APMC market price farmer"
     return "Gujarat farmer agriculture scheme technology crop news"
 
-
 NEWS_TITLE_PHRASES = (
     ("Gujarat's natural farming push", "ગુજરાતમાં પ્રાકૃતિક ખેતીને પ્રોત્સાહન"),
     ("Natural farming more than doubles", "પ્રાકૃતિક ખેતીથી ઉપજમાં મોટો વધારો"),
@@ -315,8 +305,7 @@ def _gujarati_news_title(title: str, crop: str = "", category: str = "agricultur
     }
     return category_titles.get(category, "ગુજરાતમાં કૃષિ અને ખેડૂતો અંગે મહત્વના સમાચાર")
 
-
-def _fetch_news_items(query: str, limit: int = 24, include_article_text: bool = False, category: str = "agriculture"):
+def _fetch_news_items(query: str, limit: int = 24, include_article_text: bool = False, category: str = "agriculture", max_age_hours: int | None = None, allow_older_fallback: bool = False):
     """Fetch fresh Google News RSS items with resilient query fallbacks.
 
     We do NOT trust the Google `when:2d` search operator as the freshness
@@ -341,7 +330,8 @@ def _fetch_news_items(query: str, limit: int = 24, include_article_text: bool = 
         if value and value not in candidates:
             candidates.append(value)
     now = datetime.now(timezone.utc)
-    cutoff = now - timedelta(hours=_news_max_age_hours())
+    effective_max_age = max_age_hours if max_age_hours is not None else _news_max_age_hours()
+    cutoff = now - timedelta(hours=effective_max_age)
     india_tz = timezone(timedelta(hours=5, minutes=30))
     items, seen = [], set()
 
@@ -395,6 +385,7 @@ def _fetch_news_items(query: str, limit: int = 24, include_article_text: bool = 
                 continue
             seen.add(key)
             _LAST_NEWS_FETCH_DIAGNOSTICS["fresh_items_kept"] += 1
+            item_age_hours = max(0.0, (now - published).total_seconds() / 3600.0)
             items.append({
                 "title": title,
                 "display_title": _gujarati_news_title(title, "", category or "agriculture"),
@@ -405,6 +396,9 @@ def _fetch_news_items(query: str, limit: int = 24, include_article_text: bool = 
                 "source": source or "સમાચાર સ્ત્રોત",
                 "description": _html_to_text(description),
                 "category": category or "agriculture",
+                "is_fresh": item_age_hours <= _news_max_age_hours(),
+                "age_hours": round(item_age_hours, 1),
+                "news_age_type": "fresh" if item_age_hours <= _news_max_age_hours() else "important_older",
             })
             if len(items) >= limit:
                 break
@@ -425,7 +419,6 @@ def _fetch_news_items(query: str, limit: int = 24, include_article_text: bool = 
                 item["description"] = (item.get("description", "") + "\n" + fetched).strip()[:60000]
     return selected
 
-
 @app.get("/api/v1/news")
 def news(crop: str = "", category: str = "agriculture"):
     crop_name = crop.strip()
@@ -439,16 +432,24 @@ def news(crop: str = "", category: str = "agriculture"):
     # the same local publication-date freshness check; nothing stale is shown.
     fallback_used = False
     fallback_reason = ""
-    if not items and crop_name:
+    if not items:
+        # Important fallback is intentionally separate from the primary 48-hour
+        # freshness rule. If no fresh article exists, show relevant recent
+        # Gujarat agriculture/farmer news up to 7 days old, explicitly marked
+        # as older. This prevents an empty News screen without pretending an
+        # older article is a fresh/today article.
         fallback_query = "Gujarat agriculture farmer news " + NEWS_QUERY_SUFFIX
-        fallback_items = _fetch_news_items(fallback_query, 12, category=category_name)
+        fallback_items = _fetch_news_items(
+            fallback_query, 12, category=category_name,
+            max_age_hours=168, allow_older_fallback=True,
+        )
         fallback_diag = dict(_LAST_NEWS_FETCH_DIAGNOSTICS)
         if fallback_items:
             fallback_used = True
-            fallback_reason = "crop-specific fresh news unavailable; relevant Gujarat agriculture/farmer news used"
+            fallback_reason = "no fresh 48-hour article; relevant Gujarat agriculture/farmer news up to 7 days old used"
             items = fallback_items
         else:
-            fallback_reason = "crop-specific/important fallback feeds had no fresh item"
+            fallback_reason = "no fresh 48-hour article and no relevant fallback news within 7 days"
         for key in ("rss_search_failed", "rss_items_seen", "fresh_items_kept", "queries_tried", "empty_feeds"):
             diagnostics[key] = diagnostics.get(key, 0) + fallback_diag.get(key, 0)
 
@@ -462,6 +463,8 @@ def news(crop: str = "", category: str = "agriculture"):
     diagnostics["fallback_used"] = fallback_used
     diagnostics["fallback_reason"] = fallback_reason
     diagnostics["english_headlines_rejected"] = 0
+    diagnostics["fresh_48h_items"] = sum(1 for item in items if item.get("is_fresh"))
+    diagnostics["important_older_items"] = sum(1 for item in items if item.get("news_age_type") == "important_older")
     return {
         "ok": True,
         "crop": crop_name,
@@ -470,7 +473,7 @@ def news(crop: str = "", category: str = "agriculture"):
         "checked_at": datetime.now(timezone.utc).isoformat(),
         "items": items,
         "diagnostics": diagnostics,
-        "message": "તાજા ગુજરાતી કૃષિ સમાચાર" if items else "છેલ્લા 48 કલાકમાં ચકાસેલા તાજા સમાચાર મળ્યા નથી.",
+        "message": ("તાજા ગુજરાતી કૃષિ સમાચાર" if diagnostics.get("fresh_48h_items", 0) else ("મહત્વના તાજેતરના ગુજરાતી કૃષિ સમાચાર (7 દિવસ સુધી)" if items else "છેલ્લા 48 કલાકમાં તાજા સમાચાર મળ્યા નથી અને 7 દિવસમાં સંબંધિત fallback સમાચાર મળ્યા નથી.")),
     }
 
 @app.post("/api/v1/ai/ask")
@@ -495,7 +498,6 @@ def ask(req: Ask):
             "mode": "agent_fallback",
             "warning": str(exc),
         }
-
 
 @app.post("/api/v1/ai/diagnose")
 async def diagnose(image: UploadFile = File(...), crop: str = Form(""), context: str = Form("")):
@@ -581,11 +583,9 @@ GUJARATI_CROP_ALIASES = {
     "કેળા": "Banana", "દાડમ": "Pomegranate"
 }
 
-
 def _mandi_cache_key(state: str, district: str, commodity: str) -> str:
     normalized = GUJARATI_CROP_ALIASES.get((commodity or "").strip(), (commodity or "").strip())
     return "|".join(((state or "").strip().lower(), (district or "").strip().lower(), normalized.lower()))
-
 
 def _mandi_cached_result(key: str, now: float, allow_stale: bool = False):
     item = _mandi_cache.get(key)
@@ -595,7 +595,6 @@ def _mandi_cached_result(key: str, now: float, allow_stale: bool = False):
     if age <= MANDI_CACHE_TTL_SECONDS or (allow_stale and age <= MANDI_STALE_MAX_SECONDS):
         return item.get("data"), age
     return None
-
 
 def _mandi_retry_after_seconds(exc: urllib.error.HTTPError) -> int:
     raw = ""
@@ -609,11 +608,9 @@ def _mandi_retry_after_seconds(exc: urllib.error.HTTPError) -> int:
     except Exception:
         return MANDI_RATE_LIMIT_COOLDOWN_SECONDS
 
-
 def _mandi_cache_response(key: str, data: dict[str, Any], now: float):
     # Keep only JSON-safe response data and normalized records; never store the API key.
     _mandi_cache[key] = {"saved_at": now, "data": data}
-
 
 def _mandi_cached_payload(data: dict[str, Any], age: float, reason: str):
     cached = dict(data)
@@ -625,10 +622,8 @@ def _mandi_cached_payload(data: dict[str, Any], age: float, reason: str):
     cached["message"] = "છેલ્લો સફળ Mandi data બતાવવામાં આવી રહ્યો છે. " + reason
     return cached
 
-
 def _norm_mandi_text(value: Any) -> str:
     return " ".join(str(value or "").strip().lower().replace("-", " ").replace("_", " ").split())
-
 
 def _commodity_matches(row: dict[str, Any], requested: str) -> bool:
     """Keep only rows belonging to the requested commodity during broad fallbacks."""
@@ -664,7 +659,6 @@ def _commodity_matches(row: dict[str, Any], requested: str) -> bool:
         return False
     return any(v in accepted or wanted in v or v in wanted for v in values)
 
-
 def _mandi_latest_rows(rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], str]:
     """Return rows from the latest available arrival date, matching the old working agent."""
     dated = []
@@ -679,7 +673,6 @@ def _mandi_latest_rows(rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]]
         return rows, ""
     latest = max(valid)
     return [row for row, parsed in dated if parsed == latest], latest.strftime("%d-%m-%Y")
-
 
 def _mandi_normalized_result(payload: dict[str, Any], requested_commodity: str, fallback_used: bool = False):
     raw_records = payload.get("records") or []
@@ -700,7 +693,6 @@ def _mandi_normalized_result(payload: dict[str, Any], requested_commodity: str, 
             "fallback_used": fallback_used,
         },
     }
-
 
 def _mandi_api_get(state: str, district: str, commodity: str):
     global _mandi_global_rate_limit_until, _mandi_upstream_failure_until
@@ -829,7 +821,6 @@ def _mandi_api_get(state: str, district: str, commodity: str):
             return _mandi_cached_payload(cached_data, age, last_error), ""
         return None, last_error
 
-
 def _parse_mandi_date(value: str):
     raw = str(value or "").strip()
     if not raw:
@@ -848,7 +839,6 @@ def _parse_mandi_date(value: str):
             continue
     return None
 
-
 def _normalise_price(value: str):
     if value is None:
         return ""
@@ -864,7 +854,6 @@ def _normalise_price(value: str):
     if not (0 < number < 10000000):
         return ""
     return str(int(number)) if number.is_integer() else f"{number:.2f}"
-
 
 def _normalise_mandi_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     def pick(row, *keys):
@@ -908,11 +897,9 @@ def _news_price_number(text: str):
     m = re.search(r"(?<!\d)(\d{2,7}(?:\.\d+)?)", cleaned)
     return float(m.group(1)) if m else None
 
-
 def _normalise_for_match(text: str) -> str:
     trans = str.maketrans("૦૧૨૩૪૫૬૭૮૯", "0123456789")
     return re.sub(r"\s+", " ", (text or "").translate(trans).casefold()).strip()
-
 
 # Common Gujarati/English crop names found in Gujarati market-price articles.
 NEWS_CROP_ALIASES = {
@@ -940,7 +927,6 @@ NEWS_CROP_ALIASES = {
     "દાડમ": ["દાડમ", "pomegranate"],
 }
 
-
 def _detect_crop(text: str, requested_crop: str = "") -> str:
     hay = _normalise_for_match(text)
     if requested_crop.strip():
@@ -957,7 +943,6 @@ def _detect_crop(text: str, requested_crop: str = "") -> str:
         if any(_normalise_for_match(a) in hay for a in aliases):
             return crop
     return ""
-
 
 _LOCATION_BAD_WORDS = {
     "આજ", "આજના", "આજે", "ગુજરાત", "gujarat", "market", "market yard",
@@ -977,7 +962,6 @@ def _clean_location_candidate(value: str) -> str:
         return ""
     return candidate
 
-
 def _extract_location(text: str) -> str:
     """Return only an explicit market/APMC/taluka/district name; never guess."""
     patterns = [
@@ -993,7 +977,6 @@ def _extract_location(text: str) -> str:
             if candidate:
                 return candidate
     return "Location not mentioned"
-
 
 def _price_pairs(text: str):
     """Extract price ranges from prose and pipe-delimited HTML table rows."""
@@ -1038,7 +1021,6 @@ def _price_pairs(text: str):
             context = t[max(0, m.start()-140):min(len(t), m.end()+140)]
             pairs.append((context, min(a, b), max(a, b), False))
     return pairs
-
 
 def _extract_news_prices(item: dict, requested_crop: str):
     title = str(item.get("title") or "").strip()
@@ -1130,10 +1112,8 @@ def _news_market_prices_detailed(crop: str, limit: int = 20):
         diagnostics["message"] = "Prices extracted"
     return prices, diagnostics
 
-
 def _news_market_prices(crop: str, limit: int = 30):
     return _news_market_prices_detailed(crop, limit)[0]
-
 
 def _news_price_response(commodity: str = ""):
     checked_at = datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=5, minutes=30))).strftime("%d-%m-%Y %H:%M")
@@ -1163,7 +1143,6 @@ def mandi_news(commodity: str = ""):
             "news_prices": [],
             "error": str(exc)[:300],
         }
-
 
 @app.get("/api/v1/mandi")
 def mandi(state: str = "Gujarat", district: str = "", commodity: str = "ALL"):
