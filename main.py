@@ -246,6 +246,15 @@ _LAST_NEWS_FETCH_DIAGNOSTICS = {"rss_search_failed": 0, "rss_items_seen": 0, "fr
 
 NEWS_QUERY_SUFFIX = "when:2d"
 
+# Google News RSS can return an empty feed for some Gujarati + when:2d
+# combinations even when the same topic has RSS results without that operator.
+# Freshness is therefore enforced locally from pubDate; the search operator is
+# only an optional accelerator, never the sole freshness mechanism.
+NEWS_QUERY_VARIANTS = (
+    "ગુજરાત ખેડૂત ખેતી કૃષિ સમાચાર",
+    "Gujarat agriculture farmer news",
+    "Gujarat agriculture farmers crop news",
+)
 
 def _news_query_for_category(crop: str, category: str) -> str:
     crop = crop.strip()
@@ -264,38 +273,65 @@ def _news_query_for_category(crop: str, category: str) -> str:
 
 
 def _fetch_news_items(query: str, limit: int = 24, include_article_text: bool = False, category: str = "agriculture"):
-    """Fetch only genuinely fresh Google News RSS items.
+    """Fetch fresh Google News RSS items with resilient query fallbacks.
 
-    The Google News query explicitly asks for the last two days, then the RSS
-    publication timestamp is independently checked against NEWS_MAX_AGE_HOURS.
-    No old result is relabeled as fresh news.
+    We do NOT trust the Google `when:2d` search operator as the freshness
+    mechanism because some localized feeds return an empty RSS document for
+    that operator. Every accepted item is still required to have a valid
+    publication timestamp inside NEWS_MAX_AGE_HOURS.
     """
     global _LAST_NEWS_FETCH_DIAGNOSTICS
-    _LAST_NEWS_FETCH_DIAGNOSTICS = {"rss_search_failed": 0, "rss_items_seen": 0, "fresh_items_kept": 0}
-    queries = [query.strip()] if query.strip() else []
-    queries.extend([
-        "ગુજરાત ખેડૂત ખેતી કૃષિ પાક when:2d",
-        "ગુજરાત APMC બજાર ભાવ ખેડૂત when:2d",
-    ])
+    _LAST_NEWS_FETCH_DIAGNOSTICS = {
+        "rss_search_failed": 0,
+        "rss_items_seen": 0,
+        "fresh_items_kept": 0,
+        "queries_tried": 0,
+        "empty_feeds": 0,
+    }
+    candidates = []
+    for value in [query.strip(), *NEWS_QUERY_VARIANTS]:
+        value = value.strip()
+        if value and value not in candidates:
+            candidates.append(value)
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(hours=_news_max_age_hours())
     india_tz = timezone(timedelta(hours=5, minutes=30))
     items, seen = [], set()
-    for search_query in queries[:3]:
+
+    # Keep the number of RSS calls bounded. The publication timestamp below is
+    # the authoritative freshness check, so there is no need to issue a second
+    # `when:2d` request for every query.
+    for effective_query in candidates[:4]:
         if len(items) >= limit:
             break
-        effective_query = search_query if "when:" in search_query.lower() else f"{search_query} {NEWS_QUERY_SUFFIX}"
+        effective_query = effective_query.replace(" when:2d", "").replace(" when:1d", "")
+        _LAST_NEWS_FETCH_DIAGNOSTICS["queries_tried"] += 1
         url = "https://news.google.com/rss/search?" + urllib.parse.urlencode(
-            {"q": effective_query, "hl": "gu", "gl": "IN", "ceid": "IN:gu"}
+            {"q": effective_query, "hl": "en-IN", "gl": "IN", "ceid": "IN:en"}
         )
-        request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 SmartAgriMarketAI/1.3"})
+        request = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/126.0 SmartAgriMarketAI/1.4",
+                "Accept": "application/rss+xml,application/xml,text/xml,*/*;q=0.8",
+            },
+        )
         try:
             with urllib.request.urlopen(request, timeout=8) as response:
-                root = ET.fromstring(response.read(700000))
+                raw = response.read(700000)
+            if not raw.strip():
+                _LAST_NEWS_FETCH_DIAGNOSTICS["empty_feeds"] += 1
+                continue
+            root = ET.fromstring(raw)
         except Exception:
             _LAST_NEWS_FETCH_DIAGNOSTICS["rss_search_failed"] += 1
             continue
-        for item in root.findall(".//item")[:30]:
+
+        rss_items = root.findall(".//item")
+        if not rss_items:
+            _LAST_NEWS_FETCH_DIAGNOSTICS["empty_feeds"] += 1
+            continue
+        for item in rss_items[:40]:
             _LAST_NEWS_FETCH_DIAGNOSTICS["rss_items_seen"] += 1
             title = (item.findtext("title") or "").strip()
             link = (item.findtext("link") or "").strip()
@@ -303,7 +339,9 @@ def _fetch_news_items(query: str, limit: int = 24, include_article_text: bool = 
             source = (item.findtext("source") or "").strip()
             description = (item.findtext("description") or "").strip()
             published = _parse_news_date(date_text)
-            if not title or not link or published is None or published < cutoff or published > now + timedelta(minutes=10):
+            if not title or not link or published is None:
+                continue
+            if published < cutoff or published > now + timedelta(minutes=10):
                 continue
             key = link.split("?", 1)[0].casefold()
             if key in seen:
@@ -311,7 +349,9 @@ def _fetch_news_items(query: str, limit: int = 24, include_article_text: bool = 
             seen.add(key)
             _LAST_NEWS_FETCH_DIAGNOSTICS["fresh_items_kept"] += 1
             items.append({
-                "title": title, "link": link, "published_at": published.isoformat(),
+                "title": title,
+                "link": link,
+                "published_at": published.isoformat(),
                 "published_text": published.astimezone(india_tz).strftime("%d-%m-%Y %I:%M %p"),
                 "source": source or "સમાચાર સ્ત્રોત",
                 "description": _html_to_text(description),
@@ -323,9 +363,9 @@ def _fetch_news_items(query: str, limit: int = 24, include_article_text: bool = 
     items.sort(key=lambda x: x["published_at"], reverse=True)
     if not include_article_text:
         return items[:limit]
-    candidates = items[:min(limit, 18)]
+    selected = items[:min(limit, 18)]
     with ThreadPoolExecutor(max_workers=4) as pool:
-        futures = {pool.submit(_fetch_article_text, item["link"]): item for item in candidates}
+        futures = {pool.submit(_fetch_article_text, item["link"]): item for item in selected}
         for future in as_completed(futures):
             item = futures[future]
             try:
@@ -334,7 +374,7 @@ def _fetch_news_items(query: str, limit: int = 24, include_article_text: bool = 
                 fetched = ""
             if fetched:
                 item["description"] = (item.get("description", "") + "\n" + fetched).strip()[:60000]
-    return candidates
+    return selected
 
 
 @app.get("/api/v1/news")
@@ -448,9 +488,11 @@ def _mandi_env_seconds(name: str, default: int, minimum: int, maximum: int) -> i
 MANDI_CACHE_TTL_SECONDS = _mandi_env_seconds("MANDI_CACHE_TTL_SECONDS", 600, 30, 3600)
 MANDI_RATE_LIMIT_COOLDOWN_SECONDS = _mandi_env_seconds("MANDI_RATE_LIMIT_COOLDOWN_SECONDS", 900, 60, 86400)
 MANDI_STALE_MAX_SECONDS = _mandi_env_seconds("MANDI_STALE_MAX_SECONDS", 86400, 300, 7 * 86400)
+MANDI_UPSTREAM_FAILURE_COOLDOWN_SECONDS = _mandi_env_seconds("MANDI_UPSTREAM_FAILURE_COOLDOWN_SECONDS", 300, 30, 3600)
 _mandi_cache: dict[str, dict[str, Any]] = {}
 _mandi_rate_limit_until: dict[str, float] = {}
 _mandi_global_rate_limit_until: float = 0.0
+_mandi_upstream_failure_until: float = 0.0
 _mandi_lock = threading.RLock()
 
 GUJARATI_CROP_ALIASES = {
@@ -584,7 +626,7 @@ def _mandi_normalized_result(payload: dict[str, Any], requested_commodity: str, 
 
 
 def _mandi_api_get(state: str, district: str, commodity: str):
-    global _mandi_global_rate_limit_until
+    global _mandi_global_rate_limit_until, _mandi_upstream_failure_until
     """Hybrid live Mandi fetch: old working fallbacks + current cache/429 protection."""
     if not MANDI_API_KEY:
         return None, "Live Mandi API key server પર configure નથી. Renderમાં DATA_GOV_API_KEY ઉમેરો."
@@ -604,6 +646,14 @@ def _mandi_api_get(state: str, district: str, commodity: str):
             data, age = cached
             return _mandi_cached_payload(data, age, "server cacheમાંથી મળ્યું."), ""
 
+        if _mandi_upstream_failure_until > now:
+            stale = _mandi_cached_result(key, now, allow_stale=True)
+            reason = "data.gov.in upstream 502/503/504 પછી server cooldown ચાલુ છે."
+            if stale:
+                data, age = stale
+                return _mandi_cached_payload(data, age, reason), ""
+            return None, reason
+
         cooldown_until = max(_mandi_rate_limit_until.get(key, 0.0), _mandi_global_rate_limit_until)
         if cooldown_until > now:
             stale = _mandi_cached_result(key, now, allow_stale=True)
@@ -614,7 +664,7 @@ def _mandi_api_get(state: str, district: str, commodity: str):
             return None, "Live Mandi API limit પર છે; server cooldown ચાલુ છે. થોડા સમય પછી ફરી પ્રયાસ કરો."
 
         def request_once(*, use_state: bool, use_district: bool, use_commodity: bool):
-            global _mandi_global_rate_limit_until
+            global _mandi_global_rate_limit_until, _mandi_upstream_failure_until
             params = {"api-key": MANDI_API_KEY, "format": "json", "limit": "100"}
             if use_state and state:
                 params["filters[state]"] = state
@@ -649,6 +699,8 @@ def _mandi_api_get(state: str, district: str, commodity: str):
                     last_error = f"Live Mandi request error: {str(exc)[:180]}"
                 if attempt < 2:
                     time.sleep(float(2 ** attempt))
+            if "HTTP error 502" in last_error or "HTTP error 503" in last_error or "HTTP error 504" in last_error or "service હાલમાં ઉપલબ્ધ નથી" in last_error:
+                _mandi_upstream_failure_until = time.monotonic() + MANDI_UPSTREAM_FAILURE_COOLDOWN_SECONDS
             return None, last_error, 0
 
         # Preserve the old working order. District-specific first; if it has no usable
@@ -685,6 +737,7 @@ def _mandi_api_get(state: str, district: str, commodity: str):
                     _mandi_cache_response(key, result, time.monotonic())
                     _mandi_rate_limit_until.pop(key, None)
                     _mandi_global_rate_limit_until = 0.0
+                    _mandi_upstream_failure_until = 0.0
                     return result, ""
             fallback_used = True
 
