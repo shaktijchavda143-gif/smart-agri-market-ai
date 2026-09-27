@@ -11,6 +11,7 @@ import urllib.request
 import re
 import time
 import json
+import threading
 import xml.etree.ElementTree as ET
 from html.parser import HTMLParser
 from datetime import datetime, timezone, timedelta
@@ -25,7 +26,7 @@ from openai import OpenAI
 from google import genai
 from google.genai import types
 
-APP_VERSION = "11.1 Gemini Vision + Mandi Normalized"
+APP_VERSION = "11.2 Gemini Vision + Mandi Cache Guard"
 MODEL = os.getenv("OPENAI_MODEL", "gpt-5.6-luna").strip() or "gpt-5.6-luna"
 GEMINI_VISION_MODEL = os.getenv("GEMINI_VISION_MODEL", "gemini-3.6-flash").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
@@ -144,6 +145,9 @@ def health():
         "gemini_vision_configured": bool(GEMINI_API_KEY),
         "gemini_vision_model": GEMINI_VISION_MODEL,
         "mandi_api_configured": bool(os.getenv("DATA_GOV_API_KEY", "").strip()),
+        "mandi_cache_ttl_seconds": MANDI_CACHE_TTL_SECONDS,
+        "mandi_rate_limit_cooldown_seconds": MANDI_RATE_LIMIT_COOLDOWN_SECONDS,
+        "mandi_stale_max_seconds": MANDI_STALE_MAX_SECONDS,
         "news_service": "google-news-rss",
         "model": MODEL,
     }
@@ -406,6 +410,22 @@ async def diagnose(image: UploadFile = File(...), crop: str = Form(""), context:
 MANDI_RESOURCE_ID = os.getenv("DATA_GOV_RESOURCE_ID", "9ef84268-d588-465a-a308-a864a43d0070").strip()
 MANDI_API_KEY = os.getenv("DATA_GOV_API_KEY", "").strip()
 
+# Mandi protection is intentionally server-side so repeated Android requests do
+# not repeatedly consume the upstream data.gov.in quota.
+def _mandi_env_seconds(name: str, default: int, minimum: int, maximum: int) -> int:
+    try:
+        return max(minimum, min(int(os.getenv(name, str(default))), maximum))
+    except Exception:
+        return default
+
+MANDI_CACHE_TTL_SECONDS = _mandi_env_seconds("MANDI_CACHE_TTL_SECONDS", 600, 30, 3600)
+MANDI_RATE_LIMIT_COOLDOWN_SECONDS = _mandi_env_seconds("MANDI_RATE_LIMIT_COOLDOWN_SECONDS", 900, 60, 86400)
+MANDI_STALE_MAX_SECONDS = _mandi_env_seconds("MANDI_STALE_MAX_SECONDS", 86400, 300, 7 * 86400)
+_mandi_cache: dict[str, dict[str, Any]] = {}
+_mandi_rate_limit_until: dict[str, float] = {}
+_mandi_global_rate_limit_until: float = 0.0
+_mandi_lock = threading.RLock()
+
 GUJARATI_CROP_ALIASES = {
     "કપાસ": "Cotton", "મગફળી": "Groundnut", "ઘઉં": "Wheat", "બાજરી": "Bajra",
     "મકાઈ": "Maize", "જીરું": "Jeera", "ધાણા": "Dhaniya", "તલ": "Sesamum",
@@ -416,76 +436,171 @@ GUJARATI_CROP_ALIASES = {
 }
 
 
-def _mandi_api_get(state: str, district: str, commodity: str):
-    """Fetch live mandi rows from the official data.gov.in mandi resource.
+def _mandi_cache_key(state: str, district: str, commodity: str) -> str:
+    normalized = GUJARATI_CROP_ALIASES.get((commodity or "").strip(), (commodity or "").strip())
+    return "|".join((state or "").strip().lower(), (district or "").strip().lower(), normalized.lower())
 
-    Keep the API key server-side. The Android app never receives it. We also
-    normalize common field-name variants so a harmless upstream schema change
-    does not silently produce blank price cells.
+
+def _mandi_cached_result(key: str, now: float, allow_stale: bool = False):
+    item = _mandi_cache.get(key)
+    if not item:
+        return None
+    age = max(0.0, now - float(item.get("saved_at", now)))
+    if age <= MANDI_CACHE_TTL_SECONDS or (allow_stale and age <= MANDI_STALE_MAX_SECONDS):
+        return item.get("data"), age
+    return None
+
+
+def _mandi_retry_after_seconds(exc: urllib.error.HTTPError) -> int:
+    raw = ""
+    try:
+        raw = str(exc.headers.get("Retry-After", "")).strip()
+    except Exception:
+        raw = ""
+    try:
+        value = int(raw)
+        return max(60, min(value, 86400))
+    except Exception:
+        return MANDI_RATE_LIMIT_COOLDOWN_SECONDS
+
+
+def _mandi_cache_response(key: str, data: dict[str, Any], now: float):
+    # Keep only JSON-safe response data and normalized records; never store the API key.
+    _mandi_cache[key] = {"saved_at": now, "data": data}
+
+
+def _mandi_cached_payload(data: dict[str, Any], age: float, reason: str):
+    cached = dict(data)
+    cached["live_available"] = False
+    cached["source"] = "data.gov.in cached"
+    cached["cache_age_seconds"] = int(max(0, age))
+    cached["cache_status"] = "stale" if age > MANDI_CACHE_TTL_SECONDS else "fresh"
+    cached["live_error"] = reason
+    cached["message"] = "છેલ્લો સફળ Mandi data બતાવવામાં આવી રહ્યો છે. " + reason
+    return cached
+
+
+def _mandi_api_get(state: str, district: str, commodity: str):
+    global _mandi_global_rate_limit_until
+    """Fetch Mandi data with server-side cache, request de-duplication and 429 cooldown.
+
+    The Android app may call this endpoint repeatedly. Only one upstream request for a
+    given query is allowed at a time; fresh server cache is returned without touching
+    data.gov.in. A 429 starts a cooldown, and the last successful response is used as a
+    clearly-marked cached fallback when it is still within the stale window.
     """
     if not MANDI_API_KEY:
         return None, "Live Mandi API key server પર configure નથી. Renderમાં DATA_GOV_API_KEY ઉમેરો."
 
     normalized_commodity = commodity.strip()
     api_commodity = GUJARATI_CROP_ALIASES.get(normalized_commodity, normalized_commodity)
+    key = _mandi_cache_key(state, district, normalized_commodity)
+    now = time.monotonic()
 
-    def request_once(use_district: bool):
-        params = {"api-key": MANDI_API_KEY, "format": "json", "limit": "100"}
-        if state.strip():
-            params["filters[state]"] = state.strip()
-        if use_district and district.strip():
-            params["filters[district]"] = district.strip()
-        if api_commodity and api_commodity.upper() != "ALL":
-            params["filters[commodity]"] = api_commodity
-        url = "https://api.data.gov.in/resource/" + MANDI_RESOURCE_ID + "?" + urllib.parse.urlencode(params)
-        last_error = "Live Mandi service હાલમાં ઉપલબ્ધ નથી."
-        for attempt in range(3):
-            req = urllib.request.Request(
-                url,
-                headers={"Accept": "application/json", "User-Agent": "SmartAgriMarketAI/1.1"},
-            )
-            try:
-                with urllib.request.urlopen(req, timeout=12) as response:
-                    body = response.read().decode("utf-8", "ignore")
-                    payload = json.loads(body)
-                    return payload, ""
-            except urllib.error.HTTPError as exc:
-                if exc.code == 429:
-                    return None, "Live Mandi API limit પર છે."
-                if exc.code in (401, 403):
-                    return None, "Live Mandi API authentication/permission error."
-                last_error = f"Live Mandi HTTP error {exc.code}."
-                if exc.code not in (502, 503):
-                    return None, last_error
-            except Exception:
-                last_error = "Live Mandi service હાલમાં ઉપલબ્ધ નથી."
-            if attempt < 2:
-                time.sleep(float(2 ** attempt))
-        return None, last_error
+    # Fast path: no upstream request for fresh server cache.
+    with _mandi_lock:
+        cached = _mandi_cached_result(key, now, allow_stale=False)
+        if cached:
+            data, age = cached
+            return _mandi_cached_payload(data, age, "server cacheમાંથી મળ્યું."), ""
+        cooldown_until = max(_mandi_rate_limit_until.get(key, 0.0), _mandi_global_rate_limit_until)
+        if cooldown_until > now:
+            stale = _mandi_cached_result(key, now, allow_stale=True)
+            reason = "data.gov.in API limit પછી server cooldown ચાલુ છે."
+            if stale:
+                data, age = stale
+                return _mandi_cached_payload(data, age, reason), ""
+            return None, "Live Mandi API limit પર છે; server cooldown ચાલુ છે. થોડા સમય પછી ફરી પ્રયાસ કરો."
 
-    data, error = request_once(bool(district.strip()))
-    if isinstance(data, dict) and data.get("records"):
-        raw_records = data.get("records") or []
-        normalized = _normalise_mandi_records(raw_records)
-        raw_keys = sorted(list(raw_records[0].keys())) if isinstance(raw_records[0], dict) else []
-        return {**data, "records": normalized, "_diagnostics": {"raw_record_count": len(raw_records), "raw_sample_keys": raw_keys[:30]}}, ""
-    if error and error not in ("Live Mandi service હાલમાં ઉપલબ્ધ નથી.",):
-        return None, error
+        # The lock deliberately covers the upstream call. This de-duplicates concurrent
+        # identical requests: the next caller re-checks the cache after the first finishes.
+        def request_once(use_district: bool):
+            global _mandi_global_rate_limit_until
+            params = {"api-key": MANDI_API_KEY, "format": "json", "limit": "100"}
+            if state.strip():
+                params["filters[state]"] = state.strip()
+            if use_district and district.strip():
+                params["filters[district]"] = district.strip()
+            if api_commodity and api_commodity.upper() != "ALL":
+                params["filters[commodity]"] = api_commodity
+            url = "https://api.data.gov.in/resource/" + MANDI_RESOURCE_ID + "?" + urllib.parse.urlencode(params)
+            last_error = "Live Mandi service હાલમાં ઉપલબ્ધ નથી."
+            for attempt in range(3):
+                req = urllib.request.Request(
+                    url,
+                    headers={"Accept": "application/json", "User-Agent": "SmartAgriMarketAI/1.2"},
+                )
+                try:
+                    with urllib.request.urlopen(req, timeout=12) as response:
+                        body = response.read().decode("utf-8", "ignore")
+                        payload = json.loads(body)
+                        return payload, "", 0
+                except urllib.error.HTTPError as exc:
+                    if exc.code == 429:
+                        cooldown = _mandi_retry_after_seconds(exc)
+                        _mandi_rate_limit_until[key] = time.monotonic() + cooldown
+                        _mandi_global_rate_limit_until = time.monotonic() + cooldown
+                        return None, f"Live Mandi API limit પર છે; server cooldown {cooldown} સેકન્ડ માટે સક્રિય છે.", cooldown
+                    if exc.code in (401, 403):
+                        return None, "Live Mandi API authentication/permission error.", 0
+                    last_error = f"Live Mandi HTTP error {exc.code}."
+                    if exc.code not in (502, 503):
+                        return None, last_error, 0
+                except Exception:
+                    last_error = "Live Mandi service હાલમાં ઉપલબ્ધ નથી."
+                if attempt < 2:
+                    time.sleep(float(2 ** attempt))
+            return None, last_error, 0
 
-    # Some data.gov installations have inconsistent district filter values.
-    # If a district-filtered request returns no rows, retry once without the
-    # district filter. The caller will only show these rows when no district
-    # was requested, preventing a misleading cross-district result.
-    if district.strip():
-        fallback, fallback_error = request_once(False)
-        if isinstance(fallback, dict) and fallback.get("records"):
-            raw_records = fallback.get("records") or []
+        data, error, cooldown = request_once(bool(district.strip()))
+        if isinstance(data, dict) and data.get("records"):
+            raw_records = data.get("records") or []
             normalized = _normalise_mandi_records(raw_records)
             raw_keys = sorted(list(raw_records[0].keys())) if isinstance(raw_records[0], dict) else []
-            return {**fallback, "records": normalized, "_diagnostics": {"raw_record_count": len(raw_records), "raw_sample_keys": raw_keys[:30]}, "district_filter_miss": True}, ""
-        return None, fallback_error or error or "આ જિલ્લો માટે હાલ Live Mandi record મળ્યો નથી."
+            result = {**data, "records": normalized, "_diagnostics": {"raw_record_count": len(raw_records), "raw_sample_keys": raw_keys[:30]}}
+            _mandi_cache_response(key, result, time.monotonic())
+            _mandi_rate_limit_until.pop(key, None)
+            _mandi_global_rate_limit_until = 0.0
+            return result, ""
 
-    return data, error
+        # A 429 must never trigger an immediate district-less fallback request.
+        if cooldown:
+            stale = _mandi_cached_result(key, time.monotonic(), allow_stale=True)
+            if stale:
+                cached_data, age = stale
+                return _mandi_cached_payload(cached_data, age, error), ""
+            return None, error
+
+        if error and error not in ("Live Mandi service હાલમાં ઉપલબ્ધ નથી.",):
+            stale = _mandi_cached_result(key, time.monotonic(), allow_stale=True)
+            if stale:
+                cached_data, age = stale
+                return _mandi_cached_payload(cached_data, age, error), ""
+            return None, error
+
+        # Some data.gov installations have inconsistent district filter values.
+        # Retry once without district only when the district-filtered request genuinely
+        # returned no rows. A successful fallback is NOT cached under the district key.
+        if district.strip():
+            fallback, fallback_error, fallback_cooldown = request_once(False)
+            if fallback_cooldown:
+                stale = _mandi_cached_result(key, time.monotonic(), allow_stale=True)
+                if stale:
+                    cached_data, age = stale
+                    return _mandi_cached_payload(cached_data, age, fallback_error), ""
+                return None, fallback_error
+            if isinstance(fallback, dict) and fallback.get("records"):
+                raw_records = fallback.get("records") or []
+                normalized = _normalise_mandi_records(raw_records)
+                raw_keys = sorted(list(raw_records[0].keys())) if isinstance(raw_records[0], dict) else []
+                return {**fallback, "records": normalized, "_diagnostics": {"raw_record_count": len(raw_records), "raw_sample_keys": raw_keys[:30]}, "district_filter_miss": True}, ""
+            error = fallback_error or error
+
+        stale = _mandi_cached_result(key, time.monotonic(), allow_stale=True)
+        if stale:
+            cached_data, age = stale
+            return _mandi_cached_payload(cached_data, age, error or "Live Mandi service હાલમાં ઉપલબ્ધ નથી."), ""
+        return data, error
 
 
 def _parse_mandi_date(value: str):
