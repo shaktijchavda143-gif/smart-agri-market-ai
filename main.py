@@ -154,6 +154,7 @@ def health():
 
 
 NEWS_DEFAULT_MAX_AGE_HOURS = 48
+NEWS_FALLBACK_MAX_AGE_HOURS = 168
 
 def _news_max_age_hours() -> int:
     try:
@@ -253,6 +254,7 @@ NEWS_QUERY_SUFFIX = "when:2d"
 # - Gujarati is detected from article text, not from a publisher allow-list.
 # - Category/crop intent is preserved during fallback.
 NEWS_DEFAULT_MAX_AGE_HOURS = 48
+NEWS_FALLBACK_MAX_AGE_HOURS = 168
 
 NEWS_CROP_SYNONYMS = {
     "મગફળી": ("મગફળી", "groundnut", "peanut"),
@@ -470,16 +472,20 @@ def _fetch_news_items(
         "category_irrelevant": 0, "crop_irrelevant": 0, "irrelevant_items_rejected": 0,
         "duplicate_rejected": 0,
     }
-    candidates = []
-    base = query.replace(" when:2d", "").replace(" when:1d", "").strip()
-    # Primary discovery preserves the request. Fallback reuses the same query
-    # and only expands the time window; it never drops category/crop semantics.
-    for value in (base, f"Gujarat agriculture farmer news {NEWS_CROP_ENGLISH.get(relevance_crop, relevance_crop)}".strip()):
-        if value and value not in candidates:
-            candidates.append(value)
+    base = re.sub(r"\s+when:\d+d\b", "", (query or "").strip(), flags=re.IGNORECASE).strip()
+    if not base:
+        base = "Gujarat agriculture farmer news"
     now = datetime.now(timezone.utc)
     effective_max_age = max_age_hours if max_age_hours is not None else _news_max_age_hours()
+    effective_max_age = max(1, min(int(effective_max_age), NEWS_FALLBACK_MAX_AGE_HOURS))
     cutoff = now - timedelta(hours=effective_max_age)
+    time_operator = "when:2d" if effective_max_age <= 48 else "when:7d"
+    candidates = [f"{base} {time_operator}".strip()]
+    if relevance_crop:
+        crop_en = NEWS_CROP_ENGLISH.get(relevance_crop, relevance_crop)
+        alternate = f"{base} {relevance_crop} {crop_en} {time_operator}".strip()
+        if alternate not in candidates:
+            candidates.append(alternate)
     india_tz = timezone(timedelta(hours=5, minutes=30))
     items, seen = [], set()
 
@@ -566,6 +572,7 @@ def _fetch_news_items(
                 "is_fresh": (now - published).total_seconds() <= 48 * 3600,
                 "age_hours": round(max(0.0, (now - published).total_seconds() / 3600.0), 1),
                 "news_age_type": "fresh" if (now - published).total_seconds() <= 48 * 3600 else "important_older",
+                "news_window": "48h" if effective_max_age <= 48 else "7d",
             }
             key = _news_identity(item)
             if key in seen:
@@ -1304,7 +1311,7 @@ def _news_market_prices_detailed(crop: str, limit: int = 20):
                    "recognizable_prices": 0, "matching_crop": 0, "valid_locations": 0,
                    "backend_exception": ""}
     try:
-        items = _fetch_news_items(query, 24, include_article_text=True)
+        items = _fetch_news_items(query, 24, include_article_text=True, category="market", relevance_crop=crop.strip(), require_crop=bool(crop.strip()), max_age_hours=48)
     except Exception as exc:
         diagnostics["backend_exception"] = str(exc)[:300]
         return [], diagnostics
