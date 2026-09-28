@@ -27,7 +27,7 @@ from google import genai
 from google.genai import types
 
 APP_VERSION = "11.2 Gemini Vision + Mandi Cache Guard"
-MODEL = os.getenv("OPENAI_MODEL", "gpt-5.6-luna").strip() or "gpt-5.6-luna"
+MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile").strip() or "llama-3.3-70b-versatile"
 GEMINI_VISION_MODEL = os.getenv("GEMINI_VISION_MODEL", "gemini-3.6-flash").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 
@@ -64,9 +64,9 @@ class Ask(BaseModel):
     context: dict | None = None
 
 
-def openai_client():
-    key = os.getenv("OPENAI_API_KEY", "").strip()
-    return OpenAI(api_key=key) if key else None
+def groq_client():
+    key = os.getenv("GROQ_API_KEY", "").strip()
+    return OpenAI(api_key=key, base_url="https://api.groq.com/openai/v1") if key else None
 
 
 def norm(text: str) -> str:
@@ -141,7 +141,7 @@ def health():
         "service": "smart-agri-ai",
         "version": APP_VERSION,
         "agent_loaded": _agent is not None,
-        "openai_configured": bool(os.getenv("OPENAI_API_KEY", "").strip()),
+        "groq_configured": bool(os.getenv("GROQ_API_KEY", "").strip()),
         "gemini_vision_configured": bool(GEMINI_API_KEY),
         "gemini_vision_model": GEMINI_VISION_MODEL,
         "mandi_api_configured": bool(os.getenv("DATA_GOV_API_KEY", "").strip()),
@@ -699,7 +699,7 @@ def ask(req: Ask):
     if not req.question.strip():
         raise HTTPException(status_code=400, detail="પ્રશ્ન ખાલી છે.")
     try:
-        client = openai_client()
+        client = groq_client()
         if client is None:
             return {"answer": rule_based_answer(req.question, req.context), "mode": "agent"}
         ctx = req.context or {}
@@ -708,7 +708,7 @@ def ask(req: Ask):
         answer = (response.output_text or "").strip()
         if not answer:
             answer = rule_based_answer(req.question, req.context)
-        return {"answer": answer, "mode": "openai", "model": MODEL}
+        return {"answer": answer, "mode": "groq", "model": MODEL}
     except Exception as exc:
         # Never make the Android button fail just because the external AI service failed.
         return {
