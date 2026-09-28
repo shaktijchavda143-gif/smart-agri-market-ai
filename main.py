@@ -246,205 +246,254 @@ _LAST_NEWS_FETCH_DIAGNOSTICS = {"rss_search_failed": 0, "rss_items_seen": 0, "fr
 
 NEWS_QUERY_SUFFIX = "when:2d"
 
-# Google News RSS can return an empty feed for some Gujarati + when:2d
-# combinations even when the same topic has RSS results without that operator.
-# Freshness is therefore enforced locally from pubDate; the search operator is
-# only an optional accelerator, never the sole freshness mechanism.
-# Google News RSS reliably accepts the English/ASCII Gujarat queries below.
-# Gujarati output is handled separately so a Gujarati-only RSS query cannot
-# turn into HTTP 400 and leave the app empty.
-NEWS_CROP_ENGLISH = {
-    "કપાસ": "cotton", "મગફળી": "groundnut peanut", "ઘઉં": "wheat",
-    "બાજરી": "bajra millet", "મકાઈ": "maize corn", "જીરું": "cumin jeera",
-    "ધાણા": "coriander", "તલ": "sesame", "એરંડા": "castor",
-    "ચણા": "gram chana", "તુવેર": "tur arhar", "મગ": "moong",
-    "અડદ": "urad black gram", "ડુંગળી": "onion", "બટાકા": "potato",
-    "ટામેટા": "tomato", "મરચાં": "chilli", "લસણ": "garlic",
-    "શેરડી": "sugarcane", "કેરી": "mango", "કેળા": "banana",
-    "દાડમ": "pomegranate",
+# News business contract:
+# - 48h is the primary window.
+# - 168h is a fallback window only when the same request has no valid 48h item.
+# - Publication timestamps are normalized to UTC before comparison.
+# - Gujarati is detected from article text, not from a publisher allow-list.
+# - Category/crop intent is preserved during fallback.
+NEWS_DEFAULT_MAX_AGE_HOURS = 48
+
+NEWS_CROP_SYNONYMS = {
+    "મગફળી": ("મગફળી", "groundnut", "peanut"),
+    "કપાસ": ("કપાસ", "cotton"),
+    "જીરું": ("જીરું", "cumin", "jeera"),
+    "એરંડા": ("એરંડા", "castor", "castor seed"),
+    "ડુંગળી": ("ડુંગળી", "onion"),
+    "ઘઉં": ("ઘઉં", "wheat"),
+    "બાજરી": ("બાજરી", "bajra", "pearl millet"),
+    "મકાઈ": ("મકાઈ", "maize", "corn"),
+    "ધાણા": ("ધાણા", "coriander"),
+    "તલ": ("તલ", "sesame"),
+    "ચણા": ("ચણા", "gram", "chickpea"),
+    "તુવેર": ("તુવેર", "tur", "arhar", "pigeon pea"),
+    "મગ": ("મગ", "moong", "green gram"),
+    "અડદ": ("અડદ", "urad", "black gram"),
+    "બટાકા": ("બટાકા", "potato"),
+    "ટામેટા": ("ટામેટા", "tomato"),
+    "મરચાં": ("મરચાં", "chilli", "chili"),
+    "લસણ": ("લસણ", "garlic"),
+    "શેરડી": ("શેરડી", "sugarcane"),
 }
 
+NEWS_CROP_ENGLISH = {key: " ".join(v[1:]) for key, v in NEWS_CROP_SYNONYMS.items()}
 
-# Sources allowed for the 7-day fallback. The fallback must show Gujarati
-# news-channel/news-paper sources, not an English agriculture publication.
-GUJARATI_NEWS_SOURCE_NAMES = (
-    "tv9 gujarati", "tv9gujarati", "abp asmita", "abp gujarati",
-    "sandesh", "divya bhaskar", "divyabhaskar", "gujarat samachar",
-    "gujarat first", "vtv gujarati", "zee 24 kalak", "news18 gujarati",
-    "gstv", "gujarat mitra", "aajkaal", "aaj kaal",
+NEWS_CATEGORY_TERMS = {
+    "agriculture": (
+        "કૃષિ", "ખેડૂત", "ખેડૂતો", "ખેતી", "પાક", "agriculture", "agricultural",
+        "farmer", "farmers", "farming", "crop", "crops", "cultivation", "harvest",
+        "irrigation", "agri", "organic farming", "natural farming",
+    ),
+    "subsidy": (
+        "સબસીડી", "સબસિડી", "સહાય", "યોજના", "ખેડૂત સહાય", "નાણાકીય સહાય",
+        "subsidy", "scheme", "financial assistance", "support",
+    ),
+    "methods": (
+        "કૃષિ પદ્ધતિ", "ખેતી પદ્ધતિ", "સિંચાઈ", "ટપક", "ડ્રિપ", "સજીવ", "પ્રાકૃતિક ખેતી",
+        "ટેકનોલોજી", "બિયારણ", "ખાતર", "farming method", "irrigation", "drip",
+        "technology", "cultivation technique", "yield improvement",
+    ),
+    "market": (
+        "બજાર ભાવ", "મંડી", "મંડી ભાવ", "બજાર", "ભાવ", "એપીએમસી", "ટેકાના ભાવ",
+        "apmc", "mandi", "market", "market rate", "price", "commodity", "msp",
+        "support price", "buying", "selling",
+    ),
+}
+
+GUJARAT_TERMS = (
+    "ગુજરાત", "ગુજરાતના", "ગુજરાતમાં", "gujarat", "ahmedabad", "rajkot", "surat",
+    "vadodara", "gandhinagar",
 )
 
-def _is_gujarati_news_source(source: str) -> bool:
-    low = " ".join((source or "").casefold().split())
-    return any(name in low for name in GUJARATI_NEWS_SOURCE_NAMES)
+def _news_max_age_hours() -> int:
+    # Environment may tighten the window but can never exceed the 7-day contract.
+    try:
+        value = int(os.getenv("NEWS_MAX_AGE_HOURS", str(NEWS_DEFAULT_MAX_AGE_HOURS)))
+        return max(1, min(value, 48))
+    except Exception:
+        return NEWS_DEFAULT_MAX_AGE_HOURS
+
+
+def _parse_news_date(value: str):
+    """Parse an RSS date into an aware UTC datetime; never invent a date."""
+    if not value:
+        return None
+    try:
+        dt = parsedate_to_datetime(value)
+        if dt.tzinfo is None:
+            # RSS dates without an offset are treated explicitly as UTC rather
+            # than depending on the Render/server local timezone.
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
 
 def _has_gujarati_text(text: str) -> bool:
-    # Require actual Gujarati Unicode characters so an English headline is
-    # never accepted merely because its display title was replaced.
-    return any("\u0a80" <= ch <= "\u0aff" for ch in (text or ""))
+    """Require genuine Gujarati Unicode content, while allowing mixed text."""
+    value = text or ""
+    gujarati = sum("\u0a80" <= ch <= "\u0aff" for ch in value)
+    letters = sum(ch.isalpha() for ch in value)
+    return gujarati >= 3 and (letters == 0 or gujarati / max(letters, 1) >= 0.12)
 
-def _is_approved_gujarati_news_item(source: str, title: str) -> bool:
-    # This is a hard gate for BOTH the 48-hour feed and the 7-day fallback.
-    # An English article must never be displayed with an artificial Gujarati
-    # title. The source itself must be a known Gujarati news publisher and the
-    # RSS headline must contain real Gujarati Unicode text.
-    return _is_gujarati_news_source(source) and _has_gujarati_text(title)
 
-NEWS_QUERY_VARIANTS = (
-    "Gujarat agriculture farmer news",
-    "Gujarat agriculture farmers crop news",
-    "Gujarat farming farmers government agriculture news",
-)
+def _gujarati_score(title: str, description: str = "") -> float:
+    text = " ".join(x for x in (title, description) if x).strip()
+    letters = sum(ch.isalpha() for ch in text)
+    gujarati = sum("\u0a80" <= ch <= "\u0aff" for ch in text)
+    if letters == 0:
+        return 0.0
+    return gujarati / letters
+
+
+def _is_gujarati_news_source(source: str) -> bool:
+    # Source is a quality/diagnostic signal only, never a language gate.
+    low = " ".join((source or "").casefold().split())
+    return any(name in low for name in (
+        "tv9 gujarati", "tv9gujarati", "abp asmita", "abp gujarati",
+        "sandesh", "divya bhaskar", "divyabhaskar", "gujarat samachar",
+        "gujarat first", "vtv gujarati", "zee 24 kalak", "news18 gujarati",
+        "gstv", "gujarat mitra", "aajkaal", "aaj kaal",
+    ))
+
+
+def _is_gujarati_article(item: dict) -> bool:
+    title = str(item.get("original_title") or item.get("title") or "")
+    description = str(item.get("description") or "")
+    # Title is the strongest signal; description can rescue a genuine mixed
+    # headline. Source can only boost confidence, never override English text.
+    return _has_gujarati_text(title) or (
+        _gujarati_score(title, description) >= 0.12 and
+        sum("\u0a80" <= ch <= "\u0aff" for ch in (title + description)) >= 8
+    )
+
 
 def _news_query_for_category(crop: str, category: str) -> str:
     crop = crop.strip()
-    category = (category or "all").strip().lower()
+    category = (category or "agriculture").strip().lower()
     crop_en = NEWS_CROP_ENGLISH.get(crop, crop)
-    if category == "agriculture":
-        return f"Gujarat {crop_en} farmer agriculture news" if crop else "Gujarat agriculture farmer news"
     if category == "subsidy":
-        return "Gujarat farmer subsidy scheme iKhedut agriculture"
-    if category == "methods":
-        return f"Gujarat {crop_en} farming method technology" if crop else "Gujarat agriculture farming technology"
-    if category == "market":
-        return f"Gujarat {crop_en} APMC market price farmer" if crop else "Gujarat APMC market price farmer"
-    return "Gujarat farmer agriculture scheme technology crop news"
+        base = "Gujarat farmer subsidy scheme agriculture"
+    elif category == "methods":
+        base = "Gujarat farming method technology agriculture"
+    elif category == "market":
+        base = "Gujarat APMC market price farmer agriculture"
+    else:
+        base = "Gujarat agriculture farmer crop news"
+    return f"{base} {crop_en}".strip() if crop else base
 
 
-NEWS_TITLE_PHRASES = (
-    ("Gujarat's natural farming push", "ગુજરાતમાં પ્રાકૃતિક ખેતીને પ્રોત્સાહન"),
-    ("Natural farming more than doubles", "પ્રાકૃતિક ખેતીથી ઉપજમાં મોટો વધારો"),
-    ("Natural farming doubles", "પ્રાકૃતિક ખેતીથી ઉપજ બમણી"),
-    ("Farmer Registry", "ખેડૂત રજિસ્ટ્રી અંગે મહત્વના સમાચાર"),
-    ("farmer registry", "ખેડૂત રજિસ્ટ્રી અંગે મહત્વના સમાચાર"),
-    ("subsidy", "ખેડૂત સબસિડી અંગે મહત્વના સમાચાર"),
-    ("scheme", "ખેડૂત યોજના અંગે મહત્વના સમાચાર"),
-    ("agriculture", "ગુજરાત કૃષિ અંગે મહત્વના સમાચાર"),
-    ("farmer", "ગુજરાતના ખેડૂતો માટે મહત્વના સમાચાર"),
-)
-
-def _gujarati_news_title(title: str, crop: str = "", category: str = "agriculture") -> str:
-    """Create a safe Gujarati display title without pretending to translate unknown text."""
-    raw = " ".join((title or "").split())
-    low = raw.casefold()
-    for phrase, translated in NEWS_TITLE_PHRASES:
-        if phrase.casefold() in low:
-            prefix = f"{crop}: " if crop else ""
-            return prefix + translated
-    if crop:
-        return f"{crop}: ગુજરાતમાં ખેતી અને ખેડૂતો અંગે મહત્વના સમાચાર"
-    category_titles = {
-        "subsidy": "ગુજરાતમાં ખેડૂત સહાય અને યોજનાઓ અંગે મહત્વના સમાચાર",
-        "methods": "ગુજરાતમાં ખેતી પદ્ધતિ અને ટેકનોલોજી અંગે મહત્વના સમાચાર",
-        "market": "ગુજરાતના બજાર અને ખેડૂતો અંગે મહત્વના સમાચાર",
-        "agriculture": "ગુજરાતમાં ખેતી અને ખેડૂતો અંગે મહત્વના સમાચાર",
-    }
-    return category_titles.get(category, "ગુજરાતમાં કૃષિ અને ખેડૂતો અંગે મહત્વના સમાચાર")
-
-
-def _news_relevance(item: dict, crop: str = "", require_crop: bool = False) -> bool:
-    """Return True only for Gujarat agriculture/farmer news.
-
-    The RSS query is a discovery mechanism only. This gate prevents unrelated
-    stories from being shown and, for a crop-specific request, prevents a
-    generic Gujarat agriculture story from occupying the crop result.
-    """
+def _category_relevant(item: dict, category: str) -> bool:
+    category = (category or "agriculture").strip().lower()
+    if category not in NEWS_CATEGORY_TERMS:
+        category = "agriculture"
     text = " ".join([
         str(item.get("original_title") or item.get("title") or ""),
         str(item.get("description") or ""),
         str(item.get("source") or ""),
     ]).casefold()
-    gujarat_terms = ("gujarat", "ગુજરાત", "ahmedabad", "rajkot", "surat", "vadodara", "gandhinagar")
-    agriculture_terms = (
-        "agriculture", "agricultural", "farmer", "farmers", "farming", "crop", "crops",
-        "cultivation", "harvest", "harvesting", "irrigation", "natural farming", "organic farming",
-        "apmc", "mandi", "agri", "કૃષિ", "ખેડૂત", "ખેડૂતો", "ખેતી", "પાક", "બજાર", "સિંચાઈ",
-        "પ્રાકૃતિક ખેતી", "ખાતર", "રોગ", "જંતુ", "બિયારણ", "સબસિડી", "યોજના",
-    )
-    if not any(term in text for term in gujarat_terms):
+    return any(term.casefold() in text for term in NEWS_CATEGORY_TERMS[category])
+
+
+def _crop_relevant(item: dict, crop: str) -> bool:
+    if not crop:
+        return True
+    aliases = NEWS_CROP_SYNONYMS.get(crop, (crop,))
+    text = " ".join([
+        str(item.get("original_title") or item.get("title") or ""),
+        str(item.get("description") or ""),
+    ]).casefold()
+    return any(alias.casefold() in text for alias in aliases)
+
+
+def _news_relevance(item: dict, crop: str = "", require_crop: bool = False, category: str = "agriculture") -> bool:
+    text = " ".join([
+        str(item.get("original_title") or item.get("title") or ""),
+        str(item.get("description") or ""),
+        str(item.get("source") or ""),
+    ]).casefold()
+    if not any(term.casefold() in text for term in GUJARAT_TERMS):
         return False
-    if not any(term in text for term in agriculture_terms):
+    if not any(term.casefold() in text for term in NEWS_CATEGORY_TERMS["agriculture"]):
         return False
-    if require_crop and crop:
-        crop_terms = NEWS_CROP_ENGLISH.get(crop, crop).casefold().split()
-        # Gujarati crop name is also accepted.
-        if crop.casefold() not in text and not any(term in text for term in crop_terms if len(term) >= 4):
-            return False
-    return True
+    if not _category_relevant(item, category):
+        return False
+    return not require_crop or _crop_relevant(item, crop)
 
 
-def _fetch_news_items(query: str, limit: int = 24, include_article_text: bool = False, category: str = "agriculture", max_age_hours: int | None = None, allow_older_fallback: bool = False, relevance_crop: str = "", require_crop: bool = False):
-    """Fetch fresh Google News RSS items with resilient query fallbacks.
+def _canonical_news_url(link: str) -> str:
+    raw = (link or "").strip()
+    try:
+        parsed = urllib.parse.urlsplit(raw)
+        if not parsed.scheme or not parsed.netloc:
+            return raw.casefold()
+        query = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+        query = [(k, v) for k, v in query if k.lower() not in {
+            "utm_source", "utm_medium", "utm_campaign", "utm_content", "utm_term"
+        }]
+        return urllib.parse.urlunsplit((
+            parsed.scheme.lower(), parsed.netloc.lower(), parsed.path.rstrip("/"),
+            urllib.parse.urlencode(query), ""
+        )).casefold()
+    except Exception:
+        return raw.casefold()
 
-    We do NOT trust the Google `when:2d` search operator as the freshness
-    mechanism because some localized feeds return an empty RSS document for
-    that operator. Every accepted item is still required to have a valid
-    publication timestamp inside NEWS_MAX_AGE_HOURS.
-    """
+
+def _news_identity(item: dict) -> str:
+    """Prefer canonical URL; fall back to title/source/day when RSS wraps URLs."""
+    link = _canonical_news_url(str(item.get("link") or ""))
+    if link and "news.google.com" not in link:
+        return "url:" + link
+    title = re.sub(r"\s+", " ", str(item.get("original_title") or item.get("title") or "")).strip().casefold()
+    source = re.sub(r"\s+", " ", str(item.get("source") or "")).strip().casefold()
+    published = str(item.get("published_at") or "")[:10]
+    return f"story:{title}|{source}|{published}"
+
+
+def _fetch_news_items(
+    query: str,
+    limit: int = 24,
+    include_article_text: bool = False,
+    category: str = "agriculture",
+    max_age_hours: int | None = None,
+    allow_older_fallback: bool = False,
+    relevance_crop: str = "",
+    require_crop: bool = False,
+):
+    """Fetch, validate and select real Gujarati agricultural articles."""
     global _LAST_NEWS_FETCH_DIAGNOSTICS
     _LAST_NEWS_FETCH_DIAGNOSTICS = {
-        "rss_search_failed": 0,
-        "rss_items_seen": 0,
-        "fresh_items_kept": 0,
-        "queries_tried": 0,
-        "empty_feeds": 0,
-        "date_parse_failed": 0,
-        "older_than_window": 0,
-        "irrelevant_items_rejected": 0,
-        "non_gujarati_source_rejected": 0,
-        "non_gujarati_headline_rejected": 0,
+        "rss_search_failed": 0, "rss_items_seen": 0, "valid_dates": 0,
+        "fresh_items_kept": 0, "queries_tried": 0, "empty_feeds": 0,
+        "date_parse_failed": 0, "older_than_window": 0, "future_date_rejected": 0,
+        "gujarati_items": 0, "non_gujarati_headline_rejected": 0,
+        "category_irrelevant": 0, "crop_irrelevant": 0, "irrelevant_items_rejected": 0,
+        "duplicate_rejected": 0,
     }
     candidates = []
-    # Never send a Gujarati-only query to Google News RSS: the endpoint can
-    # respond with HTTP 400 for Gujarati query text. Use ASCII/English search
-    # terms and localize the displayed title separately.
-    if allow_older_fallback:
-        # Dedicated fallback pipeline. Do not depend on the crop-specific
-        # Gujarati query or the primary query list. These are known-good ASCII
-        # Google News searches for relevant Gujarat agriculture/farmer news.
-        fallback_queries = (
-            "Gujarat agriculture farmer news",
-            "Gujarat farmers agriculture farming news",
-            "Gujarat natural farming farmers news",
-            "Gujarat agriculture crop farmers news",
-            "Gujarat government agriculture farmer news",
-        )
-        for value in fallback_queries:
-            value = value.strip()
-            if value and value not in candidates:
-                candidates.append(value)
-    else:
-        for value in [query.strip(), *NEWS_QUERY_VARIANTS]:
-            value = value.strip()
-            if value and value not in candidates:
-                candidates.append(value)
+    base = query.replace(" when:2d", "").replace(" when:1d", "").strip()
+    # Primary discovery preserves the request. Fallback reuses the same query
+    # and only expands the time window; it never drops category/crop semantics.
+    for value in (base, f"Gujarat agriculture farmer news {NEWS_CROP_ENGLISH.get(relevance_crop, relevance_crop)}".strip()):
+        if value and value not in candidates:
+            candidates.append(value)
     now = datetime.now(timezone.utc)
     effective_max_age = max_age_hours if max_age_hours is not None else _news_max_age_hours()
     cutoff = now - timedelta(hours=effective_max_age)
     india_tz = timezone(timedelta(hours=5, minutes=30))
     items, seen = [], set()
 
-    # Keep the number of RSS calls bounded. The publication timestamp below is
-    # the authoritative freshness check, so there is no need to issue a second
-    # `when:2d` request for every query.
-    max_queries = 5 if allow_older_fallback else 4
-    for effective_query in candidates[:max_queries]:
+    for effective_query in candidates[:4]:
         if len(items) >= limit:
             break
-        # The fallback is deliberately NOT constrained by Google's when:2d
-        # operator; local max_age_hours=168 is the authoritative 7-day rule.
-        effective_query = effective_query.replace(" when:2d", "").replace(" when:1d", "")
         _LAST_NEWS_FETCH_DIAGNOSTICS["queries_tried"] += 1
-        url = "https://news.google.com/rss/search?" + urllib.parse.urlencode(
-            {"q": effective_query, "hl": "en-IN", "gl": "IN", "ceid": "IN:en"}
-        )
-        request = urllib.request.Request(
-            url,
-            headers={
-                "User-Agent": "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/126.0 SmartAgriMarketAI/1.4",
-                "Accept": "application/rss+xml,application/xml,text/xml,*/*;q=0.8",
-            },
-        )
+        url = "https://news.google.com/rss/search?" + urllib.parse.urlencode({
+            "q": effective_query, "hl": "gu", "gl": "IN", "ceid": "IN:gu"
+        })
+        request = urllib.request.Request(url, headers={
+            "User-Agent": "Mozilla/5.0 SmartAgriMarketAI/News/2.0",
+            "Accept": "application/rss+xml,application/xml,text/xml,*/*;q=0.8",
+        })
         try:
             with urllib.request.urlopen(request, timeout=8) as response:
                 raw = response.read(700000)
@@ -460,140 +509,183 @@ def _fetch_news_items(query: str, limit: int = 24, include_article_text: bool = 
         if not rss_items:
             _LAST_NEWS_FETCH_DIAGNOSTICS["empty_feeds"] += 1
             continue
-        for item in rss_items:
+
+        for rss_item in rss_items:
             _LAST_NEWS_FETCH_DIAGNOSTICS["rss_items_seen"] += 1
-            title = (item.findtext("title") or "").strip()
-            link = (item.findtext("link") or "").strip()
-            date_text = (item.findtext("pubDate") or "").strip()
-            source = (item.findtext("source") or "").strip()
-            description = (item.findtext("description") or "").strip()
+            title = (rss_item.findtext("title") or "").strip()
+            link = (rss_item.findtext("link") or "").strip()
+            date_text = (rss_item.findtext("pubDate") or "").strip()
+            source = (rss_item.findtext("source") or "").strip()
+            description = (rss_item.findtext("description") or "").strip()
             published = _parse_news_date(date_text)
             if not title or not link:
                 continue
             if published is None:
                 _LAST_NEWS_FETCH_DIAGNOSTICS["date_parse_failed"] += 1
                 continue
+            _LAST_NEWS_FETCH_DIAGNOSTICS["valid_dates"] += 1
+            if published > now:
+                _LAST_NEWS_FETCH_DIAGNOSTICS["future_date_rejected"] += 1
+                continue
             if published < cutoff:
                 _LAST_NEWS_FETCH_DIAGNOSTICS["older_than_window"] += 1
                 continue
-            if published > now + timedelta(minutes=10):
-                continue
-            candidate_item = {"original_title": title, "description": _html_to_text(description), "source": source}
-            # Hard Gujarati-only gate for EVERY accepted article, including
-            # the normal 48-hour feed. Previously this check existed only in
-            # the 7-day fallback, which allowed English publications to pass
-            # through and then receive a fake/generated Gujarati title.
-            if not _is_gujarati_news_source(source):
-                _LAST_NEWS_FETCH_DIAGNOSTICS["non_gujarati_source_rejected"] = _LAST_NEWS_FETCH_DIAGNOSTICS.get("non_gujarati_source_rejected", 0) + 1
-                continue
-            if not _has_gujarati_text(title):
-                _LAST_NEWS_FETCH_DIAGNOSTICS["non_gujarati_headline_rejected"] = _LAST_NEWS_FETCH_DIAGNOSTICS.get("non_gujarati_headline_rejected", 0) + 1
-                continue
-            if not _news_relevance(candidate_item, relevance_crop, require_crop=require_crop):
-                _LAST_NEWS_FETCH_DIAGNOSTICS["irrelevant_items_rejected"] = _LAST_NEWS_FETCH_DIAGNOSTICS.get("irrelevant_items_rejected", 0) + 1
-                continue
-            key = link.split("?", 1)[0].casefold()
-            if key in seen:
-                continue
-            seen.add(key)
-            _LAST_NEWS_FETCH_DIAGNOSTICS["fresh_items_kept"] += 1
-            item_age_hours = max(0.0, (now - published).total_seconds() / 3600.0)
-            items.append({
-                "title": title,
-                # Preserve the publisher's real Gujarati headline. Never
-                # translate or synthesize an English headline for display.
-                "display_title": title,
+
+            candidate = {
                 "original_title": title,
-                "link": link,
-                "published_at": published.isoformat(),
+                "title": title,
+                "description": _html_to_text(description),
+                "source": source,
+            }
+            if not _is_gujarati_article(candidate):
+                _LAST_NEWS_FETCH_DIAGNOSTICS["non_gujarati_headline_rejected"] += 1
+                continue
+            _LAST_NEWS_FETCH_DIAGNOSTICS["gujarati_items"] += 1
+
+            if not _category_relevant(candidate, category):
+                _LAST_NEWS_FETCH_DIAGNOSTICS["category_irrelevant"] += 1
+                _LAST_NEWS_FETCH_DIAGNOSTICS["irrelevant_items_rejected"] += 1
+                continue
+            if require_crop and not _crop_relevant(candidate, relevance_crop):
+                _LAST_NEWS_FETCH_DIAGNOSTICS["crop_irrelevant"] += 1
+                _LAST_NEWS_FETCH_DIAGNOSTICS["irrelevant_items_rejected"] += 1
+                continue
+            # Gujarat context may be in title/summary or publisher identity.
+            combined = " ".join((title, candidate["description"], source)).casefold()
+            if not any(term.casefold() in combined for term in GUJARAT_TERMS):
+                _LAST_NEWS_FETCH_DIAGNOSTICS["irrelevant_items_rejected"] += 1
+                continue
+
+            item = {
+                "title": title, "display_title": title, "original_title": title,
+                "link": link, "published_at": published.isoformat(),
                 "published_text": published.astimezone(india_tz).strftime("%d-%m-%Y %I:%M %p"),
                 "source": source or "સમાચાર સ્ત્રોત",
-                "description": _html_to_text(description),
+                "description": candidate["description"],
                 "category": category or "agriculture",
-                "is_fresh": item_age_hours <= _news_max_age_hours(),
-                "age_hours": round(item_age_hours, 1),
-                "news_age_type": "fresh" if item_age_hours <= _news_max_age_hours() else "important_older",
-            })
+                "is_fresh": (now - published).total_seconds() <= 48 * 3600,
+                "age_hours": round(max(0.0, (now - published).total_seconds() / 3600.0), 1),
+                "news_age_type": "fresh" if (now - published).total_seconds() <= 48 * 3600 else "important_older",
+            }
+            key = _news_identity(item)
+            if key in seen:
+                _LAST_NEWS_FETCH_DIAGNOSTICS["duplicate_rejected"] += 1
+                continue
+            seen.add(key)
+            items.append(item)
+            _LAST_NEWS_FETCH_DIAGNOSTICS["fresh_items_kept"] += 1
             if len(items) >= limit:
                 break
 
     items.sort(key=lambda x: x["published_at"], reverse=True)
-    if not include_article_text:
-        return items[:limit]
-    selected = items[:min(limit, 18)]
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        futures = {pool.submit(_fetch_article_text, item["link"]): item for item in selected}
-        for future in as_completed(futures):
-            item = futures[future]
-            try:
-                fetched = future.result(timeout=9)
-            except Exception:
-                fetched = ""
-            if fetched:
-                item["description"] = (item.get("description", "") + "\n" + fetched).strip()[:60000]
-    return selected
+    if include_article_text:
+        selected = items[:min(limit, 18)]
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futures = {pool.submit(_fetch_article_text, item["link"]): item for item in selected}
+            for future in as_completed(futures):
+                item = futures[future]
+                try:
+                    fetched = future.result(timeout=9)
+                except Exception:
+                    fetched = ""
+                if fetched:
+                    item["description"] = (item.get("description", "") + "\n" + fetched).strip()[:60000]
+        return selected
+    return items[:limit]
 
 
 @app.get("/api/v1/news")
 def news(crop: str = "", category: str = "agriculture"):
     crop_name = crop.strip()
     category_name = (category or "agriculture").strip().lower()
-    query = _news_query_for_category(crop_name, category_name) + " " + NEWS_QUERY_SUFFIX
-    items = _fetch_news_items(query, 12, category=category_name, relevance_crop=crop_name, require_crop=bool(crop_name))
-    diagnostics = dict(_LAST_NEWS_FETCH_DIAGNOSTICS)
+    if category_name not in NEWS_CATEGORY_TERMS:
+        category_name = "agriculture"
 
-    # If the crop-specific feed has no fresh item, deliberately run the
-    # important Gujarat agriculture/farmer fallback. This is still subject to
-    # the same local publication-date freshness check; nothing stale is shown.
+    base_query = _news_query_for_category(crop_name, category_name)
+    primary = _fetch_news_items(
+        base_query + " " + NEWS_QUERY_SUFFIX,
+        12,
+        category=category_name,
+        relevance_crop=crop_name,
+        require_crop=bool(crop_name),
+        max_age_hours=48,
+    )
+    primary_diag = dict(_LAST_NEWS_FETCH_DIAGNOSTICS)
     fallback_used = False
     fallback_reason = ""
-    if not items:
-        # Important fallback is intentionally separate from the primary 48-hour
-        # freshness rule. If no fresh article exists, show relevant recent
-        # Gujarat agriculture/farmer news up to 7 days old, explicitly marked
-        # as older. This prevents an empty News screen without pretending an
-        # older article is a fresh/today article.
-        fallback_query = "Gujarat agriculture farmer news " + NEWS_QUERY_SUFFIX
-        fallback_items = _fetch_news_items(
-            fallback_query, 12, category=category_name,
-            max_age_hours=168, allow_older_fallback=True, relevance_crop="", require_crop=False,
+
+    if primary:
+        items = primary
+        final_window = "48h"
+    else:
+        # Only the time window broadens. Category, crop and Gujarati/article
+        # relevance are kept identical to the original request.
+        fallback = _fetch_news_items(
+            base_query,
+            12,
+            category=category_name,
+            relevance_crop=crop_name,
+            require_crop=bool(crop_name),
+            max_age_hours=168,
         )
         fallback_diag = dict(_LAST_NEWS_FETCH_DIAGNOSTICS)
-        if fallback_items:
-            fallback_used = True
-            fallback_reason = "no fresh 48-hour article; relevant Gujarat agriculture/farmer news up to 7 days old used"
-            items = fallback_items
-        else:
-            fallback_reason = "no fresh 48-hour article and no relevant fallback news within 7 days"
-        for key in ("rss_search_failed", "rss_items_seen", "fresh_items_kept", "queries_tried", "empty_feeds", "date_parse_failed", "older_than_window", "irrelevant_items_rejected"):
-            diagnostics[key] = diagnostics.get(key, 0) + fallback_diag.get(key, 0)
+        items = fallback
+        fallback_used = bool(fallback)
+        final_window = "7d_fallback" if fallback else "none"
+        fallback_reason = (
+            "no valid 48-hour result; same category/crop query broadened to 7 days"
+            if fallback else
+            "no valid Gujarati relevant result within 7 days"
+        )
 
-    for item in items:
-        # Both the fresh feed and the 7-day fallback are already hard-gated to
-        # Gujarati publisher + real Gujarati headline. Preserve that exact
-        # headline; never generate a Gujarati title from an English article.
-        original_title = item.get("original_title") or item.get("title", "")
-        item["display_title"] = original_title
-        item["title"] = original_title
-
-    diagnostics["max_age_hours"] = _news_max_age_hours()
+    # Final invariant: newest first; no synthetic titles/dates/sources/URLs.
+    items.sort(key=lambda x: x["published_at"], reverse=True)
+    diagnostics = dict(primary_diag)
+    diagnostics["raw_candidates"] = primary_diag.get("rss_items_seen", 0)
+    diagnostics["valid_dates"] = primary_diag.get("valid_dates", 0)
+    diagnostics["within_7d"] = sum(
+        1 for x in primary if x.get("age_hours", 9999) <= 168
+    )
+    diagnostics["within_48h"] = sum(
+        1 for x in primary if x.get("age_hours", 9999) <= 48
+    )
+    diagnostics["gujarati_48h"] = sum(
+        1 for x in primary if x.get("is_fresh")
+    )
+    diagnostics["category_relevant_48h"] = len(primary)
+    diagnostics["crop_relevant_48h"] = len(primary) if crop_name else len(primary)
+    diagnostics["final_48h_results"] = len(primary)
+    diagnostics["STARTING_7_DAY_FALLBACK"] = bool(not primary)
     diagnostics["fallback_used"] = fallback_used
     diagnostics["fallback_reason"] = fallback_reason
-    diagnostics["english_headlines_rejected"] = diagnostics.get("non_gujarati_headline_rejected", 0)
-    diagnostics["irrelevant_items_rejected"] = diagnostics.get("irrelevant_items_rejected", 0)
-    diagnostics["fresh_48h_items"] = sum(1 for item in items if item.get("is_fresh"))
-    diagnostics["important_older_items"] = sum(1 for item in items if item.get("news_age_type") == "important_older")
-    diagnostics["fallback_window_hours"] = 168 if fallback_used else 0
+    diagnostics["final_window"] = final_window
+    diagnostics["final_results"] = len(items)
+    diagnostics["newest_selected"] = items[0]["published_at"] if items else None
+    diagnostics["oldest_selected"] = items[-1]["published_at"] if items else None
+    if not primary:
+        diagnostics["fallback_diagnostics"] = fallback_diag
+        diagnostics["gujarati_7d"] = fallback_diag.get("gujarati_items", 0)
+        diagnostics["category_relevant_7d"] = len(items)
+        diagnostics["crop_relevant_7d"] = len(items) if crop_name else len(items)
+
     return {
         "ok": True,
         "crop": crop_name,
         "category": category_name,
-        "max_age_hours": _news_max_age_hours(),
+        "max_age_hours": 48,
+        "fallback_max_age_hours": 168,
         "checked_at": datetime.now(timezone.utc).isoformat(),
         "items": items,
         "diagnostics": diagnostics,
-        "message": ("તાજા ગુજરાતી કૃષિ સમાચાર" if diagnostics.get("fresh_48h_items", 0) else ("મહત્વના તાજેતરના ગુજરાતી કૃષિ સમાચાર (7 દિવસ સુધી)" if items else "છેલ્લા 48 કલાકમાં તાજા સમાચાર મળ્યા નથી અને 7 દિવસમાં સંબંધિત fallback સમાચાર મળ્યા નથી.")),
+        "message": (
+            "તાજા ગુજરાતી કૃષિ સમાચાર"
+            if final_window == "48h" else
+            "મહત્વના તાજેતરના ગુજરાતી કૃષિ સમાચાર (7 દિવસ સુધી)"
+            if final_window == "7d_fallback" else
+            "હાલમાં સંબંધિત તાજા કૃષિ સમાચાર ઉપલબ્ધ નથી."
+        ),
     }
+
 
 @app.post("/api/v1/ai/ask")
 def ask(req: Ask):
