@@ -963,7 +963,11 @@ def _mandi_api_get(state: str, district: str, commodity: str):
 
         def request_once(*, use_state: bool, use_district: bool, use_commodity: bool):
             global _mandi_global_rate_limit_until, _mandi_upstream_failure_until
-            params = {"api-key": MANDI_API_KEY, "format": "json", "limit": "25", "offset": "0"}
+            # Fetch a wider page because the Android screen shows the latest
+            # available APMC records across multiple yards. 25 rows could miss
+            # same-day yards when the upstream ordering changes. data.gov.in
+            # supports larger page sizes for this resource.
+            params = {"api-key": MANDI_API_KEY, "format": "json", "limit": "100", "offset": "0"}
             if use_state and state:
                 params["filters[state]"] = state
             if use_district and district:
@@ -1087,6 +1091,36 @@ def _normalise_price(value: str):
     return str(int(number)) if number.is_integer() else f"{number:.2f}"
 
 
+def _price_float(value: str):
+    try:
+        return float(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _price_per_20kg(value: str) -> str:
+    """Convert official mandi price from ₹/quintal to ₹/20 kg."""
+    number = _price_float(value)
+    if number is None:
+        return ""
+    value20 = number / 5.0
+    if abs(value20 - round(value20)) < 1e-9:
+        return str(int(round(value20)))
+    return f"{value20:.2f}".rstrip("0").rstrip(".")
+
+
+def _average_price_per_20kg(min_price: str, max_price: str) -> str:
+    """Krushi-Pragati-style average = (minimum + maximum) / 2."""
+    minimum = _price_float(min_price)
+    maximum = _price_float(max_price)
+    if minimum is None or maximum is None:
+        return ""
+    average20 = ((minimum + maximum) / 2.0) / 5.0
+    if abs(average20 - round(average20)) < 1e-9:
+        return str(int(round(average20)))
+    return f"{average20:.2f}".rstrip("0").rstrip(".")
+
+
 def _normalise_mandi_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     def pick(row, *keys):
         for key in keys:
@@ -1117,6 +1151,14 @@ def _normalise_mandi_records(records: list[dict[str, Any]]) -> list[dict[str, An
             "min_price": min_price,
             "modal_price": modal_price,
             "max_price": max_price,
+            # Official data.gov.in values are ₹/quintal. These derived fields
+            # are only for presentation; the original source values are kept.
+            "min_price_20kg": _price_per_20kg(min_price),
+            "modal_price_20kg": _price_per_20kg(modal_price),
+            "max_price_20kg": _price_per_20kg(max_price),
+            "average_price_20kg": _average_price_per_20kg(min_price, max_price),
+            "price_unit_source": "₹/quintal",
+            "display_price_unit": "₹/20kg",
         })
     return normalized
 
@@ -1435,7 +1477,10 @@ def mandi(state: str = "Gujarat", district: str = "", commodity: str = "ALL"):
         "cache_status": cache_status,
         "cache_age_seconds": int(cache_age_seconds or 0),
         "checked_at": checked_at,
-        "records": records[:50],
+        "price_unit_source": "₹/quintal (data.gov.in / AGMARKNET)",
+        "display_price_unit": "₹/20kg",
+        "average_rule": "(minimum + maximum) / 2",
+        "records": records[:100],
         "message": message,
         "diagnostics": diagnostics,
     }
