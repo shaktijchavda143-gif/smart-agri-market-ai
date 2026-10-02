@@ -1430,57 +1430,147 @@ def mandi_news(commodity: str = ""):
 
 @app.get("/api/v1/mandi")
 def mandi(state: str = "Gujarat", district: str = "", commodity: str = "ALL"):
-    checked_at = datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=5, minutes=30))).strftime("%d-%m-%Y %H:%M")
+    """Unified Mandi endpoint.
 
-    # Live Mandi is deliberately isolated from general/news price content.
-    data, error = _mandi_api_get(state, district, commodity)
-    records = []
+    Priority:
+      1. Live data.gov.in / AGMARKNET records
+      2. Server-side cached Live records when the upstream is unavailable
+      3. Fresh news-derived market-price records
+
+    The Android client should use this single endpoint.
+    """
+    checked_at = datetime.now(timezone.utc).astimezone(
+        timezone(timedelta(hours=5, minutes=30))
+    ).strftime("%d-%m-%Y %H:%M")
+
+    requested_commodity = (commodity or "ALL").strip() or "ALL"
+    news_commodity = "" if requested_commodity.upper() == "ALL" else requested_commodity
+
+    # 1) Live data.gov.in, with the existing server-side cache protection.
+    data, error = _mandi_api_get(state, district, requested_commodity)
+    records: list[dict[str, Any]] = []
+
     if isinstance(data, dict):
         records = data.get("records") or []
+        if not isinstance(records, list):
+            records = []
         if district and data.get("district_filter_miss"):
             records = []
             error = error or "આ જિલ્લો માટે Live Mandi record મળ્યો નથી."
 
-    live_available = bool(records)
-    if live_available:
-        message = "Live Mandi ભાવ મળ્યા."
-    else:
-        message = error or "Live Mandi APIમાંથી હાલ કોઈ usable price record મળ્યો નથી."
+    source_from_data = data.get("source", "") if isinstance(data, dict) else ""
+    is_server_cached = source_from_data == "data.gov.in cached"
+    live_available = bool(records) and not is_server_cached
 
+    if records:
+        raw_diag = data.get("_diagnostics", {}) if isinstance(data, dict) else {}
+        raw_count = int(raw_diag.get("raw_record_count", len(records)) or len(records))
+        sample_keys = list(raw_diag.get("raw_sample_keys", []) or [])
+        cache_status = data.get("cache_status", "") if isinstance(data, dict) else ""
+        cache_age_seconds = int(data.get("cache_age_seconds", 0) or 0) if isinstance(data, dict) else 0
+
+        diagnostics = {
+            "raw_record_count": raw_count,
+            "normalized_record_count": len(records),
+            "sample_record_keys": sample_keys[:30],
+            "summary": f"API configured={bool(MANDI_API_KEY)}; raw={raw_count}; usable_price_rows={len(records)}",
+            "cache_status": cache_status,
+            "cache_age_seconds": cache_age_seconds,
+            "fallback_used": bool(raw_diag.get("fallback_used", False)),
+            "latest_date": raw_diag.get("latest_date", ""),
+        }
+
+        return {
+            "ok": True,
+            "live_available": live_available,
+            "live_api_configured": bool(MANDI_API_KEY),
+            "fallback_source": "cache" if is_server_cached else "",
+            "live_error": (data.get("live_error", "") if is_server_cached else ""),
+            "source": "data.gov.in cached" if is_server_cached else "data.gov.in Live Mandi API",
+            "cache_status": cache_status,
+            "cache_age_seconds": cache_age_seconds,
+            "checked_at": checked_at,
+            "price_unit_source": "₹/quintal (data.gov.in / AGMARKNET)",
+            "display_price_unit": "₹/20kg",
+            "average_rule": "(minimum + maximum) / 2",
+            "records": records[:100],
+            "news_prices": [],
+            "message": (
+                "છેલ્લો સફળ Mandi data બતાવવામાં આવી રહ્યો છે."
+                if is_server_cached
+                else "Live Mandi ભાવ મળ્યા."
+            ),
+            "diagnostics": diagnostics,
+        }
+
+    # 2) If Live + server cache produced no usable rows, use fresh market news.
+    try:
+        news_prices, news_diagnostics = _news_market_prices_detailed(news_commodity, 20)
+    except Exception as exc:
+        news_prices = []
+        news_diagnostics = {"backend_exception": str(exc)[:300]}
+
+    if news_prices:
+        return {
+            "ok": True,
+            "live_available": False,
+            "live_api_configured": bool(MANDI_API_KEY),
+            "fallback_source": "news",
+            "live_error": error or (
+                data.get("live_error", "") if isinstance(data, dict) else ""
+            ) or "Live Mandi APIમાંથી usable record મળ્યો નથી.",
+            "source": "News / Article",
+            "cache_status": (
+                data.get("cache_status", "") if isinstance(data, dict) else ""
+            ),
+            "cache_age_seconds": int(
+                data.get("cache_age_seconds", 0) if isinstance(data, dict) else 0
+            ),
+            "checked_at": checked_at,
+            "price_unit_source": "News article",
+            "display_price_unit": "₹/20kg",
+            "average_rule": "(minimum + maximum) / 2",
+            "records": [],
+            "news_prices": news_prices[:20],
+            "message": (
+                "Live Mandi API ઉપલબ્ધ ન હોવાથી છેલ્લા 48 કલાકના "
+                "સંબંધિત બજાર સમાચાર પરથી ભાવ બતાવવામાં આવ્યા છે."
+            ),
+            "diagnostics": {
+                "live_api_error": error or "",
+                "news": news_diagnostics,
+                "summary": f"Live usable rows=0; news usable rows={len(news_prices)}",
+            },
+        }
+
+    # 3) Nothing usable from Live, cache or news.
     raw_diag = data.get("_diagnostics", {}) if isinstance(data, dict) else {}
-    raw_count = int(raw_diag.get("raw_record_count", 0) or 0)
-    sample_keys = list(raw_diag.get("raw_sample_keys", []) or [])
-    diagnostics = {
-        "raw_record_count": raw_count,
-        "normalized_record_count": len(records),
-        "sample_record_keys": sample_keys[:30],
-        "summary": f"API configured={bool(MANDI_API_KEY)}; raw={raw_count}; usable_price_rows={len(records)}" + (f"; sample keys={', '.join(sample_keys[:8])}" if sample_keys else "")
-    }
-
     cache_status = data.get("cache_status", "") if isinstance(data, dict) else ""
-    cache_age_seconds = data.get("cache_age_seconds", 0) if isinstance(data, dict) else 0
-    source = data.get("source", "") if isinstance(data, dict) else ""
-    if live_available:
-        source = "data.gov.in Live Mandi API"
-    elif not source:
-        source = "none"
-    diagnostics["cache_status"] = cache_status
-    diagnostics["cache_age_seconds"] = int(cache_age_seconds or 0)
-    diagnostics["fallback_used"] = bool(raw_diag.get("fallback_used", False))
-    diagnostics["latest_date"] = raw_diag.get("latest_date", "")
+    cache_age_seconds = int(data.get("cache_age_seconds", 0) or 0) if isinstance(data, dict) else 0
+    live_error = error or (
+        data.get("live_error", "") if isinstance(data, dict) else ""
+    ) or "no_records"
+
     return {
         "ok": True,
-        "live_available": live_available,
+        "live_available": False,
         "live_api_configured": bool(MANDI_API_KEY),
-        "live_error": "" if live_available else (error or (data.get("live_error", "") if isinstance(data, dict) else "") or "no_records"),
-        "source": source,
+        "fallback_source": "",
+        "live_error": live_error,
+        "source": (data.get("source", "none") if isinstance(data, dict) else "none"),
         "cache_status": cache_status,
-        "cache_age_seconds": int(cache_age_seconds or 0),
+        "cache_age_seconds": cache_age_seconds,
         "checked_at": checked_at,
         "price_unit_source": "₹/quintal (data.gov.in / AGMARKNET)",
         "display_price_unit": "₹/20kg",
         "average_rule": "(minimum + maximum) / 2",
-        "records": records[:100],
-        "message": message,
-        "diagnostics": diagnostics,
+        "records": [],
+        "news_prices": [],
+        "message": "હાલમાં Live Mandi અથવા તાજા સમાચાર આધારિત ઉપયોગી બજાર ભાવ ઉપલબ્ધ નથી.",
+        "diagnostics": {
+            "raw_record_count": int(raw_diag.get("raw_record_count", 0) or 0),
+            "normalized_record_count": 0,
+            "news_record_count": 0,
+            "summary": "Live=0; News=0",
+        },
     }
