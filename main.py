@@ -568,6 +568,8 @@ def _fetch_news_items(
                 "published_text": published.astimezone(india_tz).strftime("%d-%m-%Y %I:%M %p"),
                 "source": source or "સમાચાર સ્ત્રોત",
                 "description": candidate["description"],
+                "_rss_description_present": bool(candidate["description"]),
+                "_article_text_fetched": False,
                 "category": category or "agriculture",
                 "is_fresh": (now - published).total_seconds() <= 48 * 3600,
                 "age_hours": round(max(0.0, (now - published).total_seconds() / 3600.0), 1),
@@ -597,6 +599,7 @@ def _fetch_news_items(
                     fetched = ""
                 if fetched:
                     item["description"] = (item.get("description", "") + "\n" + fetched).strip()[:60000]
+                    item["_article_text_fetched"] = True
         return selected
     return items[:limit]
 
@@ -1343,37 +1346,79 @@ def _extract_news_prices(item: dict, requested_crop: str):
     return out
 
 def _news_market_prices_detailed(crop: str, limit: int = 20):
-    if crop.strip():
-        query = f'"{crop.strip()}" ગુજરાત APMC બજાર ભાવ યાર્ડ નીચો ઊંચો'
+    """Extract real market prices from fresh news and expose stage-by-stage diagnostics.
+
+    No price is synthesized. Every returned row must come from a real article price
+    range and an explicitly detected crop. Location is reported separately because
+    an article may contain a valid price without naming a market location.
+    """
+    requested_crop = (crop or "").strip()
+    if requested_crop:
+        query = f'"{requested_crop}" ગુજરાત APMC બજાર ભાવ યાર્ડ નીચો ઊંચો'
     else:
         query = "ગુજરાત APMC માર્કેટ યાર્ડ બજાર ભાવ આજે નીચો ઊંચો પાક"
+
     global _LAST_NEWS_FETCH_DIAGNOSTICS
     _LAST_NEWS_FETCH_DIAGNOSTICS = {"rss_search_failed": 0}
-    diagnostics = {"rss_search_failed": 0, "fresh_articles": 0, "article_text_unavailable": 0,
-                   "recognizable_prices": 0, "matching_crop": 0, "valid_locations": 0,
-                   "backend_exception": ""}
+    diagnostics = {
+        "fresh_articles": 0,
+        "article_text_unavailable": 0,
+        "recognizable_prices": 0,
+        "matching_crop": 0,
+        "valid_locations": 0,
+        "rss_search_failed": 0,
+        "backend_exception": "",
+        "message": "",
+    }
     try:
-        items = _fetch_news_items(query, 24, include_article_text=True, category="market", relevance_crop=crop.strip(), require_crop=bool(crop.strip()), max_age_hours=48)
+        items = _fetch_news_items(
+            query, 24, include_article_text=True, category="market",
+            relevance_crop=requested_crop, require_crop=bool(requested_crop),
+            max_age_hours=48,
+        )
     except Exception as exc:
         diagnostics["backend_exception"] = str(exc)[:300]
+        diagnostics["message"] = "News fetch exception"
+        print(f"[MANDI_DEBUG] news exception={diagnostics['backend_exception']}")
         return [], diagnostics
+
     diagnostics["fresh_articles"] = len(items)
     diagnostics["rss_search_failed"] = _LAST_NEWS_FETCH_DIAGNOSTICS.get("rss_search_failed", 0)
+
     prices, seen = [], set()
     for item in items:
-        if not item.get("description", "").strip():
+        title = str(item.get("title") or "").strip()
+        description = str(item.get("description") or "").strip()
+        article_text = f"{title}\n{description}".strip()
+
+        if not description and not item.get("_article_text_fetched", False):
             diagnostics["article_text_unavailable"] += 1
-        pairs = _price_pairs(f"{item.get('title','')}\n{item.get('description','')}")
-        if pairs:
-            diagnostics["recognizable_prices"] += 1
-        extracted = _extract_news_prices(item, crop)
-        if extracted:
-            diagnostics["matching_crop"] += len(extracted)
-        for parsed in extracted:
-            if parsed["location"] != "Location not mentioned":
-                diagnostics["valid_locations"] += 1
-            key = (parsed["location"].casefold(), parsed["commodity"].casefold(),
-                   parsed["min_price"], parsed["max_price"], parsed["published_at"][:10])
+
+        pairs = _price_pairs(article_text)
+        if not pairs:
+            continue
+        diagnostics["recognizable_prices"] += 1
+
+        item_matching_crop = False
+        item_valid_location = False
+        extracted_for_item = _extract_news_prices(item, requested_crop)
+        if extracted_for_item:
+            item_matching_crop = True
+            for parsed in extracted_for_item:
+                if parsed.get("location") != "Location not mentioned":
+                    item_valid_location = True
+
+        # Count articles at each filtering stage, not price-token multiplicity.
+        if item_matching_crop:
+            diagnostics["matching_crop"] += 1
+        if item_valid_location:
+            diagnostics["valid_locations"] += 1
+
+        for parsed in extracted_for_item:
+            key = (
+                parsed["location"].casefold(), parsed["commodity"].casefold(),
+                parsed["min_price"], parsed["max_price"], parsed["published_at"][:10]
+            )
             if key in seen:
                 continue
             seen.add(key)
@@ -1386,11 +1431,33 @@ def _news_market_prices_detailed(crop: str, limit: int = 20):
     if not items:
         diagnostics["message"] = "No fresh articles"
     elif diagnostics["recognizable_prices"] == 0:
-        diagnostics["message"] = "No recognizable prices"
+        diagnostics["message"] = "Fresh articles found, but no recognizable price ranges"
+    elif diagnostics["matching_crop"] == 0:
+        diagnostics["message"] = "Price ranges found, but no requested crop matched"
+    elif diagnostics["valid_locations"] == 0:
+        diagnostics["message"] = "Matching crop prices found, but no explicit valid market location"
     elif not prices:
-        diagnostics["message"] = "No matching crop"
+        diagnostics["message"] = "Filtering produced no valid price rows"
     else:
         diagnostics["message"] = "Prices extracted"
+
+    diagnostics["summary"] = (
+        f"fresh={diagnostics['fresh_articles']}; "
+        f"text_unavailable={diagnostics['article_text_unavailable']}; "
+        f"prices={diagnostics['recognizable_prices']}; "
+        f"crop_match={diagnostics['matching_crop']}; "
+        f"valid_locations={diagnostics['valid_locations']}; "
+        f"rows={len(prices)}"
+    )
+    print(
+        "[MANDI_DEBUG] "
+        f"fresh_articles={diagnostics['fresh_articles']} "
+        f"article_text_unavailable={diagnostics['article_text_unavailable']} "
+        f"recognizable_prices={diagnostics['recognizable_prices']} "
+        f"matching_crop={diagnostics['matching_crop']} "
+        f"valid_locations={diagnostics['valid_locations']} "
+        f"rows={len(prices)} message={diagnostics['message']}"
+    )
     return prices, diagnostics
 
 
@@ -1500,10 +1567,21 @@ def mandi(state: str = "Gujarat", district: str = "", commodity: str = "ALL"):
                 if is_server_cached
                 else "Live Mandi ભાવ મળ્યા."
             ),
-            "diagnostics": diagnostics,
+            "diagnostics": {
+                **diagnostics,
+                "news": {
+                    "fresh_articles": 0,
+                    "article_text_unavailable": 0,
+                    "recognizable_prices": 0,
+                    "matching_crop": 0,
+                    "valid_locations": 0,
+                    "message": "News fallback not needed because Live/Cache records are available"
+                },
+            },
         }
 
     # 2) If Live + server cache produced no usable rows, use fresh market news.
+    print(f"[MANDI_DEBUG] /api/v1/mandi state={state!r} district={district!r} commodity={requested_commodity!r} live_records={len(records)} live_available={live_available} live_error={error or ''!r}")
     try:
         news_prices, news_diagnostics = _news_market_prices_detailed(news_commodity, 20)
     except Exception as exc:
@@ -1551,6 +1629,7 @@ def mandi(state: str = "Gujarat", district: str = "", commodity: str = "ALL"):
         data.get("live_error", "") if isinstance(data, dict) else ""
     ) or "no_records"
 
+    print(f"[MANDI_DEBUG] /api/v1/mandi final-zero live_records={len(records)} news_prices={len(news_prices)} news={news_diagnostics}")
     return {
         "ok": True,
         "live_available": False,
@@ -1571,6 +1650,14 @@ def mandi(state: str = "Gujarat", district: str = "", commodity: str = "ALL"):
             "raw_record_count": int(raw_diag.get("raw_record_count", 0) or 0),
             "normalized_record_count": 0,
             "news_record_count": 0,
-            "summary": "Live=0; News=0",
+            "live_records": 0,
+            "summary": (
+                f"Live=0; News=0; "
+                f"fresh={news_diagnostics.get('fresh_articles', 0)}; "
+                f"prices={news_diagnostics.get('recognizable_prices', 0)}; "
+                f"crop_match={news_diagnostics.get('matching_crop', 0)}; "
+                f"valid_locations={news_diagnostics.get('valid_locations', 0)}"
+            ),
+            "news": news_diagnostics,
         },
     }
