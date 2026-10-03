@@ -798,7 +798,6 @@ MANDI_FALLBACK_MAX_AGE_HOURS = _mandi_env_seconds("MANDI_FALLBACK_MAX_AGE_HOURS"
 MANDI_CEDA_TIMEOUT_SECONDS = _mandi_env_seconds("MANDI_CEDA_TIMEOUT_SECONDS", 20, 5, 60)
 _mandi_rate_limit_until: dict[str, float] = {}
 _mandi_global_rate_limit_until: float = 0.0
-_ceda_global_rate_limit_until: float = 0.0
 _mandi_lock = threading.RLock()
 
 GUJARATI_CROP_ALIASES = {
@@ -1064,15 +1063,30 @@ def _mandi_api_get(state: str, district: str, commodity: str):
         )
         return None, last_error, 0, last_status
 
-async def _fetch_ceda_fresh_mandi(state: str, district: str, commodity: str) -> tuple[list[dict[str, Any]], str]:
-    """Fetch real Agmarknet-derived data through CEDA when configured.
+# CEDA metadata is auxiliary only. A rate limit on /agmarknet/commodities must
+# never be allowed to masquerade as a price-endpoint failure. Keep a small
+# process-local cache so repeated farmer requests do not hammer metadata.
+_ceda_commodity_cache: dict[str, tuple[Any, float]] = {}
+_ceda_geography_cache: tuple[Any, float] | None = None
+_CEDA_METADATA_CACHE_SECONDS = 6 * 60 * 60
+_CEDA_PUBLIC_BASE = "https://agmarknet.ceda.ashoka.edu.in/api"
 
-    CEDA is id-based. This fallback resolves the requested commodity/state and,
-    when no district is supplied, queries Gujarat districts concurrently. Only
-    rows whose date is <= MANDI_FALLBACK_MAX_AGE_HOURS are accepted. CEDA's
-    documented historical coverage can lag, so stale rows are deliberately
-    rejected instead of being shown as live prices.
+
+async def _fetch_ceda_fresh_mandi(state: str, district: str, commodity: str) -> tuple[list[dict[str, Any]], str]:
+    """Fetch real Agmarknet-derived data through CEDA.
+
+    Surgical fallback fix:
+    - /agmarknet/commodities is metadata, not the price source. Its HTTP 429
+      must not terminate the fallback before /agmarknet/prices is attempted.
+    - When the authenticated metadata endpoint is rate-limited, resolve the
+      commodity id from CEDA's public Agmarknet interface endpoint instead.
+    - Commodity/state/district ids are still resolved from upstream data; no
+      price, date, market or id is hardcoded.
+    - Only actual /agmarknet/prices rows inside the configured freshness window
+      are returned. No News/AI/demo/cache values are introduced.
     """
+    global _ceda_geography_cache
+
     if not CEDA_API_KEY:
         return [], "CEDA_API_KEY not configured"
     state = (state or "Gujarat").strip()
@@ -1081,74 +1095,113 @@ async def _fetch_ceda_fresh_mandi(state: str, district: str, commodity: str) -> 
     if api_commodity.upper() == "ALL":
         return [], "CEDA fallback requires a specific commodity"
 
-    global _ceda_global_rate_limit_until
-
-    now_monotonic = time.monotonic()
-    with _mandi_lock:
-        if _ceda_global_rate_limit_until > now_monotonic:
-            remaining = max(1, int(_ceda_global_rate_limit_until - now_monotonic))
-            return [], f"CEDA API rate-limit cooldown active ({remaining}s remaining)"
-
     timeout = httpx.Timeout(MANDI_CEDA_TIMEOUT_SECONDS, connect=min(8.0, MANDI_CEDA_TIMEOUT_SECONDS))
-    headers = {"Authorization": f"Bearer {CEDA_API_KEY}", "Accept": "application/json", "User-Agent": "SmartAgriMarketAI/CEDA/1.0"}
+    headers = {"Authorization": f"Bearer {CEDA_API_KEY}", "Accept": "application/json"}
     now_ist = datetime.now(timezone(timedelta(hours=5, minutes=30)))
-    from_date = (now_ist.date() - timedelta(days=MANDI_FALLBACK_MAX_AGE_HOURS // 24 + 2)).isoformat()
+    from_date = (now_ist.date() - timedelta(days=max(2, MANDI_FALLBACK_MAX_AGE_HOURS // 24 + 2))).isoformat()
     to_date = now_ist.date().isoformat()
 
     async with httpx.AsyncClient(base_url=CEDA_API_BASE, headers=headers, timeout=timeout) as client:
         async def call(method: str, path: str, payload: dict | None = None):
-            global _ceda_global_rate_limit_until
-            for attempt in range(2):
-                try:
-                    response = await client.request(method, path, json=payload)
-                    if response.status_code == 429:
-                        retry_after = response.headers.get("Retry-After", "").strip()
-                        cooldown = 900
-                        if retry_after:
-                            try:
-                                cooldown = max(60, min(int(retry_after), 86400))
-                            except ValueError:
-                                try:
-                                    retry_at = parsedate_to_datetime(retry_after)
-                                    if retry_at.tzinfo is None:
-                                        retry_at = retry_at.replace(tzinfo=timezone.utc)
-                                    cooldown = max(60, min(int((retry_at - datetime.now(timezone.utc)).total_seconds()), 86400))
-                                except Exception:
-                                    pass
-                        with _mandi_lock:
-                            _ceda_global_rate_limit_until = max(_ceda_global_rate_limit_until, time.monotonic() + cooldown)
-                        print(f"[MANDI_DEBUG] ceda_rate_limited path={path!r} retry_after_seconds={cooldown} attempt={attempt + 1}")
-                        if attempt == 0 and cooldown <= 60:
-                            await asyncio.sleep(cooldown)
-                            continue
-                        return None, f"HTTP 429; Retry-After={cooldown}s"
-                    if response.status_code != 200:
-                        return None, f"HTTP {response.status_code}"
-                    body = response.json()
-                    output = body.get("output", {}) if isinstance(body, dict) else {}
-                    if output.get("type") != "success":
-                        return None, str(output.get("message") or "CEDA API error")[:240]
-                    return output.get("data") or [], ""
-                except Exception as exc:
-                    if attempt == 0:
-                        await asyncio.sleep(0.5)
-                        continue
-                    return None, f"{type(exc).__name__}: {str(exc)[:180]}"
-            return None, "CEDA API request failed"
+            try:
+                response = await client.request(method, path, json=payload)
+                retry_after = response.headers.get("Retry-After", "")
+                if response.status_code != 200:
+                    suffix = f"; Retry-After={retry_after}" if retry_after else ""
+                    return None, f"HTTP {response.status_code}{suffix}"
+                body = response.json()
+                output = body.get("output", {}) if isinstance(body, dict) else {}
+                if output.get("type") != "success":
+                    return None, str(output.get("message") or "CEDA API error")[:240]
+                return output.get("data") or [], ""
+            except Exception as exc:
+                return None, f"{type(exc).__name__}: {str(exc)[:180]}"
 
-        commodities, err = await call("GET", "/agmarknet/commodities")
-        if commodities is None:
-            return [], f"CEDA commodities failed: {err}"
-        matches = [c for c in commodities if isinstance(c, dict) and norm(str(c.get("commodity_name", ""))) == norm(api_commodity)]
+        def _extract_public_data(body: Any) -> list[dict[str, Any]]:
+            if isinstance(body, list):
+                return [x for x in body if isinstance(x, dict)]
+            if isinstance(body, dict):
+                for key in ("data", "commodities", "results", "items"):
+                    value = body.get(key)
+                    if isinstance(value, list):
+                        return [x for x in value if isinstance(x, dict)]
+            return []
+
+        async def public_commodity_metadata() -> list[dict[str, Any]]:
+            """Best-effort metadata resolver; never supplies prices."""
+            public_client = httpx.AsyncClient(
+                base_url=_CEDA_PUBLIC_BASE,
+                headers={"Accept": "application/json", "User-Agent": "SmartAgriMarketAI/Mandi/12.1"},
+                timeout=timeout,
+            )
+            try:
+                response = await public_client.get("/commodities")
+                if response.status_code != 200:
+                    print(f"[MANDI_DEBUG] ceda_public_commodities_http_error status={response.status_code}")
+                    return []
+                return _extract_public_data(response.json())
+            except Exception as exc:
+                print(f"[MANDI_DEBUG] ceda_public_commodities_exception type={type(exc).__name__!r} error={str(exc)[:180]!r}")
+                return []
+            finally:
+                await public_client.aclose()
+
+        # ---------- Commodity id: cached -> authenticated metadata -> public metadata ----------
+        cache_key = norm(api_commodity)
+        cached = _ceda_commodity_cache.get(cache_key)
+        commodity_meta = cached[0] if cached and (time.monotonic() - cached[1] < _CEDA_METADATA_CACHE_SECONDS) else None
+        commodity_meta_source = "cache" if commodity_meta else ""
+
+        if not commodity_meta:
+            commodities, err = await call("GET", "/agmarknet/commodities")
+            if commodities is not None:
+                commodity_meta = commodities
+                commodity_meta_source = "ceda_v1"
+            else:
+                print(f"[MANDI_DEBUG] ceda_commodities_failed error={err!r}")
+                # The 429 seen in production is on this metadata endpoint.
+                # Resolve only the id from the public CEDA interface, then use
+                # the authenticated /v1/agmarknet/prices endpoint for prices.
+                if "HTTP 429" in err:
+                    public_rows = await public_commodity_metadata()
+                    if public_rows:
+                        commodity_meta = public_rows
+                        commodity_meta_source = "ceda_public_metadata"
+                if commodity_meta is None:
+                    return [], f"CEDA commodity metadata unavailable: {err}"
+
+        matches = [
+            c for c in commodity_meta
+            if isinstance(c, dict)
+            and norm(str(c.get("commodity_name") or c.get("commodity") or c.get("name") or "")) == norm(api_commodity)
+        ]
         if not matches:
-            matches = [c for c in commodities if isinstance(c, dict) and norm(api_commodity) in norm(str(c.get("commodity_name", "")))]
+            matches = [
+                c for c in commodity_meta
+                if isinstance(c, dict)
+                and norm(api_commodity) in norm(str(c.get("commodity_name") or c.get("commodity") or c.get("name") or ""))
+            ]
         if len(matches) != 1:
             return [], "CEDA commodity resolution failed"
-        commodity_id = matches[0].get("commodity_id")
+        commodity_id = matches[0].get("commodity_id", matches[0].get("id"))
+        if commodity_id is None:
+            return [], "CEDA commodity id missing"
+        _ceda_commodity_cache[cache_key] = (matches[0], time.monotonic())
+        print(f"[MANDI_DEBUG] ceda_commodity_resolved commodity={api_commodity!r} id={commodity_id!r} source={commodity_meta_source!r}")
 
-        geographies, err = await call("GET", "/agmarknet/geographies")
-        if geographies is None:
-            return [], f"CEDA geographies failed: {err}"
+        # ---------- Geography metadata ----------
+        geographies = None
+        geo_source = ""
+        if _ceda_geography_cache and (time.monotonic() - _ceda_geography_cache[1] < _CEDA_METADATA_CACHE_SECONDS):
+            geographies = _ceda_geography_cache[0]
+            geo_source = "cache"
+        else:
+            geographies, err = await call("GET", "/agmarknet/geographies")
+            if geographies is None:
+                return [], f"CEDA geographies failed: {err}"
+            _ceda_geography_cache = (geographies, time.monotonic())
+            geo_source = "ceda_v1"
+
         state_rows = [g for g in geographies if isinstance(g, dict) and norm(str(g.get("census_state_name", ""))) == norm(state)]
         if not state_rows:
             state_rows = [g for g in geographies if isinstance(g, dict) and norm(state) in norm(str(g.get("census_state_name", "")))]
@@ -1177,37 +1230,62 @@ async def _fetch_ceda_fresh_mandi(state: str, district: str, commodity: str) -> 
                     "to_date": to_date,
                 })
                 if rows is None:
+                    print(f"[MANDI_DEBUG] ceda_prices_failed district={dname!r} error={call_err!r}")
                     return []
-                market_rows, _ = await call("POST", "/agmarknet/markets", {
+
+                # Market metadata is optional. Prices remain authoritative only
+                # because they came from /agmarknet/prices; this call only fills
+                # a display name when the price row supplies a market id.
+                market_names = {}
+                market_rows, market_err = await call("POST", "/agmarknet/markets", {
                     "commodity_id": commodity_id,
                     "state_id": state_id,
                     "district_id": did,
                     "indicator": "price",
                 })
-                market_names = {m.get("market_id"): m.get("market_name", "") for m in (market_rows or []) if isinstance(m, dict)}
+                if market_rows is not None:
+                    market_names = {
+                        m.get("market_id"): m.get("market_name", "")
+                        for m in market_rows if isinstance(m, dict)
+                    }
+                elif market_err:
+                    print(f"[MANDI_DEBUG] ceda_markets_optional_failure district={dname!r} error={market_err!r}")
+
                 out = []
                 for r in rows:
                     if not isinstance(r, dict):
                         continue
-                    raw_date = r.get("date", "")
+                    # Support the documented CEDA v1 shape used by the current
+                    # adapter and the public interface's equivalent names.
+                    raw_date = r.get("date") or r.get("t") or r.get("arrival_date") or r.get("Date")
                     parsed = _parse_mandi_date(raw_date)
                     if not parsed:
                         continue
                     age_hours = (now_ist - parsed.astimezone(now_ist.tzinfo)).total_seconds() / 3600.0
                     if age_hours < -1/60 or age_hours > MANDI_FALLBACK_MAX_AGE_HOURS:
                         continue
-                    min_p, max_p, modal_p = r.get("min_price"), r.get("max_price"), r.get("modal_price")
+                    min_p = r.get("min_price", r.get("p_min"))
+                    max_p = r.get("max_price", r.get("p_max"))
+                    modal_p = r.get("modal_price", r.get("p_modal"))
                     try:
                         min_f, max_f, modal_f = float(min_p), float(max_p), float(modal_p)
                     except (TypeError, ValueError):
                         continue
-                    if not (min_f > 0 and min_f <= modal_f <= max_f):
+                    if not (min_f > 0 and max_f > 0 and modal_f > 0 and min_f <= modal_f <= max_f):
                         continue
+                    market_id = r.get("market_id", r.get("marketId"))
+                    market_name = (
+                        r.get("market_name") or r.get("market") or r.get("Market") or
+                        market_names.get(market_id, "")
+                    )
                     out.append({
                         "state": state,
                         "district": dname,
-                        "market": market_names.get(r.get("market_id"), ""),
-                        "commodity": str(matches[0].get("commodity_name") or api_commodity),
+                        "market": str(market_name or "").strip(),
+                        "commodity": str(
+                            r.get("commodity_name") or r.get("commodity") or
+                            matches[0].get("commodity_name") or matches[0].get("name") or api_commodity
+                        ),
                         "arrival_date": parsed.astimezone(now_ist.tzinfo).strftime("%d/%m/%Y"),
                         "min_price": min_f,
                         "max_price": max_f,
@@ -1222,6 +1300,7 @@ async def _fetch_ceda_fresh_mandi(state: str, district: str, commodity: str) -> 
         rows = [r for batch in batches for r in batch]
         if not rows:
             return [], "CEDA returned no fresh records"
+        print(f"[MANDI_DEBUG] ceda_prices_success records={len(rows)} commodity_source={commodity_meta_source!r} geography_source={geo_source!r}")
         return rows, ""
 
 def _parse_mandi_date(value: str):
@@ -1451,3 +1530,4 @@ def mandi(state: str = "Gujarat", district: str = "", commodity: str = "ALL"):
             }
         },
     }
+
