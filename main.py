@@ -773,17 +773,20 @@ async def diagnose(image: UploadFile = File(...), crop: str = Form(""), context:
     raise HTTPException(status_code=502, detail=f"Gemini Vision error after 3 retries: {last_error}")
 
 # ---------------- Secure Mandi price bridge ----------------
-MANDI_RESOURCE_ID = os.getenv("DATA_GOV_RESOURCE_ID", "9ef84268-d588-465a-a308-a864a43d0070").strip()
-MANDI_API_KEY = os.getenv("DATA_GOV_API_KEY", "").strip()
-
-# Mandi requests are protected from repeated upstream rate-limit failures, but
-# no cached/stale price is ever used as a Live Mandi fallback.
+# Mandi requests are official-API only. No cache/news/estimated price is used
+# anywhere in this Live Mandi path. Rate-limit cooldown only suppresses repeated
+# upstream calls; it never substitutes data.
 def _mandi_env_seconds(name: str, default: int, minimum: int, maximum: int) -> int:
     try:
         return max(minimum, min(int(os.getenv(name, str(default))), maximum))
     except Exception:
         return default
 
+MANDI_RESOURCE_ID = os.getenv("DATA_GOV_RESOURCE_ID", "9ef84268-d588-465a-a308-a864a43d0070").strip()
+MANDI_API_KEY = os.getenv("DATA_GOV_API_KEY", "").strip()
+MANDI_API_HOST = "api.data.gov.in"
+MANDI_API_SCHEME = "https"
+MANDI_API_TIMEOUT_SECONDS = _mandi_env_seconds("MANDI_TIMEOUT_SECONDS", 20, 5, 60)
 MANDI_RATE_LIMIT_COOLDOWN_SECONDS = _mandi_env_seconds("MANDI_RATE_LIMIT_COOLDOWN_SECONDS", 900, 60, 86400)
 _mandi_rate_limit_until: dict[str, float] = {}
 _mandi_global_rate_limit_until: float = 0.0
@@ -804,7 +807,7 @@ def _norm_mandi_text(value: Any) -> str:
 
 
 def _commodity_matches(row: dict[str, Any], requested: str) -> bool:
-    """Keep only rows belonging to the requested commodity during broad fallbacks."""
+    """Keep only rows belonging to the requested commodity."""
     if not requested or requested.strip().upper() == "ALL":
         return True
     wanted = _norm_mandi_text(GUJARATI_CROP_ALIASES.get(requested.strip(), requested))
@@ -839,7 +842,7 @@ def _commodity_matches(row: dict[str, Any], requested: str) -> bool:
 
 
 def _mandi_latest_rows(rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], str]:
-    """Return rows from the latest available arrival date, matching the old working agent."""
+    """Return rows from the latest available arrival date."""
     dated = []
     for row in rows:
         if not isinstance(row, dict):
@@ -875,16 +878,52 @@ def _mandi_normalized_result(payload: dict[str, Any], requested_commodity: str, 
     }
 
 
-def _mandi_api_get(state: str, district: str, commodity: str):
-    """Fetch only from the official data.gov.in Mandi API.
+def _mandi_retry_after_seconds(exc: urllib.error.HTTPError) -> int:
+    """Read Retry-After safely; fall back to the configured cooldown."""
+    value = ""
+    try:
+        value = str(exc.headers.get("Retry-After", "")).strip()
+    except Exception:
+        value = ""
+    if value:
+        try:
+            return max(60, min(int(value), 86400))
+        except ValueError:
+            try:
+                retry_at = parsedate_to_datetime(value)
+                if retry_at.tzinfo is None:
+                    retry_at = retry_at.replace(tzinfo=timezone.utc)
+                seconds = int((retry_at - datetime.now(timezone.utc)).total_seconds())
+                return max(60, min(seconds, 86400))
+            except Exception:
+                pass
+    return MANDI_RATE_LIMIT_COOLDOWN_SECONDS
 
-    No cache, stale snapshot, news price, article extraction, or calculated
-    fallback is allowed in this Live Mandi path.
+
+def _mandi_safe_error(exc: BaseException) -> str:
+    """Return bounded diagnostic text with secrets/credential query params redacted."""
+    raw = " ".join(str(exc or "").split())
+    if MANDI_API_KEY:
+        raw = raw.replace(MANDI_API_KEY, "[REDACTED]")
+    raw = re.sub(r"([?&](?:api-key|api_key|apikey|access[_-]?token|token|key)=)[^&\s]+", r"\1[REDACTED]", raw, flags=re.IGNORECASE)
+    return raw[:320] or type(exc).__name__
+
+
+def _mandi_log_exception(exc: BaseException, *, http_status: int = 0) -> None:
+    print(
+        "[MANDI_DEBUG] official_api_exception "
+        f"exception_type={type(exc).__name__!r} http_status={int(http_status or 0)} "
+        f"error={_mandi_safe_error(exc)!r}"
+    )
+
+
+def _mandi_api_get(state: str, district: str, commodity: str):
+    """Fetch exclusively from the official data.gov.in Mandi API.
+
+    No cache, stale snapshot, news price, article extraction, calculated price,
+    or alternate market data source is permitted here.
     """
     global _mandi_global_rate_limit_until
-
-    if not MANDI_API_KEY:
-        return None, "Live Mandi API key server પર configure નથી. Renderમાં DATA_GOV_API_KEY ઉમેરો."
 
     state = (state or "").strip() or "Gujarat"
     district = (district or "").strip()
@@ -893,119 +932,128 @@ def _mandi_api_get(state: str, district: str, commodity: str):
     if api_commodity.upper() == "ALL":
         api_commodity = ""
 
+    print(
+        "[MANDI_DEBUG] request_received "
+        f"state={state!r} district={district!r} commodity={normalized_commodity!r}"
+    )
+    print(
+        "[MANDI_DEBUG] official_api_config "
+        f"scheme={MANDI_API_SCHEME!r} host={MANDI_API_HOST!r} "
+        f"resource_id={MANDI_RESOURCE_ID!r} timeout_seconds={MANDI_API_TIMEOUT_SECONDS} "
+        f"api_key_present={bool(MANDI_API_KEY)} api_key_length={len(MANDI_API_KEY)}"
+    )
+
+    if not MANDI_API_KEY:
+        err = "DATA_GOV_API_KEY is missing from the running backend environment."
+        print("[MANDI_DEBUG] official_api_exception exception_type='ConfigurationError' http_status=0 error='DATA_GOV_API_KEY is missing' ")
+        return None, "Live Mandi API key server પર configure નથી. Renderમાં DATA_GOV_API_KEY ઉમેરો."
+
+    # Keep Live Mandi a single exact official request. A 200 + empty records
+    # is an honest official empty result; it must not trigger another query.
     rate_key = "|".join((state.lower(), district.lower(), api_commodity.lower()))
     now = time.monotonic()
     with _mandi_lock:
         cooldown_until = max(_mandi_rate_limit_until.get(rate_key, 0.0), _mandi_global_rate_limit_until)
         if cooldown_until > now:
+            print(
+                "[MANDI_DEBUG] official_api_rate_limit_cooldown "
+                f"state={state!r} district={district!r} commodity={normalized_commodity!r}"
+            )
             return None, "Live Mandi API limit પર છે; થોડા સમય પછી ફરી પ્રયાસ કરો."
 
-        def request_once(*, use_state: bool, use_district: bool, use_commodity: bool):
-            global _mandi_global_rate_limit_until
-
-            params = {
-                "api-key": MANDI_API_KEY,
-                "format": "json",
-                "limit": "100",
-                "offset": "0",
-            }
-            if use_state and state:
-                params["filters[state]"] = state
-            if use_district and district:
-                params["filters[district]"] = district
-            if use_commodity and api_commodity:
-                params["filters[commodity]"] = api_commodity
-
-            url = "https://api.data.gov.in/resource/" + MANDI_RESOURCE_ID + "?" + urllib.parse.urlencode(params)
-            last_error = "Live Mandi service હાલમાં ઉપલબ્ધ નથી."
-
-            for attempt in range(2):
-                req = urllib.request.Request(
-                    url,
-                    headers={
-                        "Accept": "application/json",
-                        "User-Agent": "SmartAgriMarketAI/1.2",
-                    },
-                )
-                try:
-                    with urllib.request.urlopen(req, timeout=10) as response:
-                        body = response.read().decode("utf-8", "ignore")
-                        payload = json.loads(body)
-                        return payload, "", 0, int(getattr(response, "status", 200) or 200)
-                except urllib.error.HTTPError as exc:
-                    if exc.code == 429:
-                        cooldown = _mandi_retry_after_seconds(exc)
-                        _mandi_rate_limit_until[rate_key] = time.monotonic() + cooldown
-                        _mandi_global_rate_limit_until = time.monotonic() + cooldown
-                        return None, f"Live Mandi API limit પર છે; server cooldown {cooldown} સેકન્ડ માટે સક્રિય છે.", cooldown, exc.code
-                    if exc.code in (401, 403):
-                        return None, "Live Mandi API authentication/permission error.", 0, exc.code
-                    last_error = f"Live Mandi HTTP error {exc.code}."
-                    if exc.code not in (502, 503, 504):
-                        return None, last_error, 0, exc.code
-                except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
-                    last_error = "Live Mandi service હાલમાં ઉપલબ્ધ નથી."
-                except Exception as exc:
-                    last_error = f"Live Mandi request error: {str(exc)[:180]}"
-                if attempt < 1:
-                    time.sleep(1.0)
-
-            return None, last_error, 0, 0
-
-        attempts = []
-        if district:
-            attempts.append((True, True, bool(api_commodity)))
-        if state and api_commodity:
-            attempts.append((True, False, True))
-        if api_commodity:
-            attempts.append((False, False, True))
+        params = {
+            "api-key": MANDI_API_KEY,
+            "format": "json",
+            "limit": "100",
+            "offset": "0",
+        }
         if state:
-            attempts.append((True, False, False))
-        if not api_commodity:
-            attempts.append((False, False, False))
-        if not attempts:
-            attempts.append((False, False, False))
+            params["filters[state]"] = state
+        if district:
+            params["filters[district]"] = district
+        if api_commodity:
+            params["filters[commodity]"] = api_commodity
+
+        path = "/resource/" + MANDI_RESOURCE_ID
+        url = f"{MANDI_API_SCHEME}://{MANDI_API_HOST}{path}?" + urllib.parse.urlencode(params)
+        print(
+            "[MANDI_DEBUG] official_api_request "
+            f"scheme={MANDI_API_SCHEME!r} host={MANDI_API_HOST!r} path={path!r} "
+            f"state={state!r} district={district!r} commodity={normalized_commodity!r} "
+            f"timeout_seconds={MANDI_API_TIMEOUT_SECONDS}"
+        )
 
         last_error = "Live Mandi service હાલમાં ઉપલબ્ધ નથી."
         last_status = 0
-
-        for index, (use_state, use_district, use_commodity) in enumerate(attempts):
-            data, error, cooldown, http_status = request_once(
-                use_state=use_state,
-                use_district=use_district,
-                use_commodity=use_commodity,
+        for attempt in range(2):
+            req = urllib.request.Request(
+                url,
+                headers={
+                    "Accept": "application/json",
+                    "User-Agent": "SmartAgriMarketAI/3.0",
+                },
             )
-            last_status = http_status or last_status
-
-            if cooldown:
-                return None, error
-
-            last_error = error or last_error
-            if isinstance(data, dict):
-                result = _mandi_normalized_result(
-                    data,
-                    normalized_commodity,
-                    fallback_used=(index > 0),
-                )
-                if result.get("records"):
-                    result["_diagnostics"]["attempt"] = index + 1
-                    result["_diagnostics"]["http_status"] = http_status or 200
-                    result["_diagnostics"]["fallback_used"] = index > 0
+            try:
+                with urllib.request.urlopen(req, timeout=MANDI_API_TIMEOUT_SECONDS) as response:
+                    status = int(getattr(response, "status", 200) or 200)
+                    content_type = str((getattr(response, "headers", None) or {}).get("Content-Type", ""))
+                    body = response.read()
+                    print(
+                        "[MANDI_DEBUG] official_api_response "
+                        f"http_status={status} content_type={content_type!r} response_bytes={len(body)}"
+                    )
+                    try:
+                        payload = json.loads(body.decode("utf-8", "ignore"))
+                    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                        _mandi_log_exception(exc, http_status=status)
+                        return None, "Live Mandi API response parse error.", 0, status
+                    if not isinstance(payload, dict):
+                        exc = TypeError(f"Expected JSON object, got {type(payload).__name__}")
+                        _mandi_log_exception(exc, http_status=status)
+                        return None, "Live Mandi API response format error.", 0, status
+                    normalized = _mandi_normalized_result(payload, normalized_commodity, fallback_used=False)
+                    normalized["_diagnostics"]["http_status"] = status
+                    normalized["_diagnostics"]["attempt"] = attempt + 1
                     _mandi_rate_limit_until.pop(rate_key, None)
                     _mandi_global_rate_limit_until = 0.0
-                    return result, ""
-                # A successful upstream response with zero usable records is an
-                # honest zero-result; broadening to a less-specific official API
-                # query is allowed, but never to cache/news.
-            else:
+                    return normalized, "", 0, status
+            except urllib.error.HTTPError as exc:
+                last_status = int(exc.code or 0)
                 print(
-                    "[MANDI_DEBUG] "
-                    f"official_api_error state={state!r} district={district!r} "
-                    f"commodity={normalized_commodity!r} http_status={http_status} "
-                    f"error={last_error!r}"
+                    "[MANDI_DEBUG] official_api_http_error "
+                    f"http_status={last_status} attempt={attempt + 1}"
                 )
+                if last_status == 429:
+                    cooldown = _mandi_retry_after_seconds(exc)
+                    _mandi_rate_limit_until[rate_key] = time.monotonic() + cooldown
+                    _mandi_global_rate_limit_until = time.monotonic() + cooldown
+                    return None, f"Live Mandi API limit પર છે; server cooldown {cooldown} સેકન્ડ માટે સક્રિય છે.", cooldown, last_status
+                if last_status in (401, 403):
+                    return None, "Live Mandi API authentication/permission error.", 0, last_status
+                last_error = f"Live Mandi HTTP error {last_status}."
+                if last_status not in (502, 503, 504):
+                    return None, last_error, 0, last_status
+            except urllib.error.URLError as exc:
+                last_status = 0
+                _mandi_log_exception(exc, http_status=0)
+                last_error = "Live Mandi service હાલમાં ઉપલબ્ધ નથી."
+            except TimeoutError as exc:
+                last_status = 0
+                _mandi_log_exception(exc, http_status=0)
+                last_error = "Live Mandi API timeout થયો."
+            except Exception as exc:
+                last_status = 0
+                _mandi_log_exception(exc, http_status=0)
+                last_error = "Live Mandi service હાલમાં ઉપલબ્ધ નથી."
 
-        return None, last_error
+            if attempt < 1:
+                time.sleep(1.0)
+
+        print(
+            "[MANDI_DEBUG] official_api_final_failure "
+            f"http_status={last_status} error={last_error!r}"
+        )
+        return None, last_error, 0, last_status
 
 def _parse_mandi_date(value: str):
     raw = str(value or "").strip()
@@ -1116,7 +1164,12 @@ def mandi(state: str = "Gujarat", district: str = "", commodity: str = "ALL"):
     ).strftime("%d-%m-%Y %H:%M")
 
     requested_commodity = (commodity or "ALL").strip() or "ALL"
-    data, error = _mandi_api_get(state, district, requested_commodity)
+    result = _mandi_api_get(state, district, requested_commodity)
+    if len(result) == 4:
+        data, error, _cooldown, upstream_status = result
+    else:
+        data, error = result
+        upstream_status = 0
 
     if isinstance(data, dict):
         records = data.get("records") or []
@@ -1125,10 +1178,10 @@ def mandi(state: str = "Gujarat", district: str = "", commodity: str = "ALL"):
 
         raw_diag = data.get("_diagnostics", {}) if isinstance(data, dict) else {}
         raw_count = int(raw_diag.get("raw_record_count", len(records)) or len(records))
-        http_status = int(raw_diag.get("http_status", 200) or 200)
+        http_status = int(raw_diag.get("http_status", upstream_status or 200) or 200)
 
         print(
-            "[MANDI_DEBUG] "
+            "[MANDI_DEBUG] final_result "
             f"state={state!r} district={district!r} commodity={requested_commodity!r} "
             f"http_status={http_status} records={len(records)} source=official_api"
         )
@@ -1158,9 +1211,10 @@ def mandi(state: str = "Gujarat", district: str = "", commodity: str = "ALL"):
         }
 
     print(
-        "[MANDI_DEBUG] "
+        "[MANDI_DEBUG] final_result "
         f"state={state!r} district={district!r} commodity={requested_commodity!r} "
-        f"http_status=0 records=0 source=official_api error={error or ''!r}"
+        f"http_status={int(upstream_status or 0)} records=0 source=official_api "
+        f"error={error or ''!r}"
     )
     return {
         "ok": True,
@@ -1176,10 +1230,13 @@ def mandi(state: str = "Gujarat", district: str = "", commodity: str = "ALL"):
         "diagnostics": {
             "api": {
                 "request_ok": False,
-                "http_status": 0,
+                "http_status": int(upstream_status or 0),
                 "records": 0,
                 "source": "official_api",
                 "error": error or "no_records",
+                "host": MANDI_API_HOST,
+                "resource_id": MANDI_RESOURCE_ID,
+                "timeout_seconds": MANDI_API_TIMEOUT_SECONDS,
             }
         },
     }
