@@ -798,6 +798,7 @@ MANDI_FALLBACK_MAX_AGE_HOURS = _mandi_env_seconds("MANDI_FALLBACK_MAX_AGE_HOURS"
 MANDI_CEDA_TIMEOUT_SECONDS = _mandi_env_seconds("MANDI_CEDA_TIMEOUT_SECONDS", 20, 5, 60)
 _mandi_rate_limit_until: dict[str, float] = {}
 _mandi_global_rate_limit_until: float = 0.0
+_ceda_global_rate_limit_until: float = 0.0
 _mandi_lock = threading.RLock()
 
 GUJARATI_CROP_ALIASES = {
@@ -1080,25 +1081,60 @@ async def _fetch_ceda_fresh_mandi(state: str, district: str, commodity: str) -> 
     if api_commodity.upper() == "ALL":
         return [], "CEDA fallback requires a specific commodity"
 
+    global _ceda_global_rate_limit_until
+
+    now_monotonic = time.monotonic()
+    with _mandi_lock:
+        if _ceda_global_rate_limit_until > now_monotonic:
+            remaining = max(1, int(_ceda_global_rate_limit_until - now_monotonic))
+            return [], f"CEDA API rate-limit cooldown active ({remaining}s remaining)"
+
     timeout = httpx.Timeout(MANDI_CEDA_TIMEOUT_SECONDS, connect=min(8.0, MANDI_CEDA_TIMEOUT_SECONDS))
-    headers = {"Authorization": f"Bearer {CEDA_API_KEY}", "Accept": "application/json"}
+    headers = {"Authorization": f"Bearer {CEDA_API_KEY}", "Accept": "application/json", "User-Agent": "SmartAgriMarketAI/CEDA/1.0"}
     now_ist = datetime.now(timezone(timedelta(hours=5, minutes=30)))
     from_date = (now_ist.date() - timedelta(days=MANDI_FALLBACK_MAX_AGE_HOURS // 24 + 2)).isoformat()
     to_date = now_ist.date().isoformat()
 
     async with httpx.AsyncClient(base_url=CEDA_API_BASE, headers=headers, timeout=timeout) as client:
         async def call(method: str, path: str, payload: dict | None = None):
-            try:
-                response = await client.request(method, path, json=payload)
-                if response.status_code != 200:
-                    return None, f"HTTP {response.status_code}"
-                body = response.json()
-                output = body.get("output", {}) if isinstance(body, dict) else {}
-                if output.get("type") != "success":
-                    return None, str(output.get("message") or "CEDA API error")[:240]
-                return output.get("data") or [], ""
-            except Exception as exc:
-                return None, f"{type(exc).__name__}: {str(exc)[:180]}"
+            global _ceda_global_rate_limit_until
+            for attempt in range(2):
+                try:
+                    response = await client.request(method, path, json=payload)
+                    if response.status_code == 429:
+                        retry_after = response.headers.get("Retry-After", "").strip()
+                        cooldown = 900
+                        if retry_after:
+                            try:
+                                cooldown = max(60, min(int(retry_after), 86400))
+                            except ValueError:
+                                try:
+                                    retry_at = parsedate_to_datetime(retry_after)
+                                    if retry_at.tzinfo is None:
+                                        retry_at = retry_at.replace(tzinfo=timezone.utc)
+                                    cooldown = max(60, min(int((retry_at - datetime.now(timezone.utc)).total_seconds()), 86400))
+                                except Exception:
+                                    pass
+                        with _mandi_lock:
+                            _ceda_global_rate_limit_until = max(_ceda_global_rate_limit_until, time.monotonic() + cooldown)
+                        print(f"[MANDI_DEBUG] ceda_rate_limited path={path!r} retry_after_seconds={cooldown} attempt={attempt + 1}")
+                        if attempt == 0 and cooldown <= 60:
+                            await asyncio.sleep(cooldown)
+                            continue
+                        return None, f"HTTP 429; Retry-After={cooldown}s"
+                    if response.status_code != 200:
+                        return None, f"HTTP {response.status_code}"
+                    body = response.json()
+                    output = body.get("output", {}) if isinstance(body, dict) else {}
+                    if output.get("type") != "success":
+                        return None, str(output.get("message") or "CEDA API error")[:240]
+                    return output.get("data") or [], ""
+                except Exception as exc:
+                    if attempt == 0:
+                        await asyncio.sleep(0.5)
+                        continue
+                    return None, f"{type(exc).__name__}: {str(exc)[:180]}"
+            return None, "CEDA API request failed"
 
         commodities, err = await call("GET", "/agmarknet/commodities")
         if commodities is None:
