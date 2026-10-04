@@ -27,7 +27,7 @@ from openai import OpenAI
 from google import genai
 from google.genai import types
 
-APP_VERSION = "12.9 AGMARKNET 2.0 LIVE RECORD ACCEPTANCE FIX"
+APP_VERSION = "13.0 AGMARKNET 2.0 FORENSIC VALIDATION + MONTHLY DATE FIX"
 MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile").strip() or "llama-3.3-70b-versatile"
 GEMINI_VISION_MODEL = os.getenv("GEMINI_VISION_MODEL", "gemini-3.6-flash").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
@@ -1339,18 +1339,15 @@ async def _fetch_agmarknet_2_live(state: str, district: str, commodity: str) -> 
             if not candidates:
                 print(f"[MANDI_DEBUG] agmarknet2_response_shape endpoint={endpoint_label!r} date={date_iso!r} shape={_ag_response_shape(body)!r}")
             accepted=[]
+            rejected={"commodity":0,"district":0,"date_invalid":0,"future":0,"stale":0,"price":0,"accepted":0}
             for r in candidates:
                 rc=str(_ag_pick(r,"cmdt_name","cmdtName","commodity","Commodity","commodity_name","commodityName") or "").strip()
-                # The verified date-wise/specific-commodity endpoint is already
-                # scoped by stateId + commodityId. Its nested price rows may NOT
-                # repeat cmdt_name. An absent commodity field therefore means
-                # "endpoint-scoped commodity", not "wrong commodity".
-                if wanted.upper()!="ALL" and rc and not _commodity_matches({"commodity":rc},wanted): continue
+                # The specific-commodity endpoint is already scoped by official
+                # stateId + commodityId. Missing commodity text is therefore valid.
+                if wanted.upper()!="ALL" and rc and not _commodity_matches({"commodity":rc},wanted):
+                    rejected["commodity"] += 1; continue
                 market_name_value=str(_ag_pick(r,"market_name","marketName","market","Market") or "").strip()
                 rd=str(_ag_pick(r,"district_name","districtName","district","District") or "").strip()
-                # Some official market labels explicitly contain "(Dist.X)".
-                # This is source text, not a guessed district, so it is safe to
-                # use only when no structured district field/context exists.
                 if not rd and market_name_value:
                     import re as _re
                     _dm=_re.search(r"\(\s*Dist\.?\s*([^\)]+)\)",market_name_value,re.IGNORECASE)
@@ -1360,17 +1357,33 @@ async def _fetch_agmarknet_2_live(state: str, district: str, commodity: str) -> 
                     districts=market_district_map.get(_norm_mandi_text(market_name_value),set())
                     if len(districts)==1:
                         rd=next(iter(districts))
-                if district and (not rd or (_norm_mandi_text(district) not in _norm_mandi_text(rd) and _norm_mandi_text(rd) not in _norm_mandi_text(district))): continue
-                raw_date=_ag_pick(r,"arrival_date","arrivalDate","arrival_date_iso","date","Date") or date_iso
+                if district and (not rd or (_norm_mandi_text(district) not in _norm_mandi_text(rd) and _norm_mandi_text(rd) not in _norm_mandi_text(district))):
+                    rejected["district"] += 1; continue
+
+                # IMPORTANT: date-wise/specific-commodity is a MONTHLY endpoint.
+                # Do not substitute the requested loop day when arrivalDate is
+                # missing/unparseable; that would manufacture freshness.
+                raw_date=_ag_pick(r,"arrival_date","arrivalDate","arrival_date_iso","date","Date")
                 parsed=_parse_mandi_date(raw_date)
-                if not parsed: parsed=datetime.combine(day,datetime.min.time(),tzinfo=now.tzinfo)
+                if not parsed:
+                    rejected["date_invalid"] += 1; continue
                 age=(now-parsed.astimezone(now.tzinfo)).total_seconds()/3600
-                if age < -1/60 or age > MANDI_FALLBACK_MAX_AGE_HOURS: continue
+                if age < -1/60:
+                    rejected["future"] += 1; continue
+                if age > MANDI_FALLBACK_MAX_AGE_HOURS:
+                    rejected["stale"] += 1; continue
+
                 mn=_normalise_price(_ag_pick(r,"min_price","minPrice","minimumPrice","Min Price","Min_Price","min")); mo=_normalise_price(_ag_pick(r,"modal_price","modalPrice","Modal Price","Modal_Price","model_price","modelPrice","Model Price","modal","model")); mx=_normalise_price(_ag_pick(r,"max_price","maxPrice","maximumPrice","Max Price","Max_Price","max"))
                 mf,mof,xf=_price_float(mn),_price_float(mo),_price_float(mx)
-                if mf is None or mof is None or xf is None or not(mf>0 and mof>0 and xf>0 and mf<=mof<=xf): continue
+                if mf is None or mof is None or xf is None or not(mf>0 and mof>0 and xf>0 and mf<=mof<=xf):
+                    rejected["price"] += 1; continue
                 accepted.append({"state":state_name,"district":rd,"market":market_name_value,"commodity":rc or wanted,"variety":str(_ag_pick(r,"variety_name","varietyName","variety","Variety") or "").strip(),"grade":str(_ag_pick(r,"grade_name","gradeName","grade","Grade") or "").strip(),"arrival_date":parsed.strftime("%d/%m/%Y"),"min_price":mf,"max_price":xf,"modal_price":mof,"source":"AGMARKNET 2.0 (Government of India)","source_url":"https://agmarknet.gov.in/home","_source_age_hours":round(age,2)})
-            print(f"[MANDI_DEBUG] agmarknet2_row_validation date={date_iso!r} accepted={len(accepted)}")
+            rejected["accepted"]=len(accepted)
+            print(f"[MANDI_DEBUG] agmarknet2_row_validation date={date_iso!r} raw={len(candidates)} "
+                  f"accepted={rejected['accepted']} rejected_commodity={rejected['commodity']} "
+                  f"rejected_district={rejected['district']} rejected_date_invalid={rejected['date_invalid']} "
+                  f"rejected_future={rejected['future']} rejected_stale={rejected['stale']} "
+                  f"rejected_price={rejected['price']}")
             if accepted: return accepted,""
         return [],"AGMARKNET 2.0 returned no fresh records"
 
