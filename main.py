@@ -27,7 +27,7 @@ from openai import OpenAI
 from google import genai
 from google.genai import types
 
-APP_VERSION = "12.4 AGMARKNET 2.0 Live Fallback"
+APP_VERSION = "12.6 AGMARKNET 2.0 CONTRACT RESOLUTION FIX"
 MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile").strip() or "llama-3.3-70b-versatile"
 GEMINI_VISION_MODEL = os.getenv("GEMINI_VISION_MODEL", "gemini-3.6-flash").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
@@ -1140,12 +1140,44 @@ async def _fetch_agmarknet_2_live(state: str, district: str, commodity: str) -> 
             if commodity_id is None:
                 body,err=await get("/daily-price-arrival/filters")
                 matches=[]
+                # Current AGMARKNET 2.0 filter payload exposes the commodity
+                # lookup table as data.cmdt_data. Rows use cmdt_id/cmdt_name
+                # (and may vary slightly by backend release). Do not assume
+                # generic commodity_id/commodity_name keys only.
                 for row in _ag_deep_rows(body):
-                    nm=str(_ag_pick(row,"commodity_name","commodityName","commodity","name","commodity_name_en") or "").strip(); cid=_ag_pick(row,"commodity_id","commodityId","commodityCode","id")
-                    if cid is not None and nm and (_norm_mandi_text(nm)==ckey or ckey in _norm_mandi_text(nm)): matches.append((nm,cid))
+                    nm=str(_ag_pick(
+                        row,
+                        "cmdt_name","cmdtName",
+                        "commodity_name","commodityName",
+                        "commodity","name","commodity_name_en",
+                    ) or "").strip()
+                    cid=_ag_pick(
+                        row,
+                        "cmdt_id","cmdtId",
+                        "commodity_id","commodityId","commodityCode",
+                        "id","code",
+                    )
+                    if cid is not None and nm and (_norm_mandi_text(nm)==ckey or ckey in _norm_mandi_text(nm)):
+                        matches.append((nm,cid))
                 exact=[m for m in matches if _norm_mandi_text(m[0])==ckey]
-                chosen=exact[0] if len(exact)==1 else (matches[0] if len(matches)==1 else None)
-                if not chosen: return [],"AGMARKNET commodity resolution failed"
+                chosen=exact[0] if exact else (matches[0] if len(matches)==1 else None)
+                print(
+                    f"[MANDI_DEBUG] agmarknet2_filter_resolution requested={wanted!r} "
+                    f"matches={len(matches)} exact={len(exact)} "
+                    f"chosen={chosen!r}"
+                )
+                if not chosen:
+                    # Safe contract diagnostics only: no prices, secrets or full payload.
+                    if isinstance(body,dict):
+                        print(f"[MANDI_DEBUG] agmarknet2_filters_shape top_keys={list(body.keys())[:20]!r}")
+                        data=body.get("data")
+                        if isinstance(data,dict):
+                            print(f"[MANDI_DEBUG] agmarknet2_filters_data_keys={list(data.keys())[:30]!r}")
+                            rows=data.get("cmdt_data")
+                            if isinstance(rows,list):
+                                first_keys=list(rows[0].keys())[:30] if rows and isinstance(rows[0],dict) else []
+                                print(f"[MANDI_DEBUG] agmarknet2_cmdt_data rows={len(rows)} first_keys={first_keys!r}")
+                    return [],f"AGMARKNET commodity resolution failed: {err or 'no matching commodity in cmdt_data'}"
                 try: commodity_id=int(chosen[1])
                 except (TypeError,ValueError): return [],"AGMARKNET commodity id invalid"
                 _agmarknet_commodity_cache[ckey]=(commodity_id,time.monotonic())
@@ -1174,9 +1206,9 @@ async def _fetch_agmarknet_2_live(state: str, district: str, commodity: str) -> 
             print(f"[MANDI_DEBUG] agmarknet2_daily_response endpoint={endpoint_label!r} date={date_iso!r} raw_records={len(candidates)}")
             accepted=[]
             for r in candidates:
-                rc=str(_ag_pick(r,"commodity","Commodity","commodity_name","commodityName") or "").strip()
+                rc=str(_ag_pick(r,"cmdt_name","cmdtName","commodity","Commodity","commodity_name","commodityName") or "").strip()
                 if wanted.upper()!="ALL" and not _commodity_matches({"commodity":rc},wanted): continue
-                rd=str(_ag_pick(r,"district","District","district_name","districtName") or "").strip()
+                rd=str(_ag_pick(r,"district_name","districtName","district","District") or "").strip()
                 if district and (not rd or (_norm_mandi_text(district) not in _norm_mandi_text(rd) and _norm_mandi_text(rd) not in _norm_mandi_text(district))): continue
                 raw_date=_ag_pick(r,"arrival_date","arrivalDate","arrival_date_iso","date","Date") or date_iso
                 parsed=_parse_mandi_date(raw_date)
@@ -1186,7 +1218,7 @@ async def _fetch_agmarknet_2_live(state: str, district: str, commodity: str) -> 
                 mn=_normalise_price(_ag_pick(r,"min_price","minPrice","Min Price","Min_Price","min")); mo=_normalise_price(_ag_pick(r,"modal_price","modalPrice","Modal Price","Modal_Price","model_price","modelPrice","Model Price","modal","model")); mx=_normalise_price(_ag_pick(r,"max_price","maxPrice","Max Price","Max_Price","max"))
                 mf,mof,xf=_price_float(mn),_price_float(mo),_price_float(mx)
                 if mf is None or mof is None or xf is None or not(mf>0 and mof>0 and xf>0 and mf<=mof<=xf): continue
-                accepted.append({"state":state_name,"district":rd,"market":str(_ag_pick(r,"market","Market","market_name","marketName") or "").strip(),"commodity":rc or wanted,"variety":str(_ag_pick(r,"variety","Variety","variety_name","varietyName") or "").strip(),"grade":str(_ag_pick(r,"grade","Grade") or "").strip(),"arrival_date":parsed.strftime("%d/%m/%Y"),"min_price":mf,"max_price":xf,"modal_price":mof,"source":"AGMARKNET 2.0 (Government of India)","source_url":"https://agmarknet.gov.in/home","_source_age_hours":round(age,2)})
+                accepted.append({"state":state_name,"district":rd,"market":str(_ag_pick(r,"market_name","marketName","market","Market") or "").strip(),"commodity":rc or wanted,"variety":str(_ag_pick(r,"variety_name","varietyName","variety","Variety") or "").strip(),"grade":str(_ag_pick(r,"grade_name","gradeName","grade","Grade") or "").strip(),"arrival_date":parsed.strftime("%d/%m/%Y"),"min_price":mf,"max_price":xf,"modal_price":mof,"source":"AGMARKNET 2.0 (Government of India)","source_url":"https://agmarknet.gov.in/home","_source_age_hours":round(age,2)})
             print(f"[MANDI_DEBUG] agmarknet2_row_validation date={date_iso!r} accepted={len(accepted)}")
             if accepted: return accepted,""
         return [],"AGMARKNET 2.0 returned no fresh records"
