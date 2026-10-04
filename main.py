@@ -1102,8 +1102,10 @@ def _ag_pick(row: dict[str, Any], *keys):
     return None
 
 def _ag_price_row(row):
+    # AGMARKNET 2.0 uses both `modal_price` and `model_price` spellings
+    # in different report payloads. Treat both as the modal-price field.
     return (_ag_pick(row,"min_price","minPrice","Min Price","Min_Price","min") is not None and
-            _ag_pick(row,"modal_price","modalPrice","Modal Price","Modal_Price","modal") is not None and
+            _ag_pick(row,"modal_price","modalPrice","Modal Price","Modal_Price","model_price","modelPrice","Model Price","model") is not None and
             _ag_pick(row,"max_price","maxPrice","Max Price","Max_Price","max") is not None)
 
 async def _fetch_agmarknet_2_live(state: str, district: str, commodity: str) -> tuple[list[dict[str, Any]], str]:
@@ -1151,11 +1153,25 @@ async def _fetch_agmarknet_2_live(state: str, district: str, commodity: str) -> 
         now=datetime.now(timezone(timedelta(hours=5,minutes=30)))
         for delta in range(3):
             day=now.date()-timedelta(days=delta); date_iso=day.isoformat()
-            body,err=await get("/prices-and-arrivals/commodity-market/daily-report-state",{"date":date_iso,"state":state_id,"includeExcel":"false"})
+            # For a specific commodity, use AGMARKNET's verified
+            # date-wise/specific-commodity report. The state report is useful
+            # for ALL, but its payload varies and may spell modal_price as
+            # model_price. The specific report avoids an unnecessary market
+            # lookup and gives market/district rows directly.
+            if wanted.upper() != "ALL":
+                body,err=await get("/prices-and-arrivals/date-wise/specific-commodity",{
+                    "year":day.year,"month":day.month,"stateId":state_id,"commodityId":commodity_id,"includeExcel":"false"
+                })
+                endpoint_label="date-wise/specific-commodity"
+            else:
+                body,err=await get("/prices-and-arrivals/commodity-market/daily-report-state",{
+                    "date":date_iso,"state":state_id,"includeExcel":"false"
+                })
+                endpoint_label="commodity-market/daily-report-state"
             if body is None:
-                print(f"[MANDI_DEBUG] agmarknet2_daily_failed date={date_iso!r} error={err!r}"); continue
+                print(f"[MANDI_DEBUG] agmarknet2_daily_failed endpoint={endpoint_label!r} date={date_iso!r} error={err!r}"); continue
             candidates=[r for r in _ag_deep_rows(body) if _ag_price_row(r)]
-            print(f"[MANDI_DEBUG] agmarknet2_daily_response date={date_iso!r} raw_records={len(candidates)}")
+            print(f"[MANDI_DEBUG] agmarknet2_daily_response endpoint={endpoint_label!r} date={date_iso!r} raw_records={len(candidates)}")
             accepted=[]
             for r in candidates:
                 rc=str(_ag_pick(r,"commodity","Commodity","commodity_name","commodityName") or "").strip()
@@ -1167,7 +1183,7 @@ async def _fetch_agmarknet_2_live(state: str, district: str, commodity: str) -> 
                 if not parsed: parsed=datetime.combine(day,datetime.min.time(),tzinfo=now.tzinfo)
                 age=(now-parsed.astimezone(now.tzinfo)).total_seconds()/3600
                 if age < -1/60 or age > MANDI_FALLBACK_MAX_AGE_HOURS: continue
-                mn=_normalise_price(_ag_pick(r,"min_price","minPrice","Min Price","Min_Price","min")); mo=_normalise_price(_ag_pick(r,"modal_price","modalPrice","Modal Price","Modal_Price","modal")); mx=_normalise_price(_ag_pick(r,"max_price","maxPrice","Max Price","Max_Price","max"))
+                mn=_normalise_price(_ag_pick(r,"min_price","minPrice","Min Price","Min_Price","min")); mo=_normalise_price(_ag_pick(r,"modal_price","modalPrice","Modal Price","Modal_Price","model_price","modelPrice","Model Price","modal","model")); mx=_normalise_price(_ag_pick(r,"max_price","maxPrice","Max Price","Max_Price","max"))
                 mf,mof,xf=_price_float(mn),_price_float(mo),_price_float(mx)
                 if mf is None or mof is None or xf is None or not(mf>0 and mof>0 and xf>0 and mf<=mof<=xf): continue
                 accepted.append({"state":state_name,"district":rd,"market":str(_ag_pick(r,"market","Market","market_name","marketName") or "").strip(),"commodity":rc or wanted,"variety":str(_ag_pick(r,"variety","Variety","variety_name","varietyName") or "").strip(),"grade":str(_ag_pick(r,"grade","Grade") or "").strip(),"arrival_date":parsed.strftime("%d/%m/%Y"),"min_price":mf,"max_price":xf,"modal_price":mof,"source":"AGMARKNET 2.0 (Government of India)","source_url":"https://agmarknet.gov.in/home","_source_age_hours":round(age,2)})
