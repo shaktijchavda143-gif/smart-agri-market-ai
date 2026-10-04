@@ -27,7 +27,7 @@ from openai import OpenAI
 from google import genai
 from google.genai import types
 
-APP_VERSION = "12.1 Official Mandi + Verified CEDA Freshness Fallback"
+APP_VERSION = "12.2 CEDA Public Price Fallback"
 MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile").strip() or "llama-3.3-70b-versatile"
 GEMINI_VISION_MODEL = os.getenv("GEMINI_VISION_MODEL", "gemini-3.6-flash").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
@@ -1121,11 +1121,24 @@ async def _fetch_ceda_fresh_mandi(state: str, district: str, commodity: str) -> 
             if isinstance(body, list):
                 return [x for x in body if isinstance(x, dict)]
             if isinstance(body, dict):
-                for key in ("data", "commodities", "results", "items"):
+                for key in ("data", "commodities", "results", "items", "rows"):
                     value = body.get(key)
                     if isinstance(value, list):
                         return [x for x in value if isinstance(x, dict)]
+                    if isinstance(value, dict):
+                        nested = _extract_public_data(value)
+                        if nested:
+                            return nested
             return []
+
+        def _commodity_name(row: dict[str, Any]) -> str:
+            return str(row.get("commodity_name") or row.get("commodity") or row.get("name") or row.get("cmdty") or row.get("commodityName") or "").strip()
+
+        def _commodity_id(row: dict[str, Any]):
+            for key in ("commodity_id", "id", "cmdty_id", "commodityId"):
+                if row.get(key) is not None:
+                    return row.get(key)
+            return None
 
         async def public_commodity_metadata() -> list[dict[str, Any]]:
             """Best-effort metadata resolver; never supplies prices."""
@@ -1159,31 +1172,22 @@ async def _fetch_ceda_fresh_mandi(state: str, district: str, commodity: str) -> 
                 commodity_meta_source = "ceda_v1"
             else:
                 print(f"[MANDI_DEBUG] ceda_commodities_failed error={err!r}")
-                # The 429 seen in production is on this metadata endpoint.
-                # Resolve only the id from the public CEDA interface, then use
-                # the authenticated /v1/agmarknet/prices endpoint for prices.
-                if "HTTP 429" in err:
-                    public_rows = await public_commodity_metadata()
-                    if public_rows:
-                        commodity_meta = public_rows
-                        commodity_meta_source = "ceda_public_metadata"
-                if commodity_meta is None:
+                # Do not make authenticated metadata 429 a blocker. CEDA's
+                # public Agmarknet interface exposes the same commodity list.
+                public_rows = await public_commodity_metadata()
+                if public_rows:
+                    commodity_meta = public_rows
+                    commodity_meta_source = "ceda_public_metadata"
+                else:
                     return [], f"CEDA commodity metadata unavailable: {err}"
 
-        matches = [
-            c for c in commodity_meta
-            if isinstance(c, dict)
-            and norm(str(c.get("commodity_name") or c.get("commodity") or c.get("name") or "")) == norm(api_commodity)
-        ]
+        matches = [c for c in commodity_meta if isinstance(c, dict) and norm(_commodity_name(c)) == norm(api_commodity)]
         if not matches:
-            matches = [
-                c for c in commodity_meta
-                if isinstance(c, dict)
-                and norm(api_commodity) in norm(str(c.get("commodity_name") or c.get("commodity") or c.get("name") or ""))
-            ]
+            matches = [c for c in commodity_meta if isinstance(c, dict) and norm(api_commodity) in norm(_commodity_name(c))]
         if len(matches) != 1:
+            print(f"[MANDI_DEBUG] ceda_commodity_resolution_failed requested={api_commodity!r} candidates={len(matches)} source={commodity_meta_source!r}")
             return [], "CEDA commodity resolution failed"
-        commodity_id = matches[0].get("commodity_id", matches[0].get("id"))
+        commodity_id = _commodity_id(matches[0])
         if commodity_id is None:
             return [], "CEDA commodity id missing"
         _ceda_commodity_cache[cache_key] = (matches[0], time.monotonic())
@@ -1222,13 +1226,49 @@ async def _fetch_ceda_fresh_mandi(state: str, district: str, commodity: str) -> 
         sem = asyncio.Semaphore(5)
         async def district_prices(did: int, dname: str):
             async with sem:
-                rows, call_err = await call("POST", "/agmarknet/prices", {
+                payload_v1 = {
                     "commodity_id": commodity_id,
                     "state_id": state_id,
                     "district_id": [did],
                     "from_date": from_date,
                     "to_date": to_date,
-                })
+                }
+                if commodity_meta_source == "ceda_public_metadata":
+                    # Public CEDA Agmarknet API uses a different, documented
+                    # request contract and does not consume the rate-limited
+                    # authenticated metadata endpoint.
+                    public_payload = {
+                        "state_id": int(state_id),
+                        "commodity_id": int(commodity_id),
+                        "district_id": 0,
+                        "calculation_type": "d",
+                        "chart_type": "timeseries",
+                        "start_date": from_date + "T00:00:00Z",
+                        "end_date": to_date + "T23:59:59Z",
+                    }
+                    try:
+                        public_client = httpx.AsyncClient(
+                            base_url=_CEDA_PUBLIC_BASE,
+                            headers={"Accept": "application/json", "User-Agent": "SmartAgriMarketAI/Mandi/12.2", "Origin": "https://agmarknet.ceda.ashoka.edu.in", "Referer": "https://agmarknet.ceda.ashoka.edu.in/"},
+                            timeout=timeout,
+                        )
+                        try:
+                            pr = await public_client.post("/prices", json=public_payload)
+                            retry_after = pr.headers.get("Retry-After", "")
+                            if pr.status_code != 200:
+                                suffix = f"; Retry-After={retry_after}" if retry_after else ""
+                                print(f"[MANDI_DEBUG] ceda_public_prices_failed district={dname!r} error={'HTTP '+str(pr.status_code)+suffix!r}")
+                                return []
+                            body = pr.json()
+                            rows = _extract_public_data(body)
+                            call_err = ""
+                        finally:
+                            await public_client.aclose()
+                    except Exception as exc:
+                        print(f"[MANDI_DEBUG] ceda_public_prices_exception district={dname!r} type={type(exc).__name__!r} error={str(exc)[:180]!r}")
+                        return []
+                else:
+                    rows, call_err = await call("POST", "/agmarknet/prices", payload_v1)
                 if rows is None:
                     print(f"[MANDI_DEBUG] ceda_prices_failed district={dname!r} error={call_err!r}")
                     return []
@@ -1272,6 +1312,13 @@ async def _fetch_ceda_fresh_mandi(state: str, district: str, commodity: str) -> 
                     except (TypeError, ValueError):
                         continue
                     if not (min_f > 0 and max_f > 0 and modal_f > 0 and min_f <= modal_f <= max_f):
+                        continue
+                    row_district = str(r.get("district") or r.get("district_name") or r.get("District") or "").strip()
+                    if district and row_district and norm(row_district) != norm(district) and norm(district) not in norm(row_district):
+                        continue
+                    if district and not row_district:
+                        # Public CEDA /api/prices with district_id=0 is a
+                        # state-level series; never relabel it as Rajkot/etc.
                         continue
                     market_id = r.get("market_id", r.get("marketId"))
                     market_name = (
