@@ -1233,65 +1233,66 @@ async def _fetch_ceda_fresh_mandi(state: str, district: str, commodity: str) -> 
                     "from_date": from_date,
                     "to_date": to_date,
                 }
-                if commodity_meta_source == "ceda_public_metadata":
-                    # Public CEDA Agmarknet API uses a different, documented
-                    # request contract and does not consume the rate-limited
-                    # authenticated metadata endpoint.
+
+                # IMPORTANT: The public CEDA price endpoint is attempted first.
+                # The v1 /agmarknet/prices response is an aggregate series and
+                # may not contain mandi/district fields; using it as the primary
+                # path for a Rajkot request can therefore produce zero accepted
+                # rows even when prices exist. The public endpoint is also the
+                # path that does not depend on the rate-limited /markets metadata.
+                rows = None
+                call_err = ""
+                try:
                     public_payload = {
                         "state_id": int(state_id),
                         "commodity_id": int(commodity_id),
-                        "district_id": 0,
+                        "district_id": int(did),
                         "calculation_type": "d",
-                        "chart_type": "timeseries",
+                        "chart_type": "datadownload",
                         "start_date": from_date + "T00:00:00Z",
                         "end_date": to_date + "T23:59:59Z",
                     }
-                    try:
-                        public_client = httpx.AsyncClient(
-                            base_url=_CEDA_PUBLIC_BASE,
-                            headers={"Accept": "application/json", "User-Agent": "SmartAgriMarketAI/Mandi/12.2", "Origin": "https://agmarknet.ceda.ashoka.edu.in", "Referer": "https://agmarknet.ceda.ashoka.edu.in/"},
-                            timeout=timeout,
-                        )
-                        try:
-                            pr = await public_client.post("/prices", json=public_payload)
-                            retry_after = pr.headers.get("Retry-After", "")
-                            if pr.status_code != 200:
-                                suffix = f"; Retry-After={retry_after}" if retry_after else ""
-                                print(f"[MANDI_DEBUG] ceda_public_prices_failed district={dname!r} error={'HTTP '+str(pr.status_code)+suffix!r}")
-                                return []
-                            body = pr.json()
-                            rows = _extract_public_data(body)
-                            call_err = ""
-                        finally:
-                            await public_client.aclose()
-                    except Exception as exc:
-                        print(f"[MANDI_DEBUG] ceda_public_prices_exception district={dname!r} type={type(exc).__name__!r} error={str(exc)[:180]!r}")
-                        return []
-                else:
-                    rows, call_err = await call("POST", "/agmarknet/prices", payload_v1)
+                    async with httpx.AsyncClient(
+                        base_url=_CEDA_PUBLIC_BASE,
+                        headers={
+                            "Accept": "application/json",
+                            "Content-Type": "application/json",
+                            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/135 Safari/537.36",
+                            "Origin": "https://agmarknet.ceda.ashoka.edu.in",
+                            "Referer": "https://agmarknet.ceda.ashoka.edu.in/",
+                        },
+                        timeout=timeout,
+                    ) as public_client:
+                        pr = await public_client.post("/prices", json=public_payload)
+                        retry_after = pr.headers.get("Retry-After", "")
+                        if pr.status_code == 200:
+                            rows = _extract_public_data(pr.json())
+                            print(f"[MANDI_DEBUG] ceda_public_prices_response district={dname!r} status=200 raw_records={len(rows)} chart_type='datadownload'")
+                        else:
+                            suffix = f"; Retry-After={retry_after}" if retry_after else ""
+                            call_err = f"HTTP {pr.status_code}{suffix}"
+                            print(f"[MANDI_DEBUG] ceda_public_prices_failed district={dname!r} error={call_err!r}")
+                except Exception as exc:
+                    call_err = f"{type(exc).__name__}: {str(exc)[:180]}"
+                    print(f"[MANDI_DEBUG] ceda_public_prices_exception district={dname!r} error={call_err!r}")
+
+                # Only if the public endpoint itself failed, try the authenticated
+                # CEDA price endpoint. Never call /agmarknet/markets merely to make
+                # a price response usable: market metadata is optional.
+                if rows is None:
+                    rows, v1_err = await call("POST", "/agmarknet/prices", payload_v1)
+                    if rows is not None:
+                        call_err = ""
+                        print(f"[MANDI_DEBUG] ceda_v1_prices_response district={dname!r} raw_records={len(rows)}")
+                    else:
+                        call_err = v1_err or call_err
                 if rows is None:
                     print(f"[MANDI_DEBUG] ceda_prices_failed district={dname!r} error={call_err!r}")
                     return []
 
-                # Market metadata is optional. Prices remain authoritative only
-                # because they came from /agmarknet/prices; this call only fills
-                # a display name when the price row supplies a market id.
                 market_names = {}
-                market_rows, market_err = await call("POST", "/agmarknet/markets", {
-                    "commodity_id": commodity_id,
-                    "state_id": state_id,
-                    "district_id": did,
-                    "indicator": "price",
-                })
-                if market_rows is not None:
-                    market_names = {
-                        m.get("market_id"): m.get("market_name", "")
-                        for m in market_rows if isinstance(m, dict)
-                    }
-                elif market_err:
-                    print(f"[MANDI_DEBUG] ceda_markets_optional_failure district={dname!r} error={market_err!r}")
-
                 out = []
+                rejected_date = rejected_stale = rejected_price = rejected_district = 0
                 for r in rows:
                     if not isinstance(r, dict):
                         continue
@@ -1300,9 +1301,11 @@ async def _fetch_ceda_fresh_mandi(state: str, district: str, commodity: str) -> 
                     raw_date = r.get("date") or r.get("t") or r.get("arrival_date") or r.get("Date")
                     parsed = _parse_mandi_date(raw_date)
                     if not parsed:
+                        rejected_date += 1
                         continue
                     age_hours = (now_ist - parsed.astimezone(now_ist.tzinfo)).total_seconds() / 3600.0
                     if age_hours < -1/60 or age_hours > MANDI_FALLBACK_MAX_AGE_HOURS:
+                        rejected_stale += 1
                         continue
                     min_p = r.get("min_price", r.get("p_min"))
                     max_p = r.get("max_price", r.get("p_max"))
@@ -1310,13 +1313,17 @@ async def _fetch_ceda_fresh_mandi(state: str, district: str, commodity: str) -> 
                     try:
                         min_f, max_f, modal_f = float(min_p), float(max_p), float(modal_p)
                     except (TypeError, ValueError):
+                        rejected_price += 1
                         continue
                     if not (min_f > 0 and max_f > 0 and modal_f > 0 and min_f <= modal_f <= max_f):
+                        rejected_price += 1
                         continue
                     row_district = str(r.get("district") or r.get("district_name") or r.get("District") or "").strip()
                     if district and row_district and norm(row_district) != norm(district) and norm(district) not in norm(row_district):
+                        rejected_district += 1
                         continue
                     if district and not row_district:
+                        rejected_district += 1
                         # Public CEDA /api/prices with district_id=0 is a
                         # state-level series; never relabel it as Rajkot/etc.
                         continue
@@ -1341,6 +1348,11 @@ async def _fetch_ceda_fresh_mandi(state: str, district: str, commodity: str) -> 
                         "source_url": "https://api.ceda.ashoka.edu.in/",
                         "_source_age_hours": round(age_hours, 2),
                     })
+                print(
+                    f"[MANDI_DEBUG] ceda_row_validation district={dname!r} raw={len(rows)} accepted={len(out)} "
+                    f"rejected_date={rejected_date} rejected_stale={rejected_stale} "
+                    f"rejected_price={rejected_price} rejected_district={rejected_district}"
+                )
                 return out
 
         batches = await asyncio.gather(*(district_prices(did, dname) for did, dname in districts.items()))
