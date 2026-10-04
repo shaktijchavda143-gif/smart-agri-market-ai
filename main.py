@@ -27,7 +27,7 @@ from openai import OpenAI
 from google import genai
 from google.genai import types
 
-APP_VERSION = "12.8 AGMARKNET 2.0 FORENSIC RESPONSE FIX"
+APP_VERSION = "12.9 AGMARKNET 2.0 LIVE RECORD ACCEPTANCE FIX"
 MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile").strip() or "llama-3.3-70b-versatile"
 GEMINI_VISION_MODEL = os.getenv("GEMINI_VISION_MODEL", "gemini-3.6-flash").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
@@ -1311,6 +1311,8 @@ async def _fetch_agmarknet_2_live(state: str, district: str, commodity: str) -> 
                     market_district_map.setdefault(_norm_mandi_text(market_name),set()).add(district_name)
             unique_context=sum(1 for districts in market_district_map.values() if len(districts)==1)
             print(f"[MANDI_DEBUG] agmarknet2_market_district_context commodity_id={commodity_id} mappings={len(market_district_map)} unique={unique_context}")
+            if not market_district_map and context_body is not None:
+                print(f"[MANDI_DEBUG] agmarknet2_market_district_context_shape shape={_ag_response_shape(context_body)!r}")
 
         now=datetime.now(timezone(timedelta(hours=5,minutes=30)))
         for delta in range(3):
@@ -1339,9 +1341,21 @@ async def _fetch_agmarknet_2_live(state: str, district: str, commodity: str) -> 
             accepted=[]
             for r in candidates:
                 rc=str(_ag_pick(r,"cmdt_name","cmdtName","commodity","Commodity","commodity_name","commodityName") or "").strip()
-                if wanted.upper()!="ALL" and not _commodity_matches({"commodity":rc},wanted): continue
+                # The verified date-wise/specific-commodity endpoint is already
+                # scoped by stateId + commodityId. Its nested price rows may NOT
+                # repeat cmdt_name. An absent commodity field therefore means
+                # "endpoint-scoped commodity", not "wrong commodity".
+                if wanted.upper()!="ALL" and rc and not _commodity_matches({"commodity":rc},wanted): continue
                 market_name_value=str(_ag_pick(r,"market_name","marketName","market","Market") or "").strip()
                 rd=str(_ag_pick(r,"district_name","districtName","district","District") or "").strip()
+                # Some official market labels explicitly contain "(Dist.X)".
+                # This is source text, not a guessed district, so it is safe to
+                # use only when no structured district field/context exists.
+                if not rd and market_name_value:
+                    import re as _re
+                    _dm=_re.search(r"\(\s*Dist\.?\s*([^\)]+)\)",market_name_value,re.IGNORECASE)
+                    if _dm:
+                        rd=_dm.group(1).strip()
                 if not rd and market_name_value and market_district_map:
                     districts=market_district_map.get(_norm_mandi_text(market_name_value),set())
                     if len(districts)==1:
