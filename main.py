@@ -27,7 +27,7 @@ from openai import OpenAI
 from google import genai
 from google.genai import types
 
-APP_VERSION = "12.2 CEDA Public Price Fallback"
+APP_VERSION = "12.4 AGMARKNET 2.0 Live Fallback"
 MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile").strip() or "llama-3.3-70b-versatile"
 GEMINI_VISION_MODEL = os.getenv("GEMINI_VISION_MODEL", "gemini-3.6-flash").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
@@ -1072,6 +1072,109 @@ _CEDA_METADATA_CACHE_SECONDS = 6 * 60 * 60
 _CEDA_PUBLIC_BASE = "https://agmarknet.ceda.ashoka.edu.in/api"
 
 
+# AGMARKNET 2.0 public live fallback. This is the official farmer-facing
+# market-report backend; it is attempted before CEDA and never uses cached,
+# estimated, News or AI prices.
+AGMARKNET_PUBLIC_BASE = os.getenv("AGMARKNET_PUBLIC_BASE", "https://api.agmarknet.gov.in/v1").strip().rstrip("/")
+AGMARKNET_PUBLIC_TIMEOUT_SECONDS = _mandi_env_seconds("AGMARKNET_PUBLIC_TIMEOUT_SECONDS", 20, 5, 60)
+_agmarknet_state_cache: dict[str, tuple[Any, float]] = {}
+_agmarknet_commodity_cache: dict[str, tuple[Any, float]] = {}
+_AGMARKNET_METADATA_CACHE_SECONDS = 6 * 60 * 60
+
+def _ag_deep_rows(value: Any) -> list[dict[str, Any]]:
+    out=[]; seen=set()
+    def walk(x):
+        if isinstance(x, dict):
+            if id(x) in seen: return
+            seen.add(id(x)); out.append(x)
+            for v in x.values(): walk(v)
+        elif isinstance(x, list):
+            for v in x: walk(v)
+    walk(value); return out
+
+def _ag_pick(row: dict[str, Any], *keys):
+    for k in keys:
+        if k in row and row[k] not in (None, ""): return row[k]
+    normalized={str(k).lower().replace("_","").replace(" ",""):v for k,v in row.items()}
+    for k in keys:
+        v=normalized.get(str(k).lower().replace("_","").replace(" ",""))
+        if v not in (None, ""): return v
+    return None
+
+def _ag_price_row(row):
+    return (_ag_pick(row,"min_price","minPrice","Min Price","Min_Price","min") is not None and
+            _ag_pick(row,"modal_price","modalPrice","Modal Price","Modal_Price","modal") is not None and
+            _ag_pick(row,"max_price","maxPrice","Max Price","Max_Price","max") is not None)
+
+async def _fetch_agmarknet_2_live(state: str, district: str, commodity: str) -> tuple[list[dict[str, Any]], str]:
+    requested=(commodity or "ALL").strip() or "ALL"
+    wanted=GUJARATI_CROP_ALIASES.get(requested, requested)
+    state_name=(state or "Gujarat").strip()
+    timeout=httpx.Timeout(AGMARKNET_PUBLIC_TIMEOUT_SECONDS, connect=min(8.0,AGMARKNET_PUBLIC_TIMEOUT_SECONDS))
+    headers={"Accept":"application/json, text/plain, */*","Origin":"https://agmarknet.gov.in","Referer":"https://agmarknet.gov.in/","User-Agent":"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/135 Safari/537.36"}
+    async with httpx.AsyncClient(base_url=AGMARKNET_PUBLIC_BASE,headers=headers,timeout=timeout) as client:
+        async def get(path,params=None):
+            try:
+                r=await client.get(path,params=params)
+                if r.status_code!=200: return None,f"HTTP {r.status_code}"
+                return r.json(),""
+            except Exception as exc: return None,f"{type(exc).__name__}: {str(exc)[:180]}"
+        skey=_norm_mandi_text(state_name); cached=_agmarknet_state_cache.get(skey)
+        state_id=cached[0] if cached and time.monotonic()-cached[1]<_AGMARKNET_METADATA_CACHE_SECONDS else None
+        if state_id is None:
+            body,err=await get("/location/state",{"page":1,"search":state_name})
+            for row in _ag_deep_rows(body):
+                nm=str(_ag_pick(row,"name","state_name","stateName","State","state") or "").strip(); sid=_ag_pick(row,"id","state_id","stateId","stateCode")
+                if sid is not None and nm and _norm_mandi_text(nm)==skey:
+                    try: state_id=int(sid); break
+                    except (TypeError,ValueError): pass
+            if state_id is None: return [],f"AGMARKNET state resolution failed: {err}"
+            _agmarknet_state_cache[skey]=(state_id,time.monotonic())
+        print(f"[MANDI_DEBUG] agmarknet2_state_resolved state={state_name!r} id={state_id}")
+        commodity_id=None
+        if wanted.upper()!="ALL":
+            ckey=_norm_mandi_text(wanted); cc=_agmarknet_commodity_cache.get(ckey)
+            commodity_id=cc[0] if cc and time.monotonic()-cc[1]<_AGMARKNET_METADATA_CACHE_SECONDS else None
+            if commodity_id is None:
+                body,err=await get("/daily-price-arrival/filters")
+                matches=[]
+                for row in _ag_deep_rows(body):
+                    nm=str(_ag_pick(row,"commodity_name","commodityName","commodity","name","commodity_name_en") or "").strip(); cid=_ag_pick(row,"commodity_id","commodityId","commodityCode","id")
+                    if cid is not None and nm and (_norm_mandi_text(nm)==ckey or ckey in _norm_mandi_text(nm)): matches.append((nm,cid))
+                exact=[m for m in matches if _norm_mandi_text(m[0])==ckey]
+                chosen=exact[0] if len(exact)==1 else (matches[0] if len(matches)==1 else None)
+                if not chosen: return [],"AGMARKNET commodity resolution failed"
+                try: commodity_id=int(chosen[1])
+                except (TypeError,ValueError): return [],"AGMARKNET commodity id invalid"
+                _agmarknet_commodity_cache[ckey]=(commodity_id,time.monotonic())
+            print(f"[MANDI_DEBUG] agmarknet2_commodity_resolved commodity={wanted!r} id={commodity_id}")
+        now=datetime.now(timezone(timedelta(hours=5,minutes=30)))
+        for delta in range(3):
+            day=now.date()-timedelta(days=delta); date_iso=day.isoformat()
+            body,err=await get("/prices-and-arrivals/commodity-market/daily-report-state",{"date":date_iso,"state":state_id,"includeExcel":"false"})
+            if body is None:
+                print(f"[MANDI_DEBUG] agmarknet2_daily_failed date={date_iso!r} error={err!r}"); continue
+            candidates=[r for r in _ag_deep_rows(body) if _ag_price_row(r)]
+            print(f"[MANDI_DEBUG] agmarknet2_daily_response date={date_iso!r} raw_records={len(candidates)}")
+            accepted=[]
+            for r in candidates:
+                rc=str(_ag_pick(r,"commodity","Commodity","commodity_name","commodityName") or "").strip()
+                if wanted.upper()!="ALL" and not _commodity_matches({"commodity":rc},wanted): continue
+                rd=str(_ag_pick(r,"district","District","district_name","districtName") or "").strip()
+                if district and (not rd or (_norm_mandi_text(district) not in _norm_mandi_text(rd) and _norm_mandi_text(rd) not in _norm_mandi_text(district))): continue
+                raw_date=_ag_pick(r,"arrival_date","arrivalDate","arrival_date_iso","date","Date") or date_iso
+                parsed=_parse_mandi_date(raw_date)
+                if not parsed: parsed=datetime.combine(day,datetime.min.time(),tzinfo=now.tzinfo)
+                age=(now-parsed.astimezone(now.tzinfo)).total_seconds()/3600
+                if age < -1/60 or age > MANDI_FALLBACK_MAX_AGE_HOURS: continue
+                mn=_normalise_price(_ag_pick(r,"min_price","minPrice","Min Price","Min_Price","min")); mo=_normalise_price(_ag_pick(r,"modal_price","modalPrice","Modal Price","Modal_Price","modal")); mx=_normalise_price(_ag_pick(r,"max_price","maxPrice","Max Price","Max_Price","max"))
+                mf,mof,xf=_price_float(mn),_price_float(mo),_price_float(mx)
+                if mf is None or mof is None or xf is None or not(mf>0 and mof>0 and xf>0 and mf<=mof<=xf): continue
+                accepted.append({"state":state_name,"district":rd,"market":str(_ag_pick(r,"market","Market","market_name","marketName") or "").strip(),"commodity":rc or wanted,"variety":str(_ag_pick(r,"variety","Variety","variety_name","varietyName") or "").strip(),"grade":str(_ag_pick(r,"grade","Grade") or "").strip(),"arrival_date":parsed.strftime("%d/%m/%Y"),"min_price":mf,"max_price":xf,"modal_price":mof,"source":"AGMARKNET 2.0 (Government of India)","source_url":"https://agmarknet.gov.in/home","_source_age_hours":round(age,2)})
+            print(f"[MANDI_DEBUG] agmarknet2_row_validation date={date_iso!r} accepted={len(accepted)}")
+            if accepted: return accepted,""
+        return [],"AGMARKNET 2.0 returned no fresh records"
+
 async def _fetch_ceda_fresh_mandi(state: str, district: str, commodity: str) -> tuple[list[dict[str, Any]], str]:
     """Fetch real Agmarknet-derived data through CEDA.
 
@@ -1523,6 +1626,23 @@ def mandi(state: str = "Gujarat", district: str = "", commodity: str = "ALL"):
                 }
             },
         }
+
+    # Official AGMARKNET 2.0 public backend is the first secondary live source.
+    try:
+        ag_records, ag_error = asyncio.run(_fetch_agmarknet_2_live(state, district, requested_commodity))
+    except RuntimeError:
+        def _ag_runner():
+            return asyncio.run(_fetch_agmarknet_2_live(state, district, requested_commodity))
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            ag_records, ag_error = pool.submit(_ag_runner).result(timeout=AGMARKNET_PUBLIC_TIMEOUT_SECONDS * 4 + 5)
+    except Exception as exc:
+        ag_records, ag_error = [], f"{type(exc).__name__}: {str(exc)[:180]}"
+    if ag_records:
+        normalized = _normalise_mandi_records(ag_records)
+        if normalized:
+            print(f"[MANDI_DEBUG] agmarknet2_fallback_success records={len(normalized)}")
+            return {"ok":True,"live_available":True,"live_api_configured":bool(MANDI_API_KEY),"source":"agmarknet_2_public","checked_at":checked_at,"price_unit_source":"₹/quintal (AGMARKNET 2.0)","display_price_unit":"₹/20kg","records":normalized[:100],"message":"Live AGMARKNET ભાવ મળ્યા.","diagnostics":{"api":{"request_ok":False,"http_status":int(upstream_status or 0),"records":0,"source":"official_api"},"fallback":{"request_ok":True,"records":len(normalized),"source":"agmarknet_2_public","max_age_hours":MANDI_FALLBACK_MAX_AGE_HOURS}}}
+    print(f"[MANDI_DEBUG] agmarknet2_fallback_failed error={ag_error!r}")
 
     # Secondary live-source attempt: CEDA Agmarknet. It is only accepted when
     # the actual API returns records that are no older than the configured
