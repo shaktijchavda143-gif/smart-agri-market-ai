@@ -27,7 +27,7 @@ from openai import OpenAI
 from google import genai
 from google.genai import types
 
-APP_VERSION = "12.6 AGMARKNET 2.0 CONTRACT RESOLUTION FIX"
+APP_VERSION = "12.8 AGMARKNET 2.0 FORENSIC RESPONSE FIX"
 MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile").strip() or "llama-3.3-70b-versatile"
 GEMINI_VISION_MODEL = os.getenv("GEMINI_VISION_MODEL", "gemini-3.6-flash").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
@@ -1079,6 +1079,7 @@ AGMARKNET_PUBLIC_BASE = os.getenv("AGMARKNET_PUBLIC_BASE", "https://api.agmarkne
 AGMARKNET_PUBLIC_TIMEOUT_SECONDS = _mandi_env_seconds("AGMARKNET_PUBLIC_TIMEOUT_SECONDS", 20, 5, 60)
 _agmarknet_state_cache: dict[str, tuple[Any, float]] = {}
 _agmarknet_commodity_cache: dict[str, tuple[Any, float]] = {}
+_agmarknet_commodity_context_cache: dict[int, tuple[Any, float]] = {}
 _AGMARKNET_METADATA_CACHE_SECONDS = 6 * 60 * 60
 
 def _ag_deep_rows(value: Any) -> list[dict[str, Any]]:
@@ -1102,11 +1103,114 @@ def _ag_pick(row: dict[str, Any], *keys):
     return None
 
 def _ag_price_row(row):
-    # AGMARKNET 2.0 uses both `modal_price` and `model_price` spellings
-    # in different report payloads. Treat both as the modal-price field.
-    return (_ag_pick(row,"min_price","minPrice","Min Price","Min_Price","min") is not None and
-            _ag_pick(row,"modal_price","modalPrice","Modal Price","Modal_Price","model_price","modelPrice","Model Price","model") is not None and
-            _ag_pick(row,"max_price","maxPrice","Max Price","Max_Price","max") is not None)
+    # AGMARKNET 2.0 has used snake_case/camelCase names and, in the
+    # date-wise specific-commodity payload, minimumPrice/maximumPrice.
+    return (_ag_pick(row,"min_price","minPrice","minimumPrice","Min Price","Min_Price","min") is not None and
+            _ag_pick(row,"modal_price","modalPrice","Modal Price","Modal_Price","model_price","modelPrice","Model Price","modal","model") is not None and
+            _ag_pick(row,"max_price","maxPrice","maximumPrice","Max Price","Max_Price","max") is not None)
+
+def _ag_report_rows(body: Any) -> list[dict[str, Any]]:
+    """Flatten AGMARKNET 2.0 report payloads without assuming one wrapper shape.
+
+    Verified public examples show a top-level ``markets`` array, with
+    ``market -> dates -> data`` nesting.  Some upstream responses can also be
+    wrapped under a response/data object.  Walk only JSON containers and keep
+    market/date context while flattening; never invent price/date values.
+    """
+    out: list[dict[str, Any]] = []
+    seen: set[int] = set()
+
+    def walk(value: Any) -> None:
+        if isinstance(value, dict):
+            oid=id(value)
+            if oid in seen:
+                return
+            seen.add(oid)
+
+            markets=value.get("markets")
+            market_objects=markets if isinstance(markets,list) else []
+            # Some wrappers expose one market object directly under data.
+            if not market_objects and isinstance(value.get("dates"),list) and _ag_pick(value,"marketName","market_name","market","Market") is not None:
+                market_objects=[value]
+            for market in market_objects:
+                if not isinstance(market, dict):
+                    continue
+                mid=id(market)
+                if mid in seen:
+                    continue
+                seen.add(mid)
+                market_name=_ag_pick(market,"marketName","market_name","market","Market")
+                market_district=_ag_pick(market,"districtName","district_name","district","District")
+                market_state=_ag_pick(market,"stateName","state_name","state","State")
+                dates=market.get("dates")
+                if not isinstance(dates, list):
+                    continue
+                for date_block in dates:
+                    if not isinstance(date_block, dict):
+                        continue
+                    arrival_date=_ag_pick(date_block,"arrivalDate","arrival_date","date","Date")
+                    rows=date_block.get("data")
+                    if not isinstance(rows, list):
+                        continue
+                    for row in rows:
+                        if not isinstance(row, dict):
+                            continue
+                        merged=dict(row)
+                        if market_name is not None:
+                            merged.setdefault("market_name",market_name)
+                        if market_district is not None:
+                            merged.setdefault("district_name",market_district)
+                        if market_state is not None:
+                            merged.setdefault("state_name",market_state)
+                        if arrival_date is not None:
+                            merged.setdefault("arrival_date",arrival_date)
+                        out.append(merged)
+
+            for child in value.values():
+                if isinstance(child,(dict,list)):
+                    walk(child)
+        elif isinstance(value,list):
+            for child in value:
+                if isinstance(child,(dict,list)):
+                    walk(child)
+
+    walk(body)
+    if out:
+        return out
+
+    # Last-resort compatibility for a flat/alternate public response where
+    # price rows themselves are exposed without market/date nesting.
+    return [r for r in _ag_deep_rows(body) if _ag_price_row(r)]
+
+
+def _ag_response_shape(body: Any) -> dict[str, Any]:
+    """Return safe structural diagnostics; never include values/prices/secrets."""
+    info={"type":type(body).__name__}
+    if isinstance(body,dict):
+        info["top_keys"]=list(body.keys())[:30]
+        data=body.get("data")
+        if isinstance(data,dict):
+            info["data_keys"]=list(data.keys())[:30]
+        markets=body.get("markets")
+        if isinstance(markets,list):
+            info["markets_count"]=len(markets)
+            if markets and isinstance(markets[0],dict):
+                info["market_keys"]=list(markets[0].keys())[:30]
+                dates=markets[0].get("dates")
+                if isinstance(dates,list):
+                    info["first_market_dates_count"]=len(dates)
+                    if dates and isinstance(dates[0],dict):
+                        info["date_keys"]=list(dates[0].keys())[:30]
+                        rows=dates[0].get("data")
+                        if isinstance(rows,list):
+                            info["first_date_data_count"]=len(rows)
+                            if rows and isinstance(rows[0],dict):
+                                info["price_row_keys"]=list(rows[0].keys())[:30]
+    elif isinstance(body,list):
+        info["list_count"]=len(body)
+        if body and isinstance(body[0],dict):
+            info["first_item_keys"]=list(body[0].keys())[:30]
+    return info
 
 async def _fetch_agmarknet_2_live(state: str, district: str, commodity: str) -> tuple[list[dict[str, Any]], str]:
     requested=(commodity or "ALL").strip() or "ALL"
@@ -1182,6 +1286,32 @@ async def _fetch_agmarknet_2_live(state: str, district: str, commodity: str) -> 
                 except (TypeError,ValueError): return [],"AGMARKNET commodity id invalid"
                 _agmarknet_commodity_cache[ckey]=(commodity_id,time.monotonic())
             print(f"[MANDI_DEBUG] agmarknet2_commodity_resolved commodity={wanted!r} id={commodity_id}")
+
+        # The date-wise specific-commodity report is market/date/variety
+        # nested and its documented price rows do not guarantee a district
+        # field. When the caller asks for a district, resolve market->district
+        # from AGMARKNET's own public commodity-context endpoint rather than
+        # guessing or accepting all markets in the state.
+        market_district_map: dict[str, set[str]] = {}
+        if wanted.upper() != "ALL" and district and commodity_id is not None:
+            cached_ctx=_agmarknet_commodity_context_cache.get(int(commodity_id))
+            context_body=None
+            if cached_ctx and time.monotonic()-cached_ctx[1]<_AGMARKNET_METADATA_CACHE_SECONDS:
+                context_body=cached_ctx[0]
+            else:
+                context_body,ctx_err=await get(f"/list-comm/{int(commodity_id)}")
+                if context_body is not None:
+                    _agmarknet_commodity_context_cache[int(commodity_id)]=(context_body,time.monotonic())
+                else:
+                    print(f"[MANDI_DEBUG] agmarknet2_commodity_context_failed commodity_id={commodity_id} error={ctx_err!r}")
+            for row in _ag_deep_rows(context_body):
+                market_name=str(_ag_pick(row,"marketName","market_name","market","Market") or "").strip()
+                district_name=str(_ag_pick(row,"districtName","district_name","district","District") or "").strip()
+                if market_name and district_name:
+                    market_district_map.setdefault(_norm_mandi_text(market_name),set()).add(district_name)
+            unique_context=sum(1 for districts in market_district_map.values() if len(districts)==1)
+            print(f"[MANDI_DEBUG] agmarknet2_market_district_context commodity_id={commodity_id} mappings={len(market_district_map)} unique={unique_context}")
+
         now=datetime.now(timezone(timedelta(hours=5,minutes=30)))
         for delta in range(3):
             day=now.date()-timedelta(days=delta); date_iso=day.isoformat()
@@ -1202,23 +1332,30 @@ async def _fetch_agmarknet_2_live(state: str, district: str, commodity: str) -> 
                 endpoint_label="commodity-market/daily-report-state"
             if body is None:
                 print(f"[MANDI_DEBUG] agmarknet2_daily_failed endpoint={endpoint_label!r} date={date_iso!r} error={err!r}"); continue
-            candidates=[r for r in _ag_deep_rows(body) if _ag_price_row(r)]
+            candidates=_ag_report_rows(body)
             print(f"[MANDI_DEBUG] agmarknet2_daily_response endpoint={endpoint_label!r} date={date_iso!r} raw_records={len(candidates)}")
+            if not candidates:
+                print(f"[MANDI_DEBUG] agmarknet2_response_shape endpoint={endpoint_label!r} date={date_iso!r} shape={_ag_response_shape(body)!r}")
             accepted=[]
             for r in candidates:
                 rc=str(_ag_pick(r,"cmdt_name","cmdtName","commodity","Commodity","commodity_name","commodityName") or "").strip()
                 if wanted.upper()!="ALL" and not _commodity_matches({"commodity":rc},wanted): continue
+                market_name_value=str(_ag_pick(r,"market_name","marketName","market","Market") or "").strip()
                 rd=str(_ag_pick(r,"district_name","districtName","district","District") or "").strip()
+                if not rd and market_name_value and market_district_map:
+                    districts=market_district_map.get(_norm_mandi_text(market_name_value),set())
+                    if len(districts)==1:
+                        rd=next(iter(districts))
                 if district and (not rd or (_norm_mandi_text(district) not in _norm_mandi_text(rd) and _norm_mandi_text(rd) not in _norm_mandi_text(district))): continue
                 raw_date=_ag_pick(r,"arrival_date","arrivalDate","arrival_date_iso","date","Date") or date_iso
                 parsed=_parse_mandi_date(raw_date)
                 if not parsed: parsed=datetime.combine(day,datetime.min.time(),tzinfo=now.tzinfo)
                 age=(now-parsed.astimezone(now.tzinfo)).total_seconds()/3600
                 if age < -1/60 or age > MANDI_FALLBACK_MAX_AGE_HOURS: continue
-                mn=_normalise_price(_ag_pick(r,"min_price","minPrice","Min Price","Min_Price","min")); mo=_normalise_price(_ag_pick(r,"modal_price","modalPrice","Modal Price","Modal_Price","model_price","modelPrice","Model Price","modal","model")); mx=_normalise_price(_ag_pick(r,"max_price","maxPrice","Max Price","Max_Price","max"))
+                mn=_normalise_price(_ag_pick(r,"min_price","minPrice","minimumPrice","Min Price","Min_Price","min")); mo=_normalise_price(_ag_pick(r,"modal_price","modalPrice","Modal Price","Modal_Price","model_price","modelPrice","Model Price","modal","model")); mx=_normalise_price(_ag_pick(r,"max_price","maxPrice","maximumPrice","Max Price","Max_Price","max"))
                 mf,mof,xf=_price_float(mn),_price_float(mo),_price_float(mx)
                 if mf is None or mof is None or xf is None or not(mf>0 and mof>0 and xf>0 and mf<=mof<=xf): continue
-                accepted.append({"state":state_name,"district":rd,"market":str(_ag_pick(r,"market_name","marketName","market","Market") or "").strip(),"commodity":rc or wanted,"variety":str(_ag_pick(r,"variety_name","varietyName","variety","Variety") or "").strip(),"grade":str(_ag_pick(r,"grade_name","gradeName","grade","Grade") or "").strip(),"arrival_date":parsed.strftime("%d/%m/%Y"),"min_price":mf,"max_price":xf,"modal_price":mof,"source":"AGMARKNET 2.0 (Government of India)","source_url":"https://agmarknet.gov.in/home","_source_age_hours":round(age,2)})
+                accepted.append({"state":state_name,"district":rd,"market":market_name_value,"commodity":rc or wanted,"variety":str(_ag_pick(r,"variety_name","varietyName","variety","Variety") or "").strip(),"grade":str(_ag_pick(r,"grade_name","gradeName","grade","Grade") or "").strip(),"arrival_date":parsed.strftime("%d/%m/%Y"),"min_price":mf,"max_price":xf,"modal_price":mof,"source":"AGMARKNET 2.0 (Government of India)","source_url":"https://agmarknet.gov.in/home","_source_age_hours":round(age,2)})
             print(f"[MANDI_DEBUG] agmarknet2_row_validation date={date_iso!r} accepted={len(accepted)}")
             if accepted: return accepted,""
         return [],"AGMARKNET 2.0 returned no fresh records"
@@ -1730,16 +1867,16 @@ def mandi(state: str = "Gujarat", district: str = "", commodity: str = "ALL"):
     print(
         "[MANDI_DEBUG] final_result "
         f"state={state!r} district={district!r} commodity={requested_commodity!r} "
-        f"http_status={int(upstream_status or 0)} records=0 source=official_api "
-        f"ceda_fallback={bool(CEDA_API_KEY)} ceda_error={ceda_error!r} error={error or ''!r}"
+        f"http_status={int(upstream_status or 0)} records=0 source=none "
+        f"primary_source=official_api ceda_fallback={bool(CEDA_API_KEY)} ceda_error={ceda_error!r} error={error or ''!r}"
     )
     return {
         "ok": True,
         "live_available": False,
         "live_api_configured": bool(MANDI_API_KEY),
-        "source": "official_api",
+        "source": "none",
         "checked_at": checked_at,
-        "price_unit_source": "₹/quintal (data.gov.in / AGMARKNET)",
+        "price_unit_source": "₹/quintal (no official live record returned)",
         "display_price_unit": "₹/20kg",
         "records": [],
         "message": "હાલમાં પસંદ કરેલા પાક માટે મંડી ભાવ ઉપલબ્ધ નથી.",
