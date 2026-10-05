@@ -27,7 +27,7 @@ from openai import OpenAI
 from google import genai
 from google.genai import types
 
-APP_VERSION = "13.0 AGMARKNET 2.0 FORENSIC VALIDATION + MONTHLY DATE FIX"
+APP_VERSION = "13.1 AGMARKNET 2.0 DAILY COMMODITY RESPONSE FIX"
 MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile").strip() or "llama-3.3-70b-versatile"
 GEMINI_VISION_MODEL = os.getenv("GEMINI_VISION_MODEL", "gemini-3.6-flash").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
@@ -925,7 +925,7 @@ def _mandi_log_exception(exc: BaseException, *, http_status: int = 0) -> None:
     )
 
 
-def _mandi_api_get(state: str, district: str, commodity: str):
+def _mandi_api_get(state: str, market: str, commodity: str):
     """Fetch exclusively from the official data.gov.in Mandi API.
 
     No cache, stale snapshot, news price, article extraction, calculated price,
@@ -934,7 +934,7 @@ def _mandi_api_get(state: str, district: str, commodity: str):
     global _mandi_global_rate_limit_until
 
     state = (state or "").strip() or "Gujarat"
-    district = (district or "").strip()
+    market = (market or "").strip()
     normalized_commodity = (commodity or "ALL").strip() or "ALL"
     api_commodity = GUJARATI_CROP_ALIASES.get(normalized_commodity, normalized_commodity)
     if api_commodity.upper() == "ALL":
@@ -942,7 +942,7 @@ def _mandi_api_get(state: str, district: str, commodity: str):
 
     print(
         "[MANDI_DEBUG] request_received "
-        f"state={state!r} district={district!r} commodity={normalized_commodity!r}"
+        f"state={state!r} market={market!r} commodity={normalized_commodity!r}"
     )
     print(
         "[MANDI_DEBUG] official_api_config "
@@ -958,14 +958,14 @@ def _mandi_api_get(state: str, district: str, commodity: str):
 
     # Keep Live Mandi a single exact official request. A 200 + empty records
     # is an honest official empty result; it must not trigger another query.
-    rate_key = "|".join((state.lower(), district.lower(), api_commodity.lower()))
+    rate_key = "|".join((state.lower(), market.lower(), api_commodity.lower()))
     now = time.monotonic()
     with _mandi_lock:
         cooldown_until = max(_mandi_rate_limit_until.get(rate_key, 0.0), _mandi_global_rate_limit_until)
         if cooldown_until > now:
             print(
                 "[MANDI_DEBUG] official_api_rate_limit_cooldown "
-                f"state={state!r} district={district!r} commodity={normalized_commodity!r}"
+                f"state={state!r} market={market!r} commodity={normalized_commodity!r}"
             )
             return None, "Live Mandi API limit પર છે; થોડા સમય પછી ફરી પ્રયાસ કરો."
 
@@ -977,8 +977,8 @@ def _mandi_api_get(state: str, district: str, commodity: str):
         }
         if state:
             params["filters[state]"] = state
-        if district:
-            params["filters[district]"] = district
+        if market:
+            params["filters[market]"] = market
         if api_commodity:
             params["filters[commodity]"] = api_commodity
 
@@ -987,7 +987,7 @@ def _mandi_api_get(state: str, district: str, commodity: str):
         print(
             "[MANDI_DEBUG] official_api_request "
             f"scheme={MANDI_API_SCHEME!r} host={MANDI_API_HOST!r} path={path!r} "
-            f"state={state!r} district={district!r} commodity={normalized_commodity!r} "
+            f"state={state!r} market={market!r} commodity={normalized_commodity!r} "
             f"timeout_seconds={MANDI_API_TIMEOUT_SECONDS}"
         )
 
@@ -1183,6 +1183,54 @@ def _ag_report_rows(body: Any) -> list[dict[str, Any]]:
     return [r for r in _ag_deep_rows(body) if _ag_price_row(r)]
 
 
+def _ag_daily_commodity_rows(body: Any) -> list[dict[str, Any]]:
+    """Flatten AGMARKNET 2.0 daily commodity/state responses.
+
+    This endpoint is date-scoped.  The response may wrap rows under
+    ``commodityGroups -> markets -> dates -> data`` or expose equivalent
+    nested dictionaries.  Context inherited from commodity/market/date
+    parents is copied onto each price row; no date or district is invented.
+    """
+    out: list[dict[str, Any]] = []
+    seen_price: set[int] = set()
+
+    def walk(value: Any, commodity_ctx=None, market_ctx=None, district_ctx=None, state_ctx=None, date_ctx=None):
+        if isinstance(value, dict):
+            commodity_here = _ag_pick(value,
+                "cmdt_name","cmdtName","commodity_name","commodityName","commodity","Commodity") or commodity_ctx
+            market_here = _ag_pick(value,
+                "market_name","marketName","market","Market") or market_ctx
+            district_here = _ag_pick(value,
+                "district_name","districtName","district","District") or district_ctx
+            state_here = _ag_pick(value,
+                "state_name","stateName","state","State") or state_ctx
+            date_here = _ag_pick(value,
+                "arrival_date","arrivalDate","date","Date") or date_ctx
+
+            if _ag_price_row(value):
+                oid=id(value)
+                if oid not in seen_price:
+                    seen_price.add(oid)
+                    merged=dict(value)
+                    if commodity_here is not None: merged.setdefault("commodity", commodity_here)
+                    if market_here is not None: merged.setdefault("market_name", market_here)
+                    if district_here is not None: merged.setdefault("district_name", district_here)
+                    if state_here is not None: merged.setdefault("state_name", state_here)
+                    if date_here is not None: merged.setdefault("arrival_date", date_here)
+                    out.append(merged)
+
+            for child in value.values():
+                if isinstance(child,(dict,list)):
+                    walk(child, commodity_here, market_here, district_here, state_here, date_here)
+        elif isinstance(value, list):
+            for child in value:
+                if isinstance(child,(dict,list)):
+                    walk(child, commodity_ctx, market_ctx, district_ctx, state_ctx, date_ctx)
+
+    walk(body)
+    return out
+
+
 def _ag_response_shape(body: Any) -> dict[str, Any]:
     """Return safe structural diagnostics; never include values/prices/secrets."""
     info={"type":type(body).__name__}
@@ -1191,6 +1239,11 @@ def _ag_response_shape(body: Any) -> dict[str, Any]:
         data=body.get("data")
         if isinstance(data,dict):
             info["data_keys"]=list(data.keys())[:30]
+        groups=body.get("commodityGroups")
+        if isinstance(groups,list):
+            info["commodity_groups_count"]=len(groups)
+            if groups and isinstance(groups[0],dict):
+                info["first_commodity_group_keys"]=list(groups[0].keys())[:30]
         markets=body.get("markets")
         if isinstance(markets,list):
             info["markets_count"]=len(markets)
@@ -1212,7 +1265,7 @@ def _ag_response_shape(body: Any) -> dict[str, Any]:
             info["first_item_keys"]=list(body[0].keys())[:30]
     return info
 
-async def _fetch_agmarknet_2_live(state: str, district: str, commodity: str) -> tuple[list[dict[str, Any]], str]:
+async def _fetch_agmarknet_2_live(state: str, market: str, commodity: str) -> tuple[list[dict[str, Any]], str]:
     requested=(commodity or "ALL").strip() or "ALL"
     wanted=GUJARATI_CROP_ALIASES.get(requested, requested)
     state_name=(state or "Gujarat").strip()
@@ -1287,82 +1340,57 @@ async def _fetch_agmarknet_2_live(state: str, district: str, commodity: str) -> 
                 _agmarknet_commodity_cache[ckey]=(commodity_id,time.monotonic())
             print(f"[MANDI_DEBUG] agmarknet2_commodity_resolved commodity={wanted!r} id={commodity_id}")
 
-        # The date-wise specific-commodity report is market/date/variety
-        # nested and its documented price rows do not guarantee a district
-        # field. When the caller asks for a district, resolve market->district
-        # from AGMARKNET's own public commodity-context endpoint rather than
-        # guessing or accepting all markets in the state.
-        market_district_map: dict[str, set[str]] = {}
-        if wanted.upper() != "ALL" and district and commodity_id is not None:
-            cached_ctx=_agmarknet_commodity_context_cache.get(int(commodity_id))
-            context_body=None
-            if cached_ctx and time.monotonic()-cached_ctx[1]<_AGMARKNET_METADATA_CACHE_SECONDS:
-                context_body=cached_ctx[0]
-            else:
-                context_body,ctx_err=await get(f"/list-comm/{int(commodity_id)}")
-                if context_body is not None:
-                    _agmarknet_commodity_context_cache[int(commodity_id)]=(context_body,time.monotonic())
-                else:
-                    print(f"[MANDI_DEBUG] agmarknet2_commodity_context_failed commodity_id={commodity_id} error={ctx_err!r}")
-            for row in _ag_deep_rows(context_body):
-                market_name=str(_ag_pick(row,"marketName","market_name","market","Market") or "").strip()
-                district_name=str(_ag_pick(row,"districtName","district_name","district","District") or "").strip()
-                if market_name and district_name:
-                    market_district_map.setdefault(_norm_mandi_text(market_name),set()).add(district_name)
-            unique_context=sum(1 for districts in market_district_map.values() if len(districts)==1)
-            print(f"[MANDI_DEBUG] agmarknet2_market_district_context commodity_id={commodity_id} mappings={len(market_district_map)} unique={unique_context}")
-            if not market_district_map and context_body is not None:
-                print(f"[MANDI_DEBUG] agmarknet2_market_district_context_shape shape={_ag_response_shape(context_body)!r}")
-
+        # Specific commodities must use a genuinely date-scoped AGMARKNET
+        # report.  The previously used date-wise/specific-commodity endpoint
+        # is month-scoped (year/month/state/commodity) and therefore returned
+        # the same 103 monthly rows for every requested day.
         now=datetime.now(timezone(timedelta(hours=5,minutes=30)))
         for delta in range(3):
             day=now.date()-timedelta(days=delta); date_iso=day.isoformat()
-            # For a specific commodity, use AGMARKNET's verified
-            # date-wise/specific-commodity report. The state report is useful
-            # for ALL, but its payload varies and may spell modal_price as
-            # model_price. The specific report avoids an unnecessary market
-            # lookup and gives market/district rows directly.
             if wanted.upper() != "ALL":
-                body,err=await get("/prices-and-arrivals/date-wise/specific-commodity",{
-                    "year":day.year,"month":day.month,"stateId":state_id,"commodityId":commodity_id,"includeExcel":"false"
+                body,err=await get("/prices-and-arrivals/commodity-wise/daily-report-state",{
+                    "date":date_iso,"stateIds":str(state_id),"includeExcel":"false"
                 })
-                endpoint_label="date-wise/specific-commodity"
+                endpoint_label="commodity-wise/daily-report-state"
+                candidates=_ag_daily_commodity_rows(body) if body is not None else []
             else:
                 body,err=await get("/prices-and-arrivals/commodity-market/daily-report-state",{
                     "date":date_iso,"state":state_id,"includeExcel":"false"
                 })
                 endpoint_label="commodity-market/daily-report-state"
+                candidates=_ag_report_rows(body) if body is not None else []
+
             if body is None:
-                print(f"[MANDI_DEBUG] agmarknet2_daily_failed endpoint={endpoint_label!r} date={date_iso!r} error={err!r}"); continue
-            candidates=_ag_report_rows(body)
-            print(f"[MANDI_DEBUG] agmarknet2_daily_response endpoint={endpoint_label!r} date={date_iso!r} raw_records={len(candidates)}")
-            if not candidates:
-                print(f"[MANDI_DEBUG] agmarknet2_response_shape endpoint={endpoint_label!r} date={date_iso!r} shape={_ag_response_shape(body)!r}")
+                print(f"[MANDI_DEBUG] agmarknet2_daily_failed endpoint={endpoint_label!r} date={date_iso!r} error={err!r}")
+                continue
+            shape=_ag_response_shape(body)
+            print(f"[MANDI_DEBUG] agmarknet2_daily_response endpoint={endpoint_label!r} date={date_iso!r} raw_records={len(candidates)} shape={shape!r}")
+            if candidates:
+                sample=[]
+                for sr in candidates[:3]:
+                    sample.append({
+                        "commodity":str(_ag_pick(sr,"commodity","cmdt_name","cmdtName","commodity_name","commodityName") or ""),
+                        "arrival_date":str(_ag_pick(sr,"arrival_date","arrivalDate","date","Date") or ""),
+                        "district":str(_ag_pick(sr,"district_name","districtName","district","District") or ""),
+                        "market":str(_ag_pick(sr,"market_name","marketName","market","Market") or ""),
+                        "min_price":_ag_pick(sr,"min_price","minPrice","minimumPrice","Min Price","Min_Price","min"),
+                        "max_price":_ag_pick(sr,"max_price","maxPrice","maximumPrice","Max Price","Max_Price","max"),
+                        "modal_price":_ag_pick(sr,"modal_price","modalPrice","Modal Price","Modal_Price","model_price","modelPrice","Model Price","modal","model"),
+                    })
+                print(f"[MANDI_DEBUG] agmarknet2_daily_sample first3={sample!r}")
+
             accepted=[]
-            rejected={"commodity":0,"district":0,"date_invalid":0,"future":0,"stale":0,"price":0,"accepted":0}
+            rejected={"commodity":0,"market":0,"date_invalid":0,"future":0,"stale":0,"price":0,"accepted":0}
             for r in candidates:
                 rc=str(_ag_pick(r,"cmdt_name","cmdtName","commodity","Commodity","commodity_name","commodityName") or "").strip()
-                # The specific-commodity endpoint is already scoped by official
-                # stateId + commodityId. Missing commodity text is therefore valid.
-                if wanted.upper()!="ALL" and rc and not _commodity_matches({"commodity":rc},wanted):
-                    rejected["commodity"] += 1; continue
+                if wanted.upper()!="ALL":
+                    if not rc or not _commodity_matches({"commodity":rc},wanted):
+                        rejected["commodity"] += 1; continue
                 market_name_value=str(_ag_pick(r,"market_name","marketName","market","Market") or "").strip()
                 rd=str(_ag_pick(r,"district_name","districtName","district","District") or "").strip()
-                if not rd and market_name_value:
-                    import re as _re
-                    _dm=_re.search(r"\(\s*Dist\.?\s*([^\)]+)\)",market_name_value,re.IGNORECASE)
-                    if _dm:
-                        rd=_dm.group(1).strip()
-                if not rd and market_name_value and market_district_map:
-                    districts=market_district_map.get(_norm_mandi_text(market_name_value),set())
-                    if len(districts)==1:
-                        rd=next(iter(districts))
-                if district and (not rd or (_norm_mandi_text(district) not in _norm_mandi_text(rd) and _norm_mandi_text(rd) not in _norm_mandi_text(district))):
-                    rejected["district"] += 1; continue
+                if market and (not market_name_value or _norm_mandi_text(market) != _norm_mandi_text(market_name_value)):
+                    rejected["market"] += 1; continue
 
-                # IMPORTANT: date-wise/specific-commodity is a MONTHLY endpoint.
-                # Do not substitute the requested loop day when arrivalDate is
-                # missing/unparseable; that would manufacture freshness.
                 raw_date=_ag_pick(r,"arrival_date","arrivalDate","arrival_date_iso","date","Date")
                 parsed=_parse_mandi_date(raw_date)
                 if not parsed:
@@ -1373,15 +1401,26 @@ async def _fetch_agmarknet_2_live(state: str, district: str, commodity: str) -> 
                 if age > MANDI_FALLBACK_MAX_AGE_HOURS:
                     rejected["stale"] += 1; continue
 
-                mn=_normalise_price(_ag_pick(r,"min_price","minPrice","minimumPrice","Min Price","Min_Price","min")); mo=_normalise_price(_ag_pick(r,"modal_price","modalPrice","Modal Price","Modal_Price","model_price","modelPrice","Model Price","modal","model")); mx=_normalise_price(_ag_pick(r,"max_price","maxPrice","maximumPrice","Max Price","Max_Price","max"))
+                mn=_normalise_price(_ag_pick(r,"min_price","minPrice","minimumPrice","Min Price","Min_Price","min"))
+                mo=_normalise_price(_ag_pick(r,"modal_price","modalPrice","Modal Price","Modal_Price","model_price","modelPrice","Model Price","modal","model"))
+                mx=_normalise_price(_ag_pick(r,"max_price","maxPrice","maximumPrice","Max Price","Max_Price","max"))
                 mf,mof,xf=_price_float(mn),_price_float(mo),_price_float(mx)
                 if mf is None or mof is None or xf is None or not(mf>0 and mof>0 and xf>0 and mf<=mof<=xf):
                     rejected["price"] += 1; continue
-                accepted.append({"state":state_name,"district":rd,"market":market_name_value,"commodity":rc or wanted,"variety":str(_ag_pick(r,"variety_name","varietyName","variety","Variety") or "").strip(),"grade":str(_ag_pick(r,"grade_name","gradeName","grade","Grade") or "").strip(),"arrival_date":parsed.strftime("%d/%m/%Y"),"min_price":mf,"max_price":xf,"modal_price":mof,"source":"AGMARKNET 2.0 (Government of India)","source_url":"https://agmarknet.gov.in/home","_source_age_hours":round(age,2)})
+                accepted.append({
+                    "state":state_name,"district":rd,"market":market_name_value,
+                    "commodity":rc or wanted,
+                    "variety":str(_ag_pick(r,"variety_name","varietyName","variety","Variety") or "").strip(),
+                    "grade":str(_ag_pick(r,"grade_name","gradeName","grade","Grade") or "").strip(),
+                    "arrival_date":parsed.strftime("%d/%m/%Y"),
+                    "min_price":mf,"max_price":xf,"modal_price":mof,
+                    "source":"AGMARKNET 2.0 (Government of India)",
+                    "source_url":"https://agmarknet.gov.in/home","_source_age_hours":round(age,2)
+                })
             rejected["accepted"]=len(accepted)
             print(f"[MANDI_DEBUG] agmarknet2_row_validation date={date_iso!r} raw={len(candidates)} "
                   f"accepted={rejected['accepted']} rejected_commodity={rejected['commodity']} "
-                  f"rejected_district={rejected['district']} rejected_date_invalid={rejected['date_invalid']} "
+                  f"rejected_market={rejected['market']} rejected_date_invalid={rejected['date_invalid']} "
                   f"rejected_future={rejected['future']} rejected_stale={rejected['stale']} "
                   f"rejected_price={rejected['price']}")
             if accepted: return accepted,""
@@ -1778,8 +1817,42 @@ def _normalise_mandi_records(records: list[dict[str, Any]]) -> list[dict[str, An
         })
     return normalized
 
+@app.get("/api/v1/mandi/markets")
+def mandi_markets(state: str = "Gujarat", commodity: str = "ALL"):
+    """Return only official market names observed in the current live report.
+
+    This is a discovery endpoint: it never invents a market list. Names come
+    from the official live record's market_name field and are therefore the
+    exact labels used by the upstream source.
+    """
+    requested = (commodity or "ALL").strip() or "ALL"
+    try:
+        data, err, _cooldown, status = _mandi_api_get(state, "", requested)
+    except Exception as exc:
+        data, err, status = None, f"{type(exc).__name__}: {str(exc)[:160]}", 0
+    names=[]
+    if isinstance(data, dict):
+        for row in data.get("records") or []:
+            if isinstance(row, dict):
+                name=str(row.get("market") or row.get("market_name") or "").strip()
+                if name and name not in names: names.append(name)
+    if not names:
+        try:
+            ag_records, ag_error = asyncio.run(_fetch_agmarknet_2_live(state, "", requested))
+        except RuntimeError:
+            def _market_runner(): return asyncio.run(_fetch_agmarknet_2_live(state, "", requested))
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                ag_records, ag_error = pool.submit(_market_runner).result(timeout=AGMARKNET_PUBLIC_TIMEOUT_SECONDS * 4 + 5)
+        except Exception as exc:
+            ag_records, ag_error = [], f"{type(exc).__name__}: {str(exc)[:160]}"
+        for row in ag_records:
+            name=str(row.get("market") or row.get("market_name") or "").strip() if isinstance(row,dict) else ""
+            if name and name not in names: names.append(name)
+        err = err or ag_error
+    return {"ok": bool(names), "state": state, "commodity": requested, "markets": names[:500], "source": "official_api_or_agmarknet_2_public", "error": "" if names else (err or "Official market list unavailable"), "http_status": int(status or 0)}
+
 @app.get("/api/v1/mandi")
-def mandi(state: str = "Gujarat", district: str = "", commodity: str = "ALL"):
+def mandi(state: str = "Gujarat", market: str = "", commodity: str = "ALL"):
     """Official API-only Live Mandi endpoint.
 
     Source chain:
@@ -1793,7 +1866,7 @@ def mandi(state: str = "Gujarat", district: str = "", commodity: str = "ALL"):
     ).strftime("%d-%m-%Y %H:%M")
 
     requested_commodity = (commodity or "ALL").strip() or "ALL"
-    result = _mandi_api_get(state, district, requested_commodity)
+    result = _mandi_api_get(state, market, requested_commodity)
     if len(result) == 4:
         data, error, _cooldown, upstream_status = result
     else:
@@ -1811,7 +1884,7 @@ def mandi(state: str = "Gujarat", district: str = "", commodity: str = "ALL"):
 
         print(
             "[MANDI_DEBUG] final_result "
-            f"state={state!r} district={district!r} commodity={requested_commodity!r} "
+            f"state={state!r} market={market!r} commodity={requested_commodity!r} "
             f"http_status={http_status} records={len(records)} source=official_api"
         )
 
@@ -1841,10 +1914,10 @@ def mandi(state: str = "Gujarat", district: str = "", commodity: str = "ALL"):
 
     # Official AGMARKNET 2.0 public backend is the first secondary live source.
     try:
-        ag_records, ag_error = asyncio.run(_fetch_agmarknet_2_live(state, district, requested_commodity))
+        ag_records, ag_error = asyncio.run(_fetch_agmarknet_2_live(state, market, requested_commodity))
     except RuntimeError:
         def _ag_runner():
-            return asyncio.run(_fetch_agmarknet_2_live(state, district, requested_commodity))
+            return asyncio.run(_fetch_agmarknet_2_live(state, market, requested_commodity))
         with ThreadPoolExecutor(max_workers=1) as pool:
             ag_records, ag_error = pool.submit(_ag_runner).result(timeout=AGMARKNET_PUBLIC_TIMEOUT_SECONDS * 4 + 5)
     except Exception as exc:
@@ -1859,16 +1932,20 @@ def mandi(state: str = "Gujarat", district: str = "", commodity: str = "ALL"):
     # Secondary live-source attempt: CEDA Agmarknet. It is only accepted when
     # the actual API returns records that are no older than the configured
     # freshness window. No hardcoded/sample/cache/news prices are permitted.
-    try:
-        ceda_records, ceda_error = asyncio.run(_fetch_ceda_fresh_mandi(state, district, requested_commodity))
-    except RuntimeError:
+    if market:
+        print(f"[MANDI_DEBUG] ceda_skipped market_filter={market!r} reason=CEDA_district_scope_cannot_prove_market_match")
+        ceda_records, ceda_error = [], "CEDA skipped because requested market requires direct market-level provenance"
+    else:
+      try:
+        ceda_records, ceda_error = asyncio.run(_fetch_ceda_fresh_mandi(state, "", requested_commodity))
+      except RuntimeError:
         # If this endpoint is called from an already-running event loop, execute
         # the async fallback in a short-lived worker thread.
         def _runner():
-            return asyncio.run(_fetch_ceda_fresh_mandi(state, district, requested_commodity))
+            return asyncio.run(_fetch_ceda_fresh_mandi(state, "", requested_commodity))
         with ThreadPoolExecutor(max_workers=1) as pool:
             ceda_records, ceda_error = pool.submit(_runner).result(timeout=MANDI_CEDA_TIMEOUT_SECONDS + 5)
-    except Exception as exc:
+      except Exception as exc:
         ceda_records, ceda_error = [], f"{type(exc).__name__}: {str(exc)[:180]}"
 
     if ceda_records:
@@ -1893,7 +1970,7 @@ def mandi(state: str = "Gujarat", district: str = "", commodity: str = "ALL"):
 
     print(
         "[MANDI_DEBUG] final_result "
-        f"state={state!r} district={district!r} commodity={requested_commodity!r} "
+        f"state={state!r} market={market!r} commodity={requested_commodity!r} "
         f"http_status={int(upstream_status or 0)} records=0 source=none "
         f"primary_source=official_api ceda_fallback={bool(CEDA_API_KEY)} ceda_error={ceda_error!r} error={error or ''!r}"
     )
