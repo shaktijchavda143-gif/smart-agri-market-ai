@@ -814,6 +814,19 @@ def _norm_mandi_text(value: Any) -> str:
     return " ".join(str(value or "").strip().lower().replace("-", " ").replace("_", " ").split())
 
 
+def _norm_mandi_market(value: Any) -> str:
+    """Normalize market identity without changing the official display name.
+
+    AGMARKNET may return labels such as ``APMC Bagasara`` while the app may
+    submit ``Bagasara``.  Only the common APMC prefix/suffix is ignored for
+    matching; the canonical upstream market name is always retained.
+    """
+    text = _norm_mandi_text(value)
+    text = re.sub(r"^apmc\s+", "", text)
+    text = re.sub(r"\s+apmc$", "", text)
+    return text.strip()
+
+
 def _commodity_matches(row: dict[str, Any], requested: str) -> bool:
     """Keep only rows belonging to the requested commodity."""
     if not requested or requested.strip().upper() == "ALL":
@@ -1388,9 +1401,13 @@ async def _fetch_agmarknet_2_live(state: str, market: str, commodity: str) -> tu
                         rejected["commodity"] += 1; continue
                 market_name_value=str(_ag_pick(r,"market_name","marketName","market","Market") or "").strip()
                 rd=str(_ag_pick(r,"district_name","districtName","district","District") or "").strip()
-                if market and (not market_name_value or _norm_mandi_text(market) != _norm_mandi_text(market_name_value)):
+                if market and (not market_name_value or _norm_mandi_market(market) != _norm_mandi_market(market_name_value)):
                     rejected["market"] += 1; continue
 
+                # IMPORTANT: the daily request date is a report scope, not an
+                # invented arrival_date.  Only an explicit upstream arrival
+                # field may become arrival_date.  Keep the request/report date
+                # separately for diagnostics/provenance.
                 raw_date=_ag_pick(r,"arrival_date","arrivalDate","arrival_date_iso","date","Date")
                 parsed=_parse_mandi_date(raw_date)
                 if not parsed:
@@ -1413,6 +1430,7 @@ async def _fetch_agmarknet_2_live(state: str, market: str, commodity: str) -> tu
                     "variety":str(_ag_pick(r,"variety_name","varietyName","variety","Variety") or "").strip(),
                     "grade":str(_ag_pick(r,"grade_name","gradeName","grade","Grade") or "").strip(),
                     "arrival_date":parsed.strftime("%d/%m/%Y"),
+                    "report_date":date_iso,
                     "min_price":mf,"max_price":xf,"modal_price":mof,
                     "source":"AGMARKNET 2.0 (Government of India)",
                     "source_url":"https://agmarknet.gov.in/home","_source_age_hours":round(age,2)
@@ -1802,6 +1820,7 @@ def _normalise_mandi_records(records: list[dict[str, Any]]) -> list[dict[str, An
             "variety": pick(row, "variety", "Variety"),
             "arrival_date": arrival,
             "arrival_date_iso": parsed.isoformat() if parsed else "",
+            "report_date": pick(row, "report_date", "reportDate", "requested_report_date"),
             "min_price": min_price,
             "modal_price": modal_price,
             "max_price": max_price,
@@ -1819,37 +1838,101 @@ def _normalise_mandi_records(records: list[dict[str, Any]]) -> list[dict[str, An
 
 @app.get("/api/v1/mandi/markets")
 def mandi_markets(state: str = "Gujarat", commodity: str = "ALL"):
-    """Return only official market names observed in the current live report.
+    """Return the official AGMARKNET market/yard master for the state.
 
-    This is a discovery endpoint: it never invents a market list. Names come
-    from the official live record's market_name field and are therefore the
-    exact labels used by the upstream source.
+    This discovery endpoint is intentionally independent of the selected crop:
+    the user should be able to see/search all official APMC names first.  It
+    never fabricates names from a hardcoded list.  Names are read from the
+    public AGMARKNET filter/master response when available; the daily report
+    is only a secondary discovery source.
     """
-    requested = (commodity or "ALL").strip() or "ALL"
+    state_name = (state or "Gujarat").strip() or "Gujarat"
+    state_key = _norm_mandi_text(state_name)
+    names: list[str] = []
+    seen: set[str] = set()
+    errors: list[str] = []
+
+    def add_market(name: Any, row: dict[str, Any] | None = None):
+        text = str(name or "").strip()
+        if not text:
+            return
+        # Prefer explicit state context when the upstream master contains it.
+        if row is not None:
+            row_state = str(_ag_pick(row, "state_name", "stateName", "state", "State") or "").strip()
+            if row_state and _norm_mandi_text(row_state) != state_key:
+                return
+        key = _norm_mandi_market(text)
+        if key and key not in seen:
+            seen.add(key)
+            names.append(text)
+
+    # Primary market master: AGMARKNET explicitly documents /daily-price-arrival/filters
+    # as returning states, districts, markets, commodities, varieties and grades.
+    async def fetch_master():
+        headers = {
+            "Accept": "application/json, text/plain, */*",
+            "Origin": "https://agmarknet.gov.in",
+            "Referer": "https://agmarknet.gov.in/",
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/135 Safari/537.36",
+        }
+        timeout = httpx.Timeout(AGMARKNET_PUBLIC_TIMEOUT_SECONDS, connect=min(8.0, AGMARKNET_PUBLIC_TIMEOUT_SECONDS))
+        async with httpx.AsyncClient(base_url=AGMARKNET_PUBLIC_BASE, headers=headers, timeout=timeout) as client:
+            try:
+                response = await client.get("/daily-price-arrival/filters")
+                if response.status_code != 200:
+                    return None, f"HTTP {response.status_code}"
+                return response.json(), ""
+            except Exception as exc:
+                return None, f"{type(exc).__name__}: {str(exc)[:180]}"
+
     try:
-        data, err, _cooldown, status = _mandi_api_get(state, "", requested)
+        body, err = asyncio.run(fetch_master())
+    except RuntimeError:
+        def _runner(): return asyncio.run(fetch_master())
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            body, err = pool.submit(_runner).result(timeout=AGMARKNET_PUBLIC_TIMEOUT_SECONDS * 2 + 5)
     except Exception as exc:
-        data, err, status = None, f"{type(exc).__name__}: {str(exc)[:160]}", 0
-    names=[]
-    if isinstance(data, dict):
-        for row in data.get("records") or []:
-            if isinstance(row, dict):
-                name=str(row.get("market") or row.get("market_name") or "").strip()
-                if name and name not in names: names.append(name)
+        body, err = None, f"{type(exc).__name__}: {str(exc)[:180]}"
+    if err:
+        errors.append(err)
+
+    # The exact key can vary by frontend release. Restrict extraction to
+    # dictionaries that actually carry market identity; do not turn arbitrary
+    # text/commodity rows into market names.
+    if body is not None:
+        for row in _ag_deep_rows(body):
+            name = _ag_pick(row, "market_name", "marketName", "market", "Market", "market_name_en")
+            if name:
+                add_market(name, row)
+
+    # Secondary official discovery: today's/previous two daily reports. This
+    # can recover names if the master payload is temporarily incomplete.
     if not names:
         try:
-            ag_records, ag_error = asyncio.run(_fetch_agmarknet_2_live(state, "", requested))
+            ag_records, ag_error = asyncio.run(_fetch_agmarknet_2_live(state_name, "", "ALL"))
         except RuntimeError:
-            def _market_runner(): return asyncio.run(_fetch_agmarknet_2_live(state, "", requested))
+            def _market_runner(): return asyncio.run(_fetch_agmarknet_2_live(state_name, "", "ALL"))
             with ThreadPoolExecutor(max_workers=1) as pool:
                 ag_records, ag_error = pool.submit(_market_runner).result(timeout=AGMARKNET_PUBLIC_TIMEOUT_SECONDS * 4 + 5)
         except Exception as exc:
             ag_records, ag_error = [], f"{type(exc).__name__}: {str(exc)[:160]}"
+        if ag_error:
+            errors.append(ag_error)
         for row in ag_records:
-            name=str(row.get("market") or row.get("market_name") or "").strip() if isinstance(row,dict) else ""
-            if name and name not in names: names.append(name)
-        err = err or ag_error
-    return {"ok": bool(names), "state": state, "commodity": requested, "markets": names[:500], "source": "official_api_or_agmarknet_2_public", "error": "" if names else (err or "Official market list unavailable"), "http_status": int(status or 0)}
+            if isinstance(row, dict):
+                add_market(_ag_pick(row, "market", "market_name", "marketName", "Market"), row)
+
+    print(f"[MANDI_DEBUG] agmarknet_market_master state={state_name!r} count={len(names)}")
+    return {
+        "ok": bool(names),
+        "state": state_name,
+        "commodity": "ALL",
+        "markets": names[:1000],
+        "source": "AGMARKNET 2.0 (Government of India)",
+        "source_url": "https://agmarknet.gov.in/home",
+        "error": "" if names else (errors[-1] if errors else "Official market master unavailable"),
+        "http_status": 200 if names else 0,
+    }
 
 @app.get("/api/v1/mandi")
 def mandi(state: str = "Gujarat", market: str = "", commodity: str = "ALL"):
