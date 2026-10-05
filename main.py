@@ -1452,6 +1452,25 @@ async def _fetch_agmarknet_2_live(state: str, market: str, commodity: str) -> tu
             if accepted: return accepted,""
         return [],"AGMARKNET 2.0 returned no fresh records"
 
+def _parse_mandi_date(value: str):
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    raw = raw.replace("T", " ").replace("Z", "").strip()
+    formats = (
+        "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d",
+        "%d/%m/%Y %H:%M:%S", "%d/%m/%Y %H:%M", "%d/%m/%Y",
+        "%d-%m-%Y %H:%M:%S", "%d-%m-%Y %H:%M", "%d-%m-%Y",
+        "%d %b %Y", "%d %B %Y"
+    )
+    for fmt in formats:
+        try:
+            return datetime.strptime(raw, fmt).replace(tzinfo=timezone(timedelta(hours=5, minutes=30)))
+        except ValueError:
+            continue
+    return None
+
+
 def _normalise_mandi_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     def pick(row, *keys):
         for key in keys:
