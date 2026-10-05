@@ -1123,126 +1123,65 @@ def _ag_price_row(row):
             _ag_pick(row,"max_price","maxPrice","maximumPrice","Max Price","Max_Price","max") is not None)
 
 def _ag_report_rows(body: Any) -> list[dict[str, Any]]:
-    """Flatten AGMARKNET 2.0 report payloads without assuming one wrapper shape.
+    """Flatten AGMARKNET 2.0 daily-report payloads with inherited context.
 
-    Verified public examples show a top-level ``markets`` array, with
-    ``market -> dates -> data`` nesting.  Some upstream responses can also be
-    wrapped under a response/data object.  Walk only JSON containers and keep
-    market/date context while flattening; never invent price/date values.
-    """
-    out: list[dict[str, Any]] = []
-    seen: set[int] = set()
-
-    def walk(value: Any) -> None:
-        if isinstance(value, dict):
-            oid=id(value)
-            if oid in seen:
-                return
-            seen.add(oid)
-
-            markets=value.get("markets")
-            market_objects=markets if isinstance(markets,list) else []
-            # Some wrappers expose one market object directly under data.
-            if not market_objects and isinstance(value.get("dates"),list) and _ag_pick(value,"marketName","market_name","market","Market") is not None:
-                market_objects=[value]
-            for market in market_objects:
-                if not isinstance(market, dict):
-                    continue
-                mid=id(market)
-                if mid in seen:
-                    continue
-                seen.add(mid)
-                market_name=_ag_pick(market,"marketName","market_name","market","Market")
-                market_district=_ag_pick(market,"districtName","district_name","district","District")
-                market_state=_ag_pick(market,"stateName","state_name","state","State")
-                dates=market.get("dates")
-                if not isinstance(dates, list):
-                    continue
-                for date_block in dates:
-                    if not isinstance(date_block, dict):
-                        continue
-                    arrival_date=_ag_pick(date_block,"arrivalDate","arrival_date","date","Date")
-                    rows=date_block.get("data")
-                    if not isinstance(rows, list):
-                        continue
-                    for row in rows:
-                        if not isinstance(row, dict):
-                            continue
-                        merged=dict(row)
-                        if market_name is not None:
-                            merged.setdefault("market_name",market_name)
-                        if market_district is not None:
-                            merged.setdefault("district_name",market_district)
-                        if market_state is not None:
-                            merged.setdefault("state_name",market_state)
-                        if arrival_date is not None:
-                            merged.setdefault("arrival_date",arrival_date)
-                        out.append(merged)
-
-            for child in value.values():
-                if isinstance(child,(dict,list)):
-                    walk(child)
-        elif isinstance(value,list):
-            for child in value:
-                if isinstance(child,(dict,list)):
-                    walk(child)
-
-    walk(body)
-    if out:
-        return out
-
-    # Last-resort compatibility for a flat/alternate public response where
-    # price rows themselves are exposed without market/date nesting.
-    return [r for r in _ag_deep_rows(body) if _ag_price_row(r)]
-
-
-def _ag_daily_commodity_rows(body: Any) -> list[dict[str, Any]]:
-    """Flatten AGMARKNET 2.0 daily commodity/state responses.
-
-    This endpoint is date-scoped.  The response may wrap rows under
-    ``commodityGroups -> markets -> dates -> data`` or expose equivalent
-    nested dictionaries.  Context inherited from commodity/market/date
-    parents is copied onto each price row; no date or district is invented.
+    Current AGMARKNET 2.0 responses can use either ``markets -> dates -> data``
+    or ``commodityGroups -> commodities -> ...``.  Price rows must inherit
+    commodity/market/date context from their parents, but no date is invented.
     """
     out: list[dict[str, Any]] = []
     seen_price: set[int] = set()
 
-    def walk(value: Any, commodity_ctx=None, market_ctx=None, district_ctx=None, state_ctx=None, date_ctx=None):
+    def walk(value: Any, commodity_ctx=None, market_ctx=None,
+             district_ctx=None, state_ctx=None, date_ctx=None,
+             group_ctx=None):
         if isinstance(value, dict):
             commodity_here = _ag_pick(value,
-                "cmdt_name","cmdtName","commodity_name","commodityName","commodity","Commodity") or commodity_ctx
+                "cmdt_name", "cmdtName", "commodity_name", "commodityName",
+                "commodity", "Commodity") or commodity_ctx
             market_here = _ag_pick(value,
-                "market_name","marketName","market","Market") or market_ctx
+                "market_name", "marketName", "market", "Market") or market_ctx
             district_here = _ag_pick(value,
-                "district_name","districtName","district","District") or district_ctx
+                "district_name", "districtName", "district", "District") or district_ctx
             state_here = _ag_pick(value,
-                "state_name","stateName","state","State") or state_ctx
+                "state_name", "stateName", "state", "State") or state_ctx
             date_here = _ag_pick(value,
-                "arrival_date","arrivalDate","date","Date") or date_ctx
+                "arrival_date", "arrivalDate", "date", "Date",
+                "reportedDate", "reported_date") or date_ctx
+            group_here = _ag_pick(value,
+                "commodityGroup", "commodity_group", "CommodityGroup",
+                "cmdt_grp_name", "cmdtGrpName") or group_ctx
 
             if _ag_price_row(value):
-                oid=id(value)
+                oid = id(value)
                 if oid not in seen_price:
                     seen_price.add(oid)
-                    merged=dict(value)
+                    merged = dict(value)
                     if commodity_here is not None: merged.setdefault("commodity", commodity_here)
                     if market_here is not None: merged.setdefault("market_name", market_here)
                     if district_here is not None: merged.setdefault("district_name", district_here)
                     if state_here is not None: merged.setdefault("state_name", state_here)
                     if date_here is not None: merged.setdefault("arrival_date", date_here)
+                    if group_here is not None: merged.setdefault("commodity_group", group_here)
                     out.append(merged)
 
             for child in value.values():
-                if isinstance(child,(dict,list)):
-                    walk(child, commodity_here, market_here, district_here, state_here, date_here)
+                if isinstance(child, (dict, list)):
+                    walk(child, commodity_here, market_here, district_here,
+                         state_here, date_here, group_here)
         elif isinstance(value, list):
             for child in value:
-                if isinstance(child,(dict,list)):
-                    walk(child, commodity_ctx, market_ctx, district_ctx, state_ctx, date_ctx)
+                if isinstance(child, (dict, list)):
+                    walk(child, commodity_ctx, market_ctx, district_ctx,
+                         state_ctx, date_ctx, group_ctx)
 
     walk(body)
     return out
 
+
+def _ag_daily_commodity_rows(body: Any) -> list[dict[str, Any]]:
+    """Flatten AGMARKNET daily commodity/state responses without inventing dates."""
+    return _ag_report_rows(body)
 
 def _ag_response_shape(body: Any) -> dict[str, Any]:
     """Return safe structural diagnostics; never include values/prices/secrets."""
@@ -1896,31 +1835,96 @@ def mandi_markets(state: str = "Gujarat", commodity: str = "ALL"):
     if err:
         errors.append(err)
 
-    # The exact key can vary by frontend release. Restrict extraction to
-    # dictionaries that actually carry market identity; do not turn arbitrary
-    # text/commodity rows into market names.
-    if body is not None:
-        for row in _ag_deep_rows(body):
-            name = _ag_pick(row, "market_name", "marketName", "market", "Market", "market_name_en")
-            if name:
-                add_market(name, row)
+    # AGMARKNET filter payloads have changed their container names across
+    # releases (for example market_data / marketData / markets).  The previous
+    # implementation only looked for a market field inside already-flattened
+    # rows, so a valid filter payload could incorrectly produce count=0.
+    # Extract only explicit market identity fields/containers; never invent
+    # names from commodity or district text.
+    def collect_market_master(value: Any, parent_market_context: bool = False):
+        if isinstance(value, dict):
+            # Direct market identity fields.
+            for key in (
+                "market_name", "marketName", "market_name_en", "marketNameEn",
+                "market", "Market", "apmc_name", "apmcName", "apmc", "APMC",
+            ):
+                if key in value:
+                    candidate = value.get(key)
+                    if isinstance(candidate, str):
+                        add_market(candidate, value)
 
-    # Secondary official discovery: today's/previous two daily reports. This
-    # can recover names if the master payload is temporarily incomplete.
+            # Some releases use a list/dict under one of these explicit market
+            # containers. Recurse into those containers even when their child
+            # rows do not themselves contain a state field.
+            for key, child in value.items():
+                nk = str(key).lower().replace("_", "").replace("-", "")
+                is_market_container = (
+                    "marketdata" in nk or "marketmaster" in nk or
+                    nk in {"markets", "marketlist", "marketdetails", "apmcs", "apmclist"}
+                )
+                if is_market_container:
+                    collect_market_master(child, True)
+                elif isinstance(child, (dict, list)):
+                    collect_market_master(child, parent_market_context)
+        elif isinstance(value, list):
+            for child in value:
+                collect_market_master(child, parent_market_context)
+
+    if body is not None:
+        collect_market_master(body)
+
+    # Secondary official discovery: query the state-scoped daily report directly.
+    # This is deliberately NOT passed through the price validator because a
+    # market master must not disappear merely because today's price rows lack
+    # an explicit arrival_date.  The endpoint itself is already scoped to the
+    # requested state, so market names can safely be collected from its nested
+    # response without inventing price/date data.
     if not names:
+        async def fetch_state_daily_for_markets():
+            headers = {
+                "Accept": "application/json, text/plain, */*",
+                "Origin": "https://agmarknet.gov.in",
+                "Referer": "https://agmarknet.gov.in/",
+                "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/135 Safari/537.36",
+            }
+            timeout = httpx.Timeout(AGMARKNET_PUBLIC_TIMEOUT_SECONDS, connect=min(8.0, AGMARKNET_PUBLIC_TIMEOUT_SECONDS))
+            async with httpx.AsyncClient(base_url=AGMARKNET_PUBLIC_BASE, headers=headers, timeout=timeout) as client:
+                try:
+                    sr = await client.get("/location/state", params={"page": 1, "search": state_name})
+                    if sr.status_code != 200:
+                        return None, f"HTTP {sr.status_code}"
+                    sb = sr.json()
+                    sid = None
+                    for row in _ag_deep_rows(sb):
+                        nm = str(_ag_pick(row, "name", "state_name", "stateName", "State", "state") or "").strip()
+                        candidate = _ag_pick(row, "id", "state_id", "stateId", "stateCode")
+                        if nm and candidate is not None and _norm_mandi_text(nm) == state_key:
+                            sid = int(candidate); break
+                    if sid is None:
+                        return None, "AGMARKNET state resolution failed"
+                    day = datetime.now(timezone(timedelta(hours=5, minutes=30))).date().isoformat()
+                    rr = await client.get("/prices-and-arrivals/commodity-market/daily-report-state",
+                                          params={"date": day, "state": sid, "includeExcel": "false"})
+                    if rr.status_code != 200:
+                        return None, f"HTTP {rr.status_code}"
+                    return rr.json(), ""
+                except Exception as exc:
+                    return None, f"{type(exc).__name__}: {str(exc)[:180]}"
         try:
-            ag_records, ag_error = asyncio.run(_fetch_agmarknet_2_live(state_name, "", "ALL"))
+            raw_body, ag_error = asyncio.run(fetch_state_daily_for_markets())
         except RuntimeError:
-            def _market_runner(): return asyncio.run(_fetch_agmarknet_2_live(state_name, "", "ALL"))
+            def _market_runner(): return asyncio.run(fetch_state_daily_for_markets())
             with ThreadPoolExecutor(max_workers=1) as pool:
-                ag_records, ag_error = pool.submit(_market_runner).result(timeout=AGMARKNET_PUBLIC_TIMEOUT_SECONDS * 4 + 5)
+                raw_body, ag_error = pool.submit(_market_runner).result(timeout=AGMARKNET_PUBLIC_TIMEOUT_SECONDS * 2 + 5)
         except Exception as exc:
-            ag_records, ag_error = [], f"{type(exc).__name__}: {str(exc)[:160]}"
+            raw_body, ag_error = None, f"{type(exc).__name__}: {str(exc)[:160]}"
         if ag_error:
             errors.append(ag_error)
-        for row in ag_records:
-            if isinstance(row, dict):
-                add_market(_ag_pick(row, "market", "market_name", "marketName", "Market"), row)
+        if raw_body is not None:
+            for row in _ag_deep_rows(raw_body):
+                name = _ag_pick(row, "market_name", "marketName", "market", "Market")
+                if name:
+                    add_market(name)
 
     print(f"[MANDI_DEBUG] agmarknet_market_master state={state_name!r} count={len(names)}")
     return {
