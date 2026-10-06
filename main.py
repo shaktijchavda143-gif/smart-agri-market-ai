@@ -167,24 +167,6 @@ def health():
 NEWS_DEFAULT_MAX_AGE_HOURS = 48
 NEWS_FALLBACK_MAX_AGE_HOURS = 168
 
-def _news_max_age_hours() -> int:
-    try:
-        value = int(os.getenv("NEWS_MAX_AGE_HOURS", str(NEWS_DEFAULT_MAX_AGE_HOURS)))
-        return max(1, min(value, 168))
-    except Exception:
-        return NEWS_DEFAULT_MAX_AGE_HOURS
-
-def _parse_news_date(value: str):
-    if not value:
-        return None
-    try:
-        dt = parsedate_to_datetime(value)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(timezone.utc)
-    except Exception:
-        return None
-
 class _VisibleTextParser(HTMLParser):
     """Convert publisher HTML to readable text while preserving table/row boundaries."""
     SKIP_TAGS = {"script", "style", "noscript", "svg"}
@@ -962,15 +944,21 @@ MANDI_RESOURCE_ID = os.getenv("DATA_GOV_RESOURCE_ID", "9ef84268-d588-465a-a308-a
 MANDI_API_KEY = os.getenv("DATA_GOV_API_KEY", "").strip()
 MANDI_API_HOST = "api.data.gov.in"
 MANDI_API_SCHEME = "https"
-MANDI_API_TIMEOUT_SECONDS = _mandi_env_seconds("MANDI_TIMEOUT_SECONDS", 20, 5, 60)
+MANDI_API_TIMEOUT_SECONDS = _mandi_env_seconds("MANDI_TIMEOUT_SECONDS", 10, 5, 30)
 MANDI_RATE_LIMIT_COOLDOWN_SECONDS = _mandi_env_seconds("MANDI_RATE_LIMIT_COOLDOWN_SECONDS", 900, 60, 86400)
+MANDI_PAGE_SIZE = _mandi_env_seconds("MANDI_PAGE_SIZE", 100, 25, 500)
+MANDI_MAX_PAGES = _mandi_env_seconds("MANDI_MAX_PAGES", 5, 1, 20)
+MANDI_SUMMARY_CROPS = ("મગફળી", "કપાસ", "જીરું", "એરંડા", "ડુંગળી")
 # Optional secondary Agmarknet-derived source. It is NEVER used unless a real
 # CEDA response is received and every returned row passes the freshness and
 # price/provenance checks below. No sample/mock values are permitted.
 CEDA_API_KEY = os.getenv("CEDA_API_KEY", "").strip()
 CEDA_API_BASE = os.getenv("CEDA_API_BASE", "https://api.ceda.ashoka.edu.in/v1").strip().rstrip("/")
 MANDI_FALLBACK_MAX_AGE_HOURS = _mandi_env_seconds("MANDI_FALLBACK_MAX_AGE_HOURS", 48, 1, 168)
-MANDI_CEDA_TIMEOUT_SECONDS = _mandi_env_seconds("MANDI_CEDA_TIMEOUT_SECONDS", 20, 5, 60)
+MANDI_CEDA_TIMEOUT_SECONDS = _mandi_env_seconds("MANDI_CEDA_TIMEOUT_SECONDS", 8, 3, 30)
+# Hard wall-clock budget for one Live Mandi crop request, including primary
+# source + official fallback. This keeps Android retries predictable.
+MANDI_TOTAL_BUDGET_SECONDS = _mandi_env_seconds("MANDI_TOTAL_BUDGET_SECONDS", 30, 10, 45)
 _mandi_rate_limit_until: dict[str, float] = {}
 _mandi_global_rate_limit_until: float = 0.0
 _mandi_lock = threading.RLock()
@@ -1065,6 +1053,8 @@ def _mandi_normalized_result(payload: dict[str, Any], requested_commodity: str, 
     return {
         **payload,
         "records": normalized,
+        "latest_arrival_date": normalized[0].get("arrival_date", "") if normalized else latest_date,
+        "latest_arrival_date_iso": normalized[0].get("arrival_date_iso", "") if normalized else "",
         "_diagnostics": {
             "raw_record_count": len(raw_records),
             "raw_sample_keys": raw_keys[:30],
@@ -1113,7 +1103,7 @@ def _mandi_log_exception(exc: BaseException, *, http_status: int = 0) -> None:
     )
 
 
-def _mandi_api_get(state: str, market: str, commodity: str):
+def _mandi_api_get(state: str, market: str, commodity: str, request_deadline: float | None = None):
     """Fetch exclusively from the official data.gov.in Mandi API.
 
     No cache, stale snapshot, news price, article extraction, calculated price,
@@ -1148,20 +1138,41 @@ def _mandi_api_get(state: str, market: str, commodity: str):
     # is an honest official empty result; it must not trigger another query.
     rate_key = "|".join((state.lower(), market.lower(), api_commodity.lower()))
     now = time.monotonic()
+    # The lock protects only shared cooldown state. Never hold it while doing
+    # upstream network I/O, otherwise one slow farmer request can block every
+    # other farmer's Mandi request in the same backend process.
     with _mandi_lock:
         cooldown_until = max(_mandi_rate_limit_until.get(rate_key, 0.0), _mandi_global_rate_limit_until)
-        if cooldown_until > now:
-            print(
-                "[MANDI_DEBUG] official_api_rate_limit_cooldown "
-                f"state={state!r} market={market!r} commodity={normalized_commodity!r}"
-            )
-            return None, "Live Mandi API limit પર છે; થોડા સમય પછી ફરી પ્રયાસ કરો."
+    if cooldown_until > now:
+        print(
+            "[MANDI_DEBUG] official_api_rate_limit_cooldown "
+            f"state={state!r} market={market!r} commodity={normalized_commodity!r}"
+        )
+        return None, "Live Mandi API limit પર છે; થોડા સમય પછી ફરી પ્રયાસ કરો."
 
+    path = "/resource/" + MANDI_RESOURCE_ID
+    print(
+        "[MANDI_DEBUG] official_api_request "
+        f"scheme={MANDI_API_SCHEME!r} host={MANDI_API_HOST!r} path={path!r} "
+        f"state={state!r} market={market!r} commodity={normalized_commodity!r} "
+        f"page_size={MANDI_PAGE_SIZE} max_pages={MANDI_MAX_PAGES} "
+        f"timeout_seconds={MANDI_API_TIMEOUT_SECONDS}"
+    )
+
+    last_error = "Live Mandi service હાલમાં ઉપલબ્ધ નથી."
+    last_status = 0
+    deadline = request_deadline
+    aggregated=[]
+    last_normalized=None
+    for page in range(MANDI_MAX_PAGES):
+        if deadline is not None and time.monotonic() >= deadline:
+            return None, "Live Mandi માટે સમય મર્યાદા પૂરી થઈ ગઈ.", 0, last_status
+        offset = page * MANDI_PAGE_SIZE
         params = {
             "api-key": MANDI_API_KEY,
             "format": "json",
-            "limit": "100",
-            "offset": "0",
+            "limit": str(MANDI_PAGE_SIZE),
+            "offset": str(offset),
         }
         if state:
             params["filters[state]"] = state
@@ -1169,19 +1180,10 @@ def _mandi_api_get(state: str, market: str, commodity: str):
             params["filters[market]"] = market
         if api_commodity:
             params["filters[commodity]"] = api_commodity
-
-        path = "/resource/" + MANDI_RESOURCE_ID
         url = f"{MANDI_API_SCHEME}://{MANDI_API_HOST}{path}?" + urllib.parse.urlencode(params)
-        print(
-            "[MANDI_DEBUG] official_api_request "
-            f"scheme={MANDI_API_SCHEME!r} host={MANDI_API_HOST!r} path={path!r} "
-            f"state={state!r} market={market!r} commodity={normalized_commodity!r} "
-            f"timeout_seconds={MANDI_API_TIMEOUT_SECONDS}"
-        )
-
-        last_error = "Live Mandi service હાલમાં ઉપલબ્ધ નથી."
-        last_status = 0
         for attempt in range(2):
+            if deadline is not None and time.monotonic() >= deadline:
+                return None, "Live Mandi માટે સમય મર્યાદા પૂરી થઈ ગઈ.", 0, last_status
             req = urllib.request.Request(
                 url,
                 headers={
@@ -1190,13 +1192,15 @@ def _mandi_api_get(state: str, market: str, commodity: str):
                 },
             )
             try:
-                with urllib.request.urlopen(req, timeout=MANDI_API_TIMEOUT_SECONDS) as response:
+                remaining = MANDI_API_TIMEOUT_SECONDS if deadline is None else max(0.5, min(float(MANDI_API_TIMEOUT_SECONDS), deadline - time.monotonic()))
+                with urllib.request.urlopen(req, timeout=remaining) as response:
                     status = int(getattr(response, "status", 200) or 200)
                     content_type = str((getattr(response, "headers", None) or {}).get("Content-Type", ""))
                     body = response.read()
                     print(
                         "[MANDI_DEBUG] official_api_response "
-                        f"http_status={status} content_type={content_type!r} response_bytes={len(body)}"
+                        f"page={page + 1} offset={offset} http_status={status} "
+                        f"content_type={content_type!r} response_bytes={len(body)}"
                     )
                     try:
                         payload = json.loads(body.decode("utf-8", "ignore"))
@@ -1207,22 +1211,52 @@ def _mandi_api_get(state: str, market: str, commodity: str):
                         exc = TypeError(f"Expected JSON object, got {type(payload).__name__}")
                         _mandi_log_exception(exc, http_status=status)
                         return None, "Live Mandi API response format error.", 0, status
-                    normalized = _mandi_normalized_result(payload, normalized_commodity, fallback_used=False)
-                    normalized["_diagnostics"]["http_status"] = status
-                    normalized["_diagnostics"]["attempt"] = attempt + 1
-                    _mandi_rate_limit_until.pop(rate_key, None)
-                    _mandi_global_rate_limit_until = 0.0
-                    return normalized, "", 0, status
+                    page_rows = payload.get("records") or []
+                    if not isinstance(page_rows, list): page_rows=[]
+                    aggregated.extend(page_rows)
+                    print(f"[MANDI_DEBUG] official_api_page rows={len(page_rows)} aggregated={len(aggregated)}")
+                    # A short page proves there is no next page.  A full page
+                    # means another page may exist, so continue until a short
+                    # page is received or MANDI_MAX_PAGES is reached.
+                    if len(page_rows) < MANDI_PAGE_SIZE:
+                        # Pagination is complete; normalize after all fetched
+                        # pages have been aggregated so latest-date selection
+                        # sees the complete bounded result set.
+                        normalized = _mandi_normalized_result({"records": aggregated}, normalized_commodity, fallback_used=False)
+                        normalized["_diagnostics"]["pagination_complete"] = True
+                        normalized["_diagnostics"]["pagination_reason"] = "short_page"
+                        normalized["_diagnostics"]["http_status"] = status
+                        normalized["_diagnostics"]["pages_fetched"] = page + 1
+                        normalized["_diagnostics"]["page_size"] = MANDI_PAGE_SIZE
+                        normalized["_diagnostics"]["raw_record_count"] = len(aggregated)
+                        with _mandi_lock:
+                            _mandi_rate_limit_until.pop(rate_key, None)
+                            _mandi_global_rate_limit_until = 0.0
+                        return normalized, "", 0, status
+
+                    if page + 1 >= MANDI_MAX_PAGES:
+                        normalized = _mandi_normalized_result({"records": aggregated}, normalized_commodity, fallback_used=False)
+                        normalized["_diagnostics"]["pagination_complete"] = False
+                        normalized["_diagnostics"]["pagination_reason"] = "max_pages_reached"
+                        normalized["_diagnostics"]["http_status"] = status
+                        normalized["_diagnostics"]["pages_fetched"] = page + 1
+                        normalized["_diagnostics"]["page_size"] = MANDI_PAGE_SIZE
+                        normalized["_diagnostics"]["raw_record_count"] = len(aggregated)
+                        with _mandi_lock:
+                            _mandi_rate_limit_until.pop(rate_key, None)
+                            _mandi_global_rate_limit_until = 0.0
+                        return normalized, "", 0, status
+
+                    # Full page and another page remains: continue the bounded
+                    # pagination loop.
             except urllib.error.HTTPError as exc:
                 last_status = int(exc.code or 0)
-                print(
-                    "[MANDI_DEBUG] official_api_http_error "
-                    f"http_status={last_status} attempt={attempt + 1}"
-                )
+                print(f"[MANDI_DEBUG] official_api_http_error page={page + 1} http_status={last_status} attempt={attempt + 1}")
                 if last_status == 429:
                     cooldown = _mandi_retry_after_seconds(exc)
-                    _mandi_rate_limit_until[rate_key] = time.monotonic() + cooldown
-                    _mandi_global_rate_limit_until = time.monotonic() + cooldown
+                    with _mandi_lock:
+                        _mandi_rate_limit_until[rate_key] = time.monotonic() + cooldown
+                        _mandi_global_rate_limit_until = time.monotonic() + cooldown
                     return None, f"Live Mandi API limit પર છે; server cooldown {cooldown} સેકન્ડ માટે સક્રિય છે.", cooldown, last_status
                 if last_status in (401, 403):
                     return None, "Live Mandi API authentication/permission error.", 0, last_status
@@ -1230,27 +1264,16 @@ def _mandi_api_get(state: str, market: str, commodity: str):
                 if last_status not in (502, 503, 504):
                     return None, last_error, 0, last_status
             except urllib.error.URLError as exc:
-                last_status = 0
-                _mandi_log_exception(exc, http_status=0)
-                last_error = "Live Mandi service હાલમાં ઉપલબ્ધ નથી."
+                last_status = 0; _mandi_log_exception(exc, http_status=0); last_error = "Live Mandi service હાલમાં ઉપલબ્ધ નથી."
             except TimeoutError as exc:
-                last_status = 0
-                _mandi_log_exception(exc, http_status=0)
-                last_error = "Live Mandi API timeout થયો."
+                last_status = 0; _mandi_log_exception(exc, http_status=0); last_error = "Live Mandi API timeout થયો."
             except Exception as exc:
-                last_status = 0
-                _mandi_log_exception(exc, http_status=0)
-                last_error = "Live Mandi service હાલમાં ઉપલબ્ધ નથી."
-
+                last_status = 0; _mandi_log_exception(exc, http_status=0); last_error = "Live Mandi service હાલમાં ઉપલબ્ધ નથી."
             if attempt < 1:
-                time.sleep(1.0)
-
-        print(
-            "[MANDI_DEBUG] official_api_final_failure "
-            f"http_status={last_status} error={last_error!r}"
-        )
-        return None, last_error, 0, last_status
-
+                sleep_for = 1.0 if deadline is None else min(1.0, max(0.0, deadline - time.monotonic()))
+                if sleep_for > 0: time.sleep(sleep_for)
+    print(f"[MANDI_DEBUG] official_api_final_failure http_status={last_status} error={last_error!r}")
+    return None, last_error, 0, last_status
 # CEDA metadata is auxiliary only. A rate limit on /agmarknet/commodities must
 # never be allowed to masquerade as a price-endpoint failure. Keep a small
 # process-local cache so repeated farmer requests do not hammer metadata.
@@ -1392,7 +1415,7 @@ def _ag_response_shape(body: Any) -> dict[str, Any]:
             info["first_item_keys"]=list(body[0].keys())[:30]
     return info
 
-async def _fetch_agmarknet_2_live(state: str, market: str, commodity: str) -> tuple[list[dict[str, Any]], str]:
+async def _fetch_agmarknet_2_live(state: str, market: str, commodity: str, request_deadline: float | None = None) -> tuple[list[dict[str, Any]], str]:
     requested=(commodity or "ALL").strip() or "ALL"
     wanted=GUJARATI_CROP_ALIASES.get(requested, requested)
     state_name=(state or "Gujarat").strip()
@@ -1401,7 +1424,10 @@ async def _fetch_agmarknet_2_live(state: str, market: str, commodity: str) -> tu
     async with httpx.AsyncClient(base_url=AGMARKNET_PUBLIC_BASE,headers=headers,timeout=timeout) as client:
         async def get(path,params=None):
             try:
-                r=await client.get(path,params=params)
+                if request_deadline is not None and time.monotonic() >= request_deadline:
+                    return None,"mandi_total_budget_exceeded"
+                remaining = AGMARKNET_PUBLIC_TIMEOUT_SECONDS if request_deadline is None else max(0.5, min(float(AGMARKNET_PUBLIC_TIMEOUT_SECONDS), request_deadline - time.monotonic()))
+                r=await client.get(path,params=params,timeout=remaining)
                 if r.status_code!=200: return None,f"HTTP {r.status_code}"
                 return r.json(),""
             except Exception as exc: return None,f"{type(exc).__name__}: {str(exc)[:180]}"
@@ -2026,12 +2052,84 @@ def _normalise_mandi_records(records: list[dict[str, Any]]) -> list[dict[str, An
             "min_price_20kg": _price_per_20kg(min_price),
             "modal_price_20kg": _price_per_20kg(modal_price),
             "max_price_20kg": _price_per_20kg(max_price),
+            # Derived midpoint, not a traded/observed market average.
+            "midpoint_price": _price_float(min_price) + ((_price_float(max_price) - _price_float(min_price)) / 2.0),
+            "midpoint_price_20kg": _price_per_20kg(str((_price_float(min_price) + _price_float(max_price)) / 2.0)),
             "price_unit_source": "₹/quintal",
             "display_price_unit": "₹/20kg",
             "source": pick(row, "source"),
             "source_url": pick(row, "source_url"),
         })
+    normalized.sort(key=lambda row: (
+        row.get("arrival_date_iso", ""),
+        _price_float(row.get("modal_price")) or -1.0,
+        _norm_mandi_market(row.get("market", "")),
+    ), reverse=True)
+    now_date = datetime.now(timezone(timedelta(hours=5, minutes=30))).date()
+    for row in normalized:
+        try:
+            row_date = datetime.fromisoformat(row.get("arrival_date_iso", "")).date()
+            age_days = max(0, (now_date - row_date).days)
+        except Exception:
+            age_days = None
+        row["age_days"] = age_days
+        if age_days == 0:
+            row["freshness_status"] = "today"
+            row["freshness_label_gu"] = "આજનો અધિકૃત ભાવ"
+        elif age_days == 1:
+            row["freshness_status"] = "recent"
+            row["freshness_label_gu"] = "ગઈકાલનો અધિકૃત ભાવ"
+        elif isinstance(age_days, int):
+            row["freshness_status"] = "recent"
+            row["freshness_label_gu"] = f"{age_days} દિવસ જૂનો અધિકૃત ભાવ"
+        else:
+            row["freshness_status"] = "unknown"
+            row["freshness_label_gu"] = "તારીખ ચકાસો"
     return normalized
+
+_GUJARATI_MARKET_NAME_MAP = {
+    "rajkot":"રાજકોટ", "gondal":"ગોંડલ", "jetpur":"જેતપુર", "morbi":"મોરબી",
+    "jamnagar":"જામનગર", "junagadh":"જુનાગઢ", "amreli":"અમરેલી", "bhavnagar":"ભાવનગર",
+    "surendranagar":"સુરેન્દ્રનગર", "mehsana":"મહેસાણા", "patan":"પાટણ", "palanpur":"પાલનપુર",
+    "deesa":"ડીસા", "visnagar":"વિસનગર", "himmatnagar":"હિંમતનગર", "anand":"આણંદ",
+    "nadiad":"નડિયાદ", "bharuch":"ભરૂચ", "ankleshwar":"અંકલેશ્વર", "surat":"સુરત",
+    "navsari":"નવસારી", "valsad":"વલસાડ", "vadodara":"વડોદરા", "ahmedabad":"અમદાવાદ",
+    "botad":"બોટાદ", "bhuj":"ભુજ", "gandhidham":"ગાંધીધામ", "dahod":"દાહોદ",
+    "godhra":"ગોધરા", "panchmahal":"પંચમહાલ", "dhoraji":"ધોરાજી", "upleta":"ઉપલેટા",
+    "manavadar":"માણાવદર", "mangrol":"માંગરોળ", "porbandar":"પોરબંદર", "dwarka":"દ્વારકા",
+    "kalavad":"કાલાવડ", "jamjodhpur":"જામજોધપુર", "lalpur":"લાલપુર", "tankara":"ટંકારા",
+    "halvad":"હળવદ", "wankaner":"વાંકાનેર", "maliya":"માળિયા", "chotila":"ચોટીલા",
+    "limbdi":"લીંબડી", "dhrangadhra":"ધ્રાંગધ્રા", "sayla":"સાયલા", "viramgam":"વિરમગામ",
+    "dholka":"ધોળકા", "bavla":"બાવળા", "sanand":"સાણંદ", "kalol":"કલોલ", "kadi":"કડી",
+    "sidhpur":"સિદ્ધપુર", "unja":"ઊંઝા", "visavadar":"વિસાવદર", "bantwa":"બાંટવા",
+    "bagasara":"બગસરા", "savarkundla":"સાવરકુંડલા", "dhari":"ધારી", "rajula":"રાજુલા",
+    "mahuva":"મહુવા", "talaja":"તળાજા", "palitana":"પાલીતાણા", "gariadhar":"ગારીયાધાર",
+    "babra":"બાબરા", "jasdan":"જસદણ", "dhrol":"ધ્રોલ", "keshod":"કેશોદ",
+    "kodinar":"કોડીનાર", "mendarda":"મેંદરડા", "talala":"તાલાલા", "una":"ઉના",
+    "maliya hatina":"માળિયા હાટીના", "anjar":"અંજાર", "mandvi":"માંડવી", "mundra":"મુંદ્રા",
+    "rapar":"રાપર", "mansa":"માણસા", "vijapur":"વિજાપુર", "kheralu":"ખેરાલુ",
+    "vadnagar":"વડનગર", "modasa":"મોડાસા", "bayad":"બાયડ", "kapadvanj":"કપડવંજ",
+    "petlad":"પેટલાદ", "borsad":"બોરસદ", "khambhat":"ખંભાત", "jambusar":"જંબુસર",
+    "vagra":"વાગરા", "bardoli":"બારડોલી", "kamrej":"કામરેજ", "chikhli":"ચીખલી",
+    "dharampur":"ધરમપુર", "umbergaon":"ઉમરગામ", "dabhoi":"ડભોઈ", "padra":"પાદરા",
+    "karjan":"કરજણ", "savli":"સાવલી", "halol":"હાલોલ", "lunawada":"લુણાવાડા",
+    "jhalod":"ઝાલોદ", "limkheda":"લીમખેડા", "devgadh baria":"દેવગઢ બારિયા",
+    "santrampur":"સંતરામપુર", "mandvi kutch":"માંડવી", "mundra apmc":"મુંદ્રા"
+}
+
+def _mandi_market_display_gu(raw: str) -> str:
+    clean=str(raw or "").strip()
+    if not clean: return "યાર્ડ"
+    key=_norm_mandi_market(clean)
+    base=_GUJARATI_MARKET_NAME_MAP.get(key)
+    if base: return f"{base} યાર્ડ"
+    # Safe generic display: preserve official name separately, but make the UI
+    # immediately understandable even for a newly added market.
+    cleaned=re.sub(r"\bAPMC\b", "", clean, flags=re.I)
+    cleaned=re.sub(r"\bAgricultural Produce Market Committee\b", "", cleaned, flags=re.I)
+    cleaned=re.sub(r"\bMarket Yard\b|\bYard\b|\bMarket\b", "", cleaned, flags=re.I)
+    cleaned=" ".join(cleaned.split()).strip(" -,")
+    return f"{cleaned} યાર્ડ" if cleaned else "કૃષિ બજાર યાર્ડ"
 
 @app.get("/api/v1/mandi/markets")
 def mandi_markets(state: str = "Gujarat", commodity: str = "ALL"):
@@ -2236,10 +2334,81 @@ def mandi_markets(state: str = "Gujarat", commodity: str = "ALL"):
 
     names=sorted(names,key=lambda x:_norm_mandi_market(x))
     print(f"[MANDI_DEBUG] agmarknet_market_master state={state_name!r} count={len(names)}")
-    return {"ok":bool(names),"state":state_name,"commodity":"ALL","markets":names[:2000],"count":len(names),"source":"AGMARKNET 2.0","source_url":"https://agmarknet.gov.in/home","errors":errors[:10]}
+    options=[{"official_name":name,"display_name_gu":_mandi_market_display_gu(name)} for name in names[:2000]]
+    return {"ok":bool(names),"state":state_name,"commodity":"ALL","markets":names[:2000],"market_options":options,"count":len(names),"source":"AGMARKNET 2.0","source_url":"https://agmarknet.gov.in/home","errors":errors[:10]}
+
+@app.get("/api/v1/mandi/today-summary/crop")
+def mandi_today_summary_crop(state: str = "Gujarat", market: str = "", commodity: str = ""):
+    """Fetch one approved crop with a bounded total wall-clock budget."""
+    requested = (commodity or "").strip()
+    allowed_crops = set(MANDI_SUMMARY_CROPS) | set(GUJARATI_CROP_ALIASES.keys()) | set(GUJARATI_CROP_ALIASES.values())
+    if requested not in allowed_crops:
+        return {
+            "ok": False, "live_available": False, "crop": requested or "પાક",
+            "records": [], "message": "આ પાક માટે Live ભાવ તપાસવાની મંજૂરી નથી.",
+            "live_error": "unsupported_summary_crop"
+        }
+    started = time.monotonic()
+    checked_at = datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=5, minutes=30))).strftime("%d-%m-%Y %H:%M")
+    try:
+        payload = mandi(
+            state=state, market=market, commodity=requested,
+            request_deadline=started + MANDI_TOTAL_BUDGET_SECONDS,
+        )
+    except Exception as exc:
+        payload = {"ok": False, "live_available": False, "source": "none", "records": [],
+                   "message": "આ પાક માટે બજાર ભાવ તપાસી શકાયા નથી.",
+                   "live_error": f"{type(exc).__name__}: {str(exc)[:160]}"}
+    records = payload.get("records") if isinstance(payload, dict) else []
+    if not isinstance(records, list): records = []
+    elapsed = round(time.monotonic() - started, 2)
+    return {
+        "ok": bool(payload.get("ok", False)) if isinstance(payload, dict) else False,
+        "crop": requested,
+        "live_available": bool(payload.get("live_available", False)) if isinstance(payload, dict) else False,
+        "source": str(payload.get("source", "") or "") if isinstance(payload, dict) else "",
+        "checked_at": str(payload.get("checked_at", checked_at) or checked_at) if isinstance(payload, dict) else checked_at,
+        "message": str(payload.get("message", "") or "") if isinstance(payload, dict) else "",
+        "live_error": str(payload.get("live_error", "") or "") if isinstance(payload, dict) else "",
+        "records": records[:100],
+        "latest_arrival_date": payload.get("latest_arrival_date", "") if isinstance(payload, dict) else "",
+        "source_policy": "AGMARKNET 2.0 primary + official data.gov.in fallback + validated CEDA fallback",
+        "request_budget_seconds": MANDI_TOTAL_BUDGET_SECONDS,
+        "elapsed_seconds": elapsed,
+    }
+
+@app.get("/api/v1/mandi/today-summary")
+def mandi_today_summary(state: str = "Gujarat", market: str = ""):
+    """Sequential farmer summary for the five primary Gujarat crops.
+
+    Each crop is fetched independently through the existing verified /mandi
+    flow, so one crop's API limit/error cannot suppress the others. The Android
+    client can use the crop endpoint above for progressive rendering, while
+    this endpoint remains the compact all-crops compatibility API.
+    """
+    checked_at = datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=5, minutes=30))).strftime("%d-%m-%Y %H:%M")
+    items=[]
+    for crop in MANDI_SUMMARY_CROPS:
+        try:
+            payload=mandi(state=state, market=market, commodity=crop)
+        except Exception as exc:
+            payload={"ok":False,"live_available":False,"source":"none","records":[],"message":"આ પાક માટે બજાર ભાવ તપાસી શકાયા નથી.","live_error":f"{type(exc).__name__}: {str(exc)[:160]}"}
+        records=payload.get("records") if isinstance(payload,dict) else []
+        if not isinstance(records,list): records=[]
+        items.append({
+            "crop":crop,
+            "live_available":bool(payload.get("live_available",False)) if isinstance(payload,dict) else False,
+            "source":str(payload.get("source","") or "") if isinstance(payload,dict) else "",
+            "checked_at":str(payload.get("checked_at",checked_at) or checked_at) if isinstance(payload,dict) else checked_at,
+            "message":str(payload.get("message","") or "") if isinstance(payload,dict) else "",
+            "live_error":str(payload.get("live_error","") or "") if isinstance(payload,dict) else "",
+            "records":records[:100]
+        })
+    available=sum(1 for x in items if x["live_available"] and x["records"])
+    return {"ok":True,"state":(state or "Gujarat").strip() or "Gujarat","market":(market or "").strip(),"checked_at":checked_at,"items":items,"available_crops":available,"total_crops":len(items),"source_policy":"AGMARKNET 2.0 primary + official data.gov.in fallback + validated CEDA fallback"}
 
 @app.get("/api/v1/mandi")
-def mandi(state: str = "Gujarat", market: str = "", commodity: str = "ALL"):
+def mandi(state: str = "Gujarat", market: str = "", commodity: str = "ALL", request_deadline: float | None = None):
     """Official live Mandi endpoint.
 
     Fast path: AGMARKNET 2.0 public backend, because it is the currently
@@ -2251,15 +2420,19 @@ def mandi(state: str = "Gujarat", market: str = "", commodity: str = "ALL"):
         timezone(timedelta(hours=5, minutes=30))
     ).strftime("%d-%m-%Y %H:%M")
     requested_commodity=(commodity or "ALL").strip() or "ALL"
+    deadline = request_deadline if request_deadline is not None else (time.monotonic() + MANDI_TOTAL_BUDGET_SECONDS)
+    if time.monotonic() >= deadline:
+        return {"ok": True, "live_available": False, "live_api_configured": bool(MANDI_API_KEY), "source": "none", "checked_at": checked_at, "records": [], "message": "Live Mandi માટે સમય મર્યાદા પૂરી થઈ ગઈ.", "live_error": "mandi_total_budget_exceeded"}
 
     # 1) FAST PRIMARY: verified AGMARKNET 2.0 live path.
     try:
-        ag_records, ag_error = asyncio.run(_fetch_agmarknet_2_live(state, market, requested_commodity))
-    except RuntimeError:
-        def _ag_runner():
-            return asyncio.run(_fetch_agmarknet_2_live(state, market, requested_commodity))
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            ag_records, ag_error = pool.submit(_ag_runner).result(timeout=AGMARKNET_PUBLIC_TIMEOUT_SECONDS * 4 + 5)
+        remaining = max(0.5, deadline - time.monotonic())
+        async def _ag_bounded():
+            return await asyncio.wait_for(
+                _fetch_agmarknet_2_live(state, market, requested_commodity, request_deadline=deadline),
+                timeout=remaining,
+            )
+        ag_records, ag_error = asyncio.run(_ag_bounded())
     except Exception as exc:
         ag_records, ag_error = [], f"{type(exc).__name__}: {str(exc)[:180]}"
 
@@ -2277,14 +2450,17 @@ def mandi(state: str = "Gujarat", market: str = "", commodity: str = "ALL"):
                 "display_price_unit":"₹/20kg",
                 "records":normalized[:100],
                 "message":"Live AGMARKNET ભાવ મળ્યા.",
+                "latest_arrival_date": (normalized[0].get("arrival_date") if normalized else ""),
                 "diagnostics":{"primary":{"request_ok":True,"records":len(normalized),"source":"agmarknet_2_public"},"fallback":{"attempted":False,"source":"data.gov.in"}}
             }
     print(f"[MANDI_DEBUG] fast_primary_failed source='agmarknet_2_public' error={ag_error!r}")
 
-    # 2) SECONDARY OFFICIAL FALLBACK: data.gov.in.  This is deliberately after
+    # 2) SECONDARY OFFICIAL FALLBACK: data.gov.in.
+    if time.monotonic() >= deadline:
+        return {"ok": True, "live_available": False, "live_api_configured": bool(MANDI_API_KEY), "source": "none", "checked_at": checked_at, "records": [], "message": "Live Mandi માટે સમય મર્યાદા પૂરી થઈ ગઈ.", "live_error": "mandi_total_budget_exceeded"}
     # AGMARKNET so a known-working request is never delayed by a blocked
     # data.gov.in connection.
-    result=_mandi_api_get(state,market,requested_commodity)
+    result=_mandi_api_get(state,market,requested_commodity,request_deadline=deadline)
     if len(result)==4:
         data,error,_cooldown,upstream_status=result
     else:
@@ -2304,26 +2480,31 @@ def mandi(state: str = "Gujarat", market: str = "", commodity: str = "ALL"):
                 "source":"official_api","checked_at":checked_at,
                 "price_unit_source":"₹/quintal (data.gov.in)","display_price_unit":"₹/20kg",
                 "records":records[:100],"message":"Live Government Mandi ભાવ મળ્યા.",
+                "latest_arrival_date": (records[0].get("arrival_date") if records else ""),
                 "diagnostics":{"primary":{"request_ok":False,"records":0,"source":"agmarknet_2_public","error":ag_error or "no_records"},"fallback":{"request_ok":True,"http_status":http_status,"records":len(records),"source":"data.gov.in","raw_records":raw_count}}
             }
 
     # 3) Optional CEDA fallback remains only after both official paths fail.
+    if time.monotonic() >= deadline:
+        return {"ok": True, "live_available": False, "live_api_configured": bool(MANDI_API_KEY), "source": "none", "checked_at": checked_at, "records": [], "message": "Live Mandi માટે સમય મર્યાદા પૂરી થઈ ગઈ.", "live_error": "mandi_total_budget_exceeded"}
     if market:
         ceda_records,ceda_error=[],"CEDA skipped because requested market requires direct market-level provenance"
     else:
         try:
-            ceda_records,ceda_error=asyncio.run(_fetch_ceda_fresh_mandi(state,"",requested_commodity))
-        except RuntimeError:
-            def _runner(): return asyncio.run(_fetch_ceda_fresh_mandi(state,"",requested_commodity))
-            with ThreadPoolExecutor(max_workers=1) as pool:
-                ceda_records,ceda_error=pool.submit(_runner).result(timeout=MANDI_CEDA_TIMEOUT_SECONDS+5)
+            remaining = max(0.5, deadline - time.monotonic())
+            async def _ceda_bounded():
+                return await asyncio.wait_for(
+                    _fetch_ceda_fresh_mandi(state,"",requested_commodity),
+                    timeout=min(float(MANDI_CEDA_TIMEOUT_SECONDS), remaining),
+                )
+            ceda_records,ceda_error=asyncio.run(_ceda_bounded())
         except Exception as exc:
             ceda_records,ceda_error=[],f"{type(exc).__name__}: {str(exc)[:180]}"
     if ceda_records:
         normalized=_normalise_mandi_records(ceda_records)
         if normalized:
             print(f"[MANDI_DEBUG] ceda_fallback_success records={len(normalized)}")
-            return {"ok":True,"live_available":True,"live_api_configured":bool(MANDI_API_KEY),"source":"ceda_agmarknet_fallback","checked_at":checked_at,"price_unit_source":"₹/quintal (Agmarknet via CEDA)","display_price_unit":"₹/20kg","records":normalized[:100],"message":"Live Agmarknet ભાવ મળ્યા.","diagnostics":{"primary":{"request_ok":False,"records":0,"source":"agmarknet_2_public","error":ag_error or "no_records"},"data_gov":{"request_ok":False,"source":"data.gov.in","error":error or "no_records"},"fallback":{"request_ok":True,"records":len(normalized),"source":"ceda_agmarknet_fallback"}}}
+            return {"ok":True,"live_available":True,"live_api_configured":bool(MANDI_API_KEY),"source":"ceda_agmarknet_fallback","checked_at":checked_at,"price_unit_source":"₹/quintal (Agmarknet via CEDA)","display_price_unit":"₹/20kg","records":normalized[:100],"latest_arrival_date": (normalized[0].get("arrival_date") if normalized else ""),"message":"Live Agmarknet ભાવ મળ્યા.","diagnostics":{"primary":{"request_ok":False,"records":0,"source":"agmarknet_2_public","error":ag_error or "no_records"},"data_gov":{"request_ok":False,"source":"data.gov.in","error":error or "no_records"},"fallback":{"request_ok":True,"records":len(normalized),"source":"ceda_agmarknet_fallback"}}}
 
     print(f"[MANDI_DEBUG] final_result state={state!r} market={market!r} commodity={requested_commodity!r} records=0 source=none agmarknet_error={ag_error!r} data_gov_error={error or ''!r} ceda_error={ceda_error!r}")
     return {
