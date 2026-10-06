@@ -27,9 +27,9 @@ from openai import OpenAI
 from google import genai
 from google.genai import types
 
-APP_VERSION = "13.2 GROK SMART GUIDE + AGMARKNET 2.0"
+APP_VERSION = "13.4 GROQ GPT-OSS PRIMARY SMART GUIDE + AGMARKNET 2.0"
 XAI_MODEL = os.getenv("XAI_MODEL", "grok-4.7").strip() or "grok-4.7"
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile").strip() or "llama-3.3-70b-versatile"
+GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b").strip() or "openai/gpt-oss-120b"
 GEMINI_VISION_MODEL = os.getenv("GEMINI_VISION_MODEL", "gemini-3.6-flash").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 
@@ -73,7 +73,7 @@ def xai_client():
 
 
 def groq_client():
-    """Legacy optional fallback. Grok remains the primary provider."""
+    """Primary Smart Guide provider: Groq using the OpenAI-compatible API."""
     key = os.getenv("GROQ_API_KEY", "").strip()
     return OpenAI(api_key=key, base_url="https://api.groq.com/openai/v1") if key else None
 
@@ -152,7 +152,7 @@ def health():
         "agent_loaded": _agent is not None,
         "xai_configured": bool(os.getenv("XAI_API_KEY", "").strip()),
         "xai_model": XAI_MODEL,
-        "primary_ai_provider": "xai_grok",
+        "primary_ai_provider": "groq_gpt_oss",
         "groq_configured": bool(os.getenv("GROQ_API_KEY", "").strip()),
         "groq_model": GROQ_MODEL,
         "gemini_vision_configured": bool(GEMINI_API_KEY),
@@ -160,7 +160,7 @@ def health():
         "mandi_api_configured": bool(os.getenv("DATA_GOV_API_KEY", "").strip()),
         "mandi_rate_limit_cooldown_seconds": MANDI_RATE_LIMIT_COOLDOWN_SECONDS,
         "news_service": "google-news-rss",
-        "model": XAI_MODEL,
+        "model": GROQ_MODEL,
     }
 
 
@@ -712,8 +712,8 @@ def news(crop: str = "", category: str = "agriculture"):
 def ask(req: Ask):
     """
     Smart Guide provider chain:
-      1) xAI Grok (PRIMARY)
-      2) legacy Groq/Llama (OPTIONAL fallback only if configured)
+      1) Groq + OpenAI GPT-OSS 120B (PRIMARY)
+      2) xAI Grok (OPTIONAL fallback only if configured)
       3) deterministic crop-knowledge fallback (not an AI model)
 
     The response explicitly reports provider/model so the Android client and
@@ -725,34 +725,7 @@ def ask(req: Ask):
     ctx = req.context or {}
     prompt = f"ખેડૂત પ્રશ્ન: {req.question.strip()}\nખેડૂત સંદર્ભ: {ctx}"
 
-    # PRIMARY: xAI Grok
-    xai = xai_client()
-    if xai is not None:
-        try:
-            response = xai.responses.create(
-                model=XAI_MODEL,
-                instructions=SYSTEM,
-                input=prompt,
-            )
-            answer = (response.output_text or "").strip()
-            if answer:
-                print(f"[AI_DEBUG] provider=xai model={XAI_MODEL} mode=llm")
-                return {
-                    "answer": answer,
-                    "mode": "xai_grok",
-                    "provider": "xai",
-                    "model": XAI_MODEL,
-                }
-            print(f"[AI_DEBUG] provider=xai model={XAI_MODEL} mode=empty_response")
-        except Exception as exc:
-            print(
-                f"[AI_DEBUG] provider=xai model={XAI_MODEL} "
-                f"mode=error error_type={type(exc).__name__} error={str(exc)[:300]}"
-            )
-    else:
-        print("[AI_DEBUG] provider=xai mode=not_configured")
-
-    # OPTIONAL LEGACY FALLBACK: only if an existing Groq key is configured.
+    # PRIMARY: Groq + OpenAI GPT-OSS 120B
     groq = groq_client()
     if groq is not None:
         try:
@@ -763,17 +736,44 @@ def ask(req: Ask):
             )
             answer = (response.output_text or "").strip()
             if answer:
-                print(f"[AI_DEBUG] provider=groq model={GROQ_MODEL} mode=llm_fallback")
+                print(f"[AI_DEBUG] provider=groq model={GROQ_MODEL} mode=llm_primary")
                 return {
                     "answer": answer,
-                    "mode": "groq_fallback",
+                    "mode": "groq_gpt_oss_primary",
                     "provider": "groq",
                     "model": GROQ_MODEL,
-                    "warning": "Primary xAI Grok unavailable; legacy Groq fallback used.",
                 }
+            print(f"[AI_DEBUG] provider=groq model={GROQ_MODEL} mode=empty_response")
         except Exception as exc:
             print(
                 f"[AI_DEBUG] provider=groq model={GROQ_MODEL} "
+                f"mode=error error_type={type(exc).__name__} error={str(exc)[:300]}"
+            )
+    else:
+        print("[AI_DEBUG] provider=groq mode=not_configured")
+
+    # OPTIONAL AI FALLBACK: xAI Grok only if XAI_API_KEY is configured.
+    xai = xai_client()
+    if xai is not None:
+        try:
+            response = xai.responses.create(
+                model=XAI_MODEL,
+                instructions=SYSTEM,
+                input=prompt,
+            )
+            answer = (response.output_text or "").strip()
+            if answer:
+                print(f"[AI_DEBUG] provider=xai model={XAI_MODEL} mode=llm_fallback")
+                return {
+                    "answer": answer,
+                    "mode": "xai_grok_fallback",
+                    "provider": "xai",
+                    "model": XAI_MODEL,
+                    "warning": "Primary Groq GPT-OSS unavailable; xAI Grok fallback used.",
+                }
+        except Exception as exc:
+            print(
+                f"[AI_DEBUG] provider=xai model={XAI_MODEL} "
                 f"mode=error error_type={type(exc).__name__} error={str(exc)[:300]}"
             )
 
