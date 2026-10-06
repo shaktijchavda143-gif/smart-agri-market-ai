@@ -263,12 +263,37 @@ NEWS_QUERY_SUFFIX = "when:2d"
 # treated as a publisher. This prevents Facebook/social posts from becoming
 # News cards.
 APPROVED_NEWS_SOURCES = {
-    "TV9 Gujarati": ("tv9gujarati.com", "tv9gujarati.com"),
+    "TV9 Gujarati": ("tv9gujarati.com",),
     "ABP Asmita": ("gujarati.abplive.com", "abplive.com"),
-    "Jamavat": ("jamawat.com",),
+    "Sandesh": ("sandesh.com",),
+    "Gujarat Samachar": ("gujaratsamachar.com",),
     "Mumbai Samachar": ("bombaysamachar.com",),
     "Gujarat First": ("gujaratfirst.com",),
+    "VTV Gujarati": ("vtvgujarati.com",),
+    "GSTV": ("gstv.in",),
+    "News18 Gujarati": ("gujarati.news18.com", "news18.com"),
+    "Zee 24 Kalak": ("zee24kalak.in", "zee24kalak.com", "zeenews.india.com"),
+    "Jamavat": ("jamawat.com",),
 }
+
+# Each publisher gets its own farmer-focused Google News query. Google News is
+# only the transport/index; the final article URL must still belong to the
+# publisher domain above. The list is intentionally broader than the original
+# five-source contract so one publisher cannot monopolise the News screen.
+NEWS_PUBLISHER_QUERIES = {
+    "TV9 Gujarati": 'site:tv9gujarati.com (ખેડૂત OR ખેડૂતો OR ખેતી OR કૃષિ OR પાક OR APMC OR MSP OR સહાય OR સબસિડી)',
+    "ABP Asmita": 'site:gujarati.abplive.com (ખેડૂત OR ખેડૂતો OR ખેતી OR કૃષિ OR પાક OR APMC OR MSP OR સહાય OR સબસિડી)',
+    "Sandesh": 'site:sandesh.com (ખેડૂત OR ખેડૂતો OR ખેતી OR કૃષિ OR પાક OR APMC OR MSP OR સહાય OR સબસિડી)',
+    "Gujarat Samachar": 'site:gujaratsamachar.com (ખેડૂત OR ખેડૂતો OR ખેતી OR કૃષિ OR પાક OR APMC OR MSP OR સહાય OR સબસિડી)',
+    "Mumbai Samachar": 'site:bombaysamachar.com (ખેડૂત OR ખેડૂતો OR ખેતી OR કૃષિ OR પાક OR APMC OR MSP OR સહાય OR સબસિડી)',
+    "Gujarat First": 'site:gujaratfirst.com (ખેડૂત OR ખેડૂતો OR ખેતી OR કૃષિ OR પાક OR APMC OR MSP OR સહાય OR સબસિડી)',
+    "VTV Gujarati": 'site:vtvgujarati.com (ખેડૂત OR ખેડૂતો OR ખેતી OR કૃષિ OR પાક OR APMC OR MSP OR સહાય OR સબસિડી)',
+    "GSTV": 'site:gstv.in (ખેડૂત OR ખેડૂતો OR ખેતી OR કૃષિ OR પાક OR APMC OR MSP OR સહાય OR સબસિડી)',
+    "News18 Gujarati": 'site:gujarati.news18.com (ખેડૂત OR ખેડૂતો OR ખેતી OR કૃષિ OR પાક OR APMC OR MSP OR સહાય OR સબસિડી)',
+    "Zee 24 Kalak": 'site:zee24kalak.in (ખેડૂત OR ખેડૂતો OR ખેતી OR કૃષિ OR પાક OR APMC OR MSP OR સહાય OR સબસિડી)',
+    "Jamavat": 'site:jamawat.com (ખેડૂત OR ખેડૂતો OR ખેતી OR કૃષિ OR પાક OR APMC OR MSP OR સહાય OR સબસિડી)',
+}
+
 
 APPROVED_NEWS_SOURCE_NAMES = {
     "tv9 gujarati": "TV9 Gujarati",
@@ -282,6 +307,16 @@ APPROVED_NEWS_SOURCE_NAMES = {
     "મુંબઈ સમાચાર": "Mumbai Samachar",
     "gujarat first": "Gujarat First",
     "gujaratfirst": "Gujarat First",
+    "sandesh": "Sandesh",
+    "gujarat samachar": "Gujarat Samachar",
+    "gujaratsamachar": "Gujarat Samachar",
+    "vtv": "VTV Gujarati",
+    "vtv gujarati": "VTV Gujarati",
+    "gstv": "GSTV",
+    "news18 gujarati": "News18 Gujarati",
+    "news18": "News18 Gujarati",
+    "zee 24 kalak": "Zee 24 Kalak",
+    "zee24kalak": "Zee 24 Kalak",
 }
 
 # News business contract:
@@ -421,6 +456,33 @@ def _is_gujarati_article(item: dict) -> bool:
     )
 
 
+NEWS_FARMER_TERMS = (
+    "ખેડૂત", "ખેડૂતો", "કિસાન", "કૃષક", "ખેતી", "કૃષિ", "પાક", "વાવેતર",
+    "વાવણી", "લણણી", "સિંચાઈ", "ખાતર", "બિયારણ", "જંતુનાશક", "પાક નુકસાન",
+    "સહાય", "સબસીડી", "યોજના", "પાક વીમો", "વળતર", "ikhedut", "આઇ ખેડૂત",
+    "મંડી", "માર્કેટ", "બજાર ભાવ", "એપીએમસી", "apmc", "msp", "ટેકાના ભાવ",
+    "ટેકાના ભાવે", "ખરીદી", "વેચાણ", "ભાવ", "વરસાદ", "માવઠું", "વાવાઝોડું",
+    "હવામાન", "પશુપાલન", "ડેરી", "દૂધ", "કૃષિ સાધન", "ટ્રેક્ટર", "ડ્રિપ",
+    "પ્રાકૃતિક ખેતી", "સજીવ ખેતી", "soil", "fertilizer", "farmer", "farmers",
+    "farming", "agriculture", "crop", "crops", "irrigation", "subsidy", "scheme",
+    "msp", "mandi", "apmc", "harvest",
+)
+
+def _farmer_relevance_score(title: str, description: str = "") -> float:
+    """Score farmer usefulness; crop name is deliberately not part of the gate."""
+    title_text = (title or "").casefold()
+    body_text = (description or "").casefold()
+    text = title_text + " " + body_text
+    if not text.strip():
+        return 0.0
+    title_hits = sum(1 for term in NEWS_FARMER_TERMS if term.casefold() in title_text)
+    body_hits = sum(1 for term in NEWS_FARMER_TERMS if term.casefold() in body_text)
+    # Title relevance is intentionally weighted more heavily. Multiple related
+    # terms increase confidence but the score remains bounded to [0, 1].
+    score = min(1.0, title_hits * 0.22 + min(body_hits, 5) * 0.08)
+    return round(score, 3)
+
+
 def _news_query_for_category(crop: str, category: str) -> str:
     # Crop is intentionally ignored. The News screen is publisher/current-news
     # based, not personalized by the selected crop.
@@ -509,25 +571,19 @@ def _fetch_news_items(
     effective_max_age = max(1, min(int(effective_max_age), NEWS_FALLBACK_MAX_AGE_HOURS))
     cutoff = now - timedelta(hours=effective_max_age)
     time_operator = "when:2d" if effective_max_age <= 48 else "when:7d"
-    # One Google News query per approved publisher prevents a single dominant
-    # source (previously Facebook) from crowding out the other publishers.
-    candidates = []
-    source_queries = {
-        "TV9 Gujarati": "site:tv9gujarati.com Gujarat Gujarati news",
-        "ABP Asmita": "site:gujarati.abplive.com Gujarat Gujarati news",
-        "Jamavat": "site:jamawat.com Gujarat Gujarati news",
-        "Mumbai Samachar": "site:bombaysamachar.com Gujarat Gujarati news",
-        "Gujarat First": "site:gujaratfirst.com Gujarat Gujarati news",
-    }
-    for source_query in source_queries.values():
-        candidates.append(f"{source_query} {time_operator}".strip())
+    # One farmer-focused query per approved publisher. The old implementation
+    # accidentally iterated only [:4], so the fifth source was never queried;
+    # more importantly, generic queries let one publisher dominate.
+    candidates = list(NEWS_PUBLISHER_QUERIES.items())
     india_tz = timezone(timedelta(hours=5, minutes=30))
     items, seen = [], set()
+    per_source_counts = {}
 
-    for effective_query in candidates[:4]:
-        if len(items) >= limit:
+    for source_name, source_query in candidates:
+        if len(items) >= max(limit * 4, 32):
             break
         _LAST_NEWS_FETCH_DIAGNOSTICS["queries_tried"] += 1
+        effective_query = f"{source_query} {time_operator}".strip()
         url = "https://news.google.com/rss/search?" + urllib.parse.urlencode({
             "q": effective_query, "hl": "gu", "gl": "IN", "ceid": "IN:gu"
         })
@@ -590,9 +646,10 @@ def _fetch_news_items(
                 continue
             _LAST_NEWS_FETCH_DIAGNOSTICS["gujarati_items"] += 1
 
-            # No crop/category/Gujarat hard filter here. The publisher itself is
-            # already an approved Gujarati news source, and the Google query is
-            # Gujarat/current-news oriented.
+            farmer_score = _farmer_relevance_score(title, candidate["description"])
+            if farmer_score < 0.22:
+                _LAST_NEWS_FETCH_DIAGNOSTICS["farmer_irrelevant_rejected"] = _LAST_NEWS_FETCH_DIAGNOSTICS.get("farmer_irrelevant_rejected", 0) + 1
+                continue
 
             item = {
                 "title": title, "display_title": title, "original_title": title,
@@ -600,6 +657,7 @@ def _fetch_news_items(
                 "published_text": published.astimezone(india_tz).strftime("%d-%m-%Y %I:%M %p"),
                 "source": approved_source,
                 "source_url": source_url,
+                "farmer_relevance": farmer_score,
                 "description": candidate["description"],
                 "_rss_description_present": bool(candidate["description"]),
                 "_article_text_fetched": False,
@@ -619,9 +677,34 @@ def _fetch_news_items(
             if len(items) >= limit:
                 break
 
-    items.sort(key=lambda x: x["published_at"], reverse=True)
+    # Source-diverse ranking: score first, then freshness, but do not let one
+    # publisher fill the entire list. At most 3 articles per publisher are used
+    # for a normal response, with round-robin selection across publishers.
+    grouped = {}
+    for item in items:
+        grouped.setdefault(item["source"], []).append(item)
+    for group in grouped.values():
+        group.sort(key=lambda x: (x.get("farmer_relevance", 0.0), x.get("published_at", "")), reverse=True)
+    selected = []
+    source_names = list(grouped.keys())
+    for round_index in range(3):
+        for source_name in source_names:
+            group = grouped[source_name]
+            if round_index < len(group):
+                selected.append(group[round_index])
+                if len(selected) >= limit:
+                    break
+        if len(selected) >= limit:
+            break
+    selected.sort(key=lambda x: (x.get("farmer_relevance", 0.0), x.get("published_at", "")), reverse=True)
+    per_source_counts = {}
+    for item in selected:
+        per_source_counts[item["source"]] = per_source_counts.get(item["source"], 0) + 1
+    _LAST_NEWS_FETCH_DIAGNOSTICS["source_counts"] = per_source_counts
+    _LAST_NEWS_FETCH_DIAGNOSTICS["sources_returned"] = sorted(per_source_counts.keys())
+    _LAST_NEWS_FETCH_DIAGNOSTICS["farmer_relevant_kept"] = len(selected)
     if include_article_text:
-        selected = items[:min(limit, 18)]
+        selected = selected[:min(limit, 18)]
         with ThreadPoolExecutor(max_workers=4) as pool:
             futures = {pool.submit(_fetch_article_text, item["link"]): item for item in selected}
             for future in as_completed(futures):
@@ -634,7 +717,7 @@ def _fetch_news_items(
                     item["description"] = (item.get("description", "") + "\n" + fetched).strip()[:60000]
                     item["_article_text_fetched"] = True
         return selected
-    return items[:limit]
+    return selected[:limit]
 
 
 @app.get("/api/v1/news")
@@ -702,6 +785,9 @@ def news(crop: str = "", category: str = "all"):
     diagnostics["fallback_reason"] = fallback_reason
     diagnostics["final_window"] = final_window
     diagnostics["final_results"] = len(items)
+    diagnostics["sources_returned"] = sorted({x.get("source", "") for x in items if x.get("source")})
+    diagnostics["source_counts"] = {src: sum(1 for x in items if x.get("source") == src) for src in diagnostics["sources_returned"]}
+    diagnostics["farmer_relevance_gate"] = "score>=0.22; crop-independent"
     diagnostics["newest_selected"] = items[0]["published_at"] if items else None
     diagnostics["oldest_selected"] = items[-1]["published_at"] if items else None
     if not primary:
