@@ -27,8 +27,9 @@ from openai import OpenAI
 from google import genai
 from google.genai import types
 
-APP_VERSION = "13.1 AGMARKNET 2.0 DAILY COMMODITY RESPONSE FIX"
-MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile").strip() or "llama-3.3-70b-versatile"
+APP_VERSION = "13.2 GROK SMART GUIDE + AGMARKNET 2.0"
+XAI_MODEL = os.getenv("XAI_MODEL", "grok-4.7").strip() or "grok-4.7"
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile").strip() or "llama-3.3-70b-versatile"
 GEMINI_VISION_MODEL = os.getenv("GEMINI_VISION_MODEL", "gemini-3.6-flash").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 
@@ -65,7 +66,14 @@ class Ask(BaseModel):
     context: dict | None = None
 
 
+def xai_client():
+    """Primary Smart Guide provider: xAI Grok via the OpenAI-compatible API."""
+    key = os.getenv("XAI_API_KEY", "").strip()
+    return OpenAI(api_key=key, base_url="https://api.x.ai/v1") if key else None
+
+
 def groq_client():
+    """Legacy optional fallback. Grok remains the primary provider."""
     key = os.getenv("GROQ_API_KEY", "").strip()
     return OpenAI(api_key=key, base_url="https://api.groq.com/openai/v1") if key else None
 
@@ -75,7 +83,7 @@ def norm(text: str) -> str:
 
 
 def rule_based_answer(question: str, context: dict | None) -> str:
-    """Use the supplied agent's crop knowledge even when OpenAI is not configured."""
+    """Use the supplied crop knowledge when no configured AI provider returns a response."""
     q = norm(question)
     ctx = context or {}
     selected = ctx.get("selected_crop") or {}
@@ -142,13 +150,17 @@ def health():
         "service": "smart-agri-ai",
         "version": APP_VERSION,
         "agent_loaded": _agent is not None,
+        "xai_configured": bool(os.getenv("XAI_API_KEY", "").strip()),
+        "xai_model": XAI_MODEL,
+        "primary_ai_provider": "xai_grok",
         "groq_configured": bool(os.getenv("GROQ_API_KEY", "").strip()),
+        "groq_model": GROQ_MODEL,
         "gemini_vision_configured": bool(GEMINI_API_KEY),
         "gemini_vision_model": GEMINI_VISION_MODEL,
         "mandi_api_configured": bool(os.getenv("DATA_GOV_API_KEY", "").strip()),
         "mandi_rate_limit_cooldown_seconds": MANDI_RATE_LIMIT_COOLDOWN_SECONDS,
         "news_service": "google-news-rss",
-        "model": MODEL,
+        "model": XAI_MODEL,
     }
 
 
@@ -698,26 +710,83 @@ def news(crop: str = "", category: str = "agriculture"):
 
 @app.post("/api/v1/ai/ask")
 def ask(req: Ask):
+    """
+    Smart Guide provider chain:
+      1) xAI Grok (PRIMARY)
+      2) legacy Groq/Llama (OPTIONAL fallback only if configured)
+      3) deterministic crop-knowledge fallback (not an AI model)
+
+    The response explicitly reports provider/model so the Android client and
+    forensic logs can distinguish a real LLM response from a local fallback.
+    """
     if not req.question.strip():
         raise HTTPException(status_code=400, detail="પ્રશ્ન ખાલી છે.")
-    try:
-        client = groq_client()
-        if client is None:
-            return {"answer": rule_based_answer(req.question, req.context), "mode": "agent"}
-        ctx = req.context or {}
-        prompt = f"ખેડૂત પ્રશ્ન: {req.question.strip()}\nખેડૂત સંદર્ભ: {ctx}"
-        response = client.responses.create(model=MODEL, instructions=SYSTEM, input=prompt)
-        answer = (response.output_text or "").strip()
-        if not answer:
-            answer = rule_based_answer(req.question, req.context)
-        return {"answer": answer, "mode": "groq", "model": MODEL}
-    except Exception as exc:
-        # Never make the Android button fail just because the external AI service failed.
-        return {
-            "answer": rule_based_answer(req.question, req.context),
-            "mode": "agent_fallback",
-            "warning": str(exc),
-        }
+
+    ctx = req.context or {}
+    prompt = f"ખેડૂત પ્રશ્ન: {req.question.strip()}\nખેડૂત સંદર્ભ: {ctx}"
+
+    # PRIMARY: xAI Grok
+    xai = xai_client()
+    if xai is not None:
+        try:
+            response = xai.responses.create(
+                model=XAI_MODEL,
+                instructions=SYSTEM,
+                input=prompt,
+            )
+            answer = (response.output_text or "").strip()
+            if answer:
+                print(f"[AI_DEBUG] provider=xai model={XAI_MODEL} mode=llm")
+                return {
+                    "answer": answer,
+                    "mode": "xai_grok",
+                    "provider": "xai",
+                    "model": XAI_MODEL,
+                }
+            print(f"[AI_DEBUG] provider=xai model={XAI_MODEL} mode=empty_response")
+        except Exception as exc:
+            print(
+                f"[AI_DEBUG] provider=xai model={XAI_MODEL} "
+                f"mode=error error_type={type(exc).__name__} error={str(exc)[:300]}"
+            )
+    else:
+        print("[AI_DEBUG] provider=xai mode=not_configured")
+
+    # OPTIONAL LEGACY FALLBACK: only if an existing Groq key is configured.
+    groq = groq_client()
+    if groq is not None:
+        try:
+            response = groq.responses.create(
+                model=GROQ_MODEL,
+                instructions=SYSTEM,
+                input=prompt,
+            )
+            answer = (response.output_text or "").strip()
+            if answer:
+                print(f"[AI_DEBUG] provider=groq model={GROQ_MODEL} mode=llm_fallback")
+                return {
+                    "answer": answer,
+                    "mode": "groq_fallback",
+                    "provider": "groq",
+                    "model": GROQ_MODEL,
+                    "warning": "Primary xAI Grok unavailable; legacy Groq fallback used.",
+                }
+        except Exception as exc:
+            print(
+                f"[AI_DEBUG] provider=groq model={GROQ_MODEL} "
+                f"mode=error error_type={type(exc).__name__} error={str(exc)[:300]}"
+            )
+
+    # FINAL FALLBACK: this is NOT an AI model.
+    answer = rule_based_answer(req.question, req.context)
+    print("[AI_DEBUG] provider=rule_based mode=non_ai_fallback")
+    return {
+        "answer": answer,
+        "mode": "rule_based_fallback",
+        "provider": "local",
+        "model": "rule-based-crop-knowledge",
+        "warning": "No configured AI model returned a response.",
+    }
 
 
 @app.post("/api/v1/ai/diagnose")
