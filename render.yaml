@@ -2,7 +2,7 @@ services:
 - type: web
   name: smart-agri-market-ai
   runtime: python
-  buildCommand: pip install -r requirements.txt
+  buildCommand: pip install -r requirements.txt && chmod +x panchang_engine_bin
   startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
   envVars:
   - key: GROQ_API_KEY
