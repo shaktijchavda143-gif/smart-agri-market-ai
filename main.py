@@ -18,6 +18,11 @@ from html.parser import HTMLParser
 from datetime import datetime, timezone, timedelta
 from email.utils import parsedate_to_datetime
 from typing import Any
+
+try:
+    from panchang_service import get_panchang
+except Exception as _panchang_import_error:
+    get_panchang = None
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
@@ -162,6 +167,23 @@ def health():
         "news_service": "google-news-rss",
         "model": GROQ_MODEL,
     }
+
+
+@app.get("/api/v1/farmer-services/panchang/today")
+def farmer_services_panchang_today(date_str: str | None = None, lat: float = 23.0225, lon: float = 72.5714):
+    """Gujarati Gujarat-Kartikadi panchang backed by the local audited engine."""
+    if get_panchang is None:
+        raise HTTPException(status_code=503, detail="Panchang service is not installed")
+    from datetime import date as _date
+    try:
+        day = _date.fromisoformat(date_str) if date_str else _date.today()
+        if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+            raise ValueError("Invalid coordinates")
+        return get_panchang(day, float(lat), float(lon))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail="Panchang service હાલમાં ઉપલબ્ધ નથી. ફરી પ્રયાસ કરો.") from exc
 
 
 NEWS_DEFAULT_MAX_AGE_HOURS = 48
