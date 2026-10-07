@@ -2047,14 +2047,11 @@ def _normalise_mandi_records(records: list[dict[str, Any]]) -> list[dict[str, An
             "min_price": min_price,
             "modal_price": modal_price,
             "max_price": max_price,
-            # Official data.gov.in values are ₹/quintal. These derived fields
-            # are only for presentation; the original source values are kept.
+            # Official source values are ₹/quintal. These display fields only
+            # convert the official values to ₹/20kg; no derived average is created.
             "min_price_20kg": _price_per_20kg(min_price),
             "modal_price_20kg": _price_per_20kg(modal_price),
             "max_price_20kg": _price_per_20kg(max_price),
-            # Derived midpoint, not a traded/observed market average.
-            "midpoint_price": _price_float(min_price) + ((_price_float(max_price) - _price_float(min_price)) / 2.0),
-            "midpoint_price_20kg": _price_per_20kg(str((_price_float(min_price) + _price_float(max_price)) / 2.0)),
             "price_unit_source": "₹/quintal",
             "display_price_unit": "₹/20kg",
             "source": pick(row, "source"),
