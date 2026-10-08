@@ -54,6 +54,53 @@ def _is_kartikadi_year_start(current: dict[str, Any]) -> bool:
     )
 
 
+
+CHOGHADIYA_DAY = {
+    0: ["ઉદ્વેગ", "ચર", "લાભ", "અમૃત", "કાળ", "શુભ", "રોગ", "ઉદ્વેગ"],
+    1: ["અમૃત", "કાળ", "શુભ", "રોગ", "ઉદ્વેગ", "ચર", "લાભ", "અમૃત"],
+    2: ["રોગ", "ઉદ્વેગ", "ચર", "લાભ", "અમૃત", "કાળ", "શુભ", "રોગ"],
+    3: ["લાભ", "અમૃત", "કાળ", "શુભ", "રોગ", "ઉદ્વેગ", "ચર", "લાભ"],
+    4: ["શુભ", "રોગ", "ઉદ્વેગ", "ચર", "લાભ", "અમૃત", "કાળ", "શુભ"],
+    5: ["ચર", "લાભ", "અમૃત", "કાળ", "શુભ", "રોગ", "ઉદ્વેગ", "ચર"],
+    6: ["કાળ", "શુભ", "રોગ", "ઉદ્વેગ", "ચર", "લાભ", "અમૃત", "કાળ"],
+}
+CHOGHADIYA_NIGHT = {
+    0: ["શુભ", "અમૃત", "ચર", "રોગ", "કાળ", "લાભ", "ઉદ્વેગ", "શુભ"],
+    1: ["રોગ", "કાળ", "લાભ", "ઉદ્વેગ", "શુભ", "અમૃત", "ચર", "રોગ"],
+    2: ["કાળ", "લાભ", "ઉદ્વેગ", "શુભ", "અમૃત", "ચર", "રોગ", "કાળ"],
+    3: ["લાભ", "ઉદ્વેગ", "શુભ", "અમૃત", "ચર", "રોગ", "કાળ", "લાભ"],
+    4: ["ઉદ્વેગ", "શુભ", "અમૃત", "ચર", "રોગ", "કાળ", "લાભ", "ઉદ્વેગ"],
+    5: ["ચર", "રોગ", "કાળ", "લાભ", "ઉદ્વેગ", "શુભ", "અમૃત", "ચર"],
+    6: ["અમૃત", "ચર", "રોગ", "કાળ", "લાભ", "ઉદ્વેગ", "શુભ", "અમૃત"],
+}
+CHOGHADIYA_QUALITY = {"અમૃત": ("શુભ", "good"), "શુભ": ("શુભ", "good"), "લાભ": ("શુભ", "good"), "ચર": ("તટસ્થ", "neutral"), "કાળ": ("અશુભ", "bad"), "રોગ": ("અશુભ", "bad"), "ઉદ્વેગ": ("અશુભ", "bad")}
+RAHU_INDEX = [8,2,7,5,6,4,3]
+YAMA_INDEX = [5,4,3,2,1,7,6]
+GULIKA_INDEX = [7,6,5,4,3,2,1]
+
+def _split_interval(start: str, end: str, names: list[str]) -> list[dict[str, Any]]:
+    a, b = datetime.fromisoformat(start), datetime.fromisoformat(end)
+    step = (b-a)/8
+    out=[]
+    for i,name in enumerate(names):
+        quality, code = CHOGHADIYA_QUALITY[name]
+        x=a+step*i; y=a+step*(i+1)
+        out.append({"name":name,"start":x.isoformat(),"end":y.isoformat(),"quality":quality,"quality_code":code})
+    return out
+
+def _muhurta(day_sunrise: str, day_sunset: str, next_sunrise: str, vara: int) -> dict[str, Any]:
+    sr=datetime.fromisoformat(day_sunrise); ss=datetime.fromisoformat(day_sunset); ns=datetime.fromisoformat(next_sunrise)
+    day_part=(ss-sr)/8
+    night_part=(ns-ss)/8
+    rahu=RAHU_INDEX[vara]-1; yama=YAMA_INDEX[vara]-1; gulika=GULIKA_INDEX[vara]-1
+    abh_start=sr+(ss-sr)*7/15; abh_end=sr+(ss-sr)*8/15
+    return {
+        "abhijit":{"start":abh_start.isoformat(),"end":abh_end.isoformat()},
+        "rahukalam":{"start":(sr+day_part*rahu).isoformat(),"end":(sr+day_part*(rahu+1)).isoformat()},
+        "yamaganda":{"start":(sr+day_part*yama).isoformat(),"end":(sr+day_part*(yama+1)).isoformat()},
+        "gulika":{"start":(sr+day_part*gulika).isoformat(),"end":(sr+day_part*(gulika+1)).isoformat()},
+    }
+
 def get_panchang(day: date, lat: float, lon: float) -> dict[str, Any]:
     prev20 = day - timedelta(days=20)
     prev40 = day - timedelta(days=40)
@@ -94,5 +141,8 @@ def get_panchang(day: date, lat: float, lon: float) -> dict[str, Any]:
         "nakshatra": [dict(x, gujarati=GU_NAK[int(x["index"])]) for x in cur.get("nakshatra", [])],
         "yoga": [dict(x, gujarati=GU_YOGA[int(x["index"])]) for x in cur.get("yoga", [])],
         "karana": [dict(x, gujarati=GU_KARANA[0] if int(x["index"]) == 0 else GU_KARANA[1 + ((int(x["index"]) - 1) % 7)] if int(x["index"]) <= 56 else GU_KARANA[8 + (int(x["index"]) - 57)]) for x in cur.get("karana", [])],
+        "choghadiya_day": _split_interval(cur["sunrise"], cur["sunset"], CHOGHADIYA_DAY[int(cur["vara"]["index"])]),
+        "choghadiya_night": _split_interval(cur["sunset"], cur["nextSunrise"], CHOGHADIYA_NIGHT[int(cur["vara"]["index"])]),
+        "muhurta": _muhurta(cur["sunrise"], cur["sunset"], cur["nextSunrise"], int(cur["vara"]["index"])),
         "engine": "ishankgupta95/panchang v5.4.0 MIT; audited local engine",
     }
