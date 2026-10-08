@@ -1,21 +1,27 @@
 services:
-- type: web
-  name: smart-agri-market-ai
-  runtime: python
-  buildCommand: pip install -r requirements.txt && chmod +x panchang_engine_bin
-  startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
-  envVars:
-  - key: GROQ_API_KEY
-    sync: false
-  - key: GROQ_TEXT_MODEL
-    value: openai/gpt-oss-20b
-  - key: GROQ_VISION_MODEL
-    value: qwen/qwen3.6-27b
-  - key: OPENAI_API_KEY
-    sync: false
-  - key: OPENAI_MODEL
-    value: gpt-5.6-luna
-  - key: GEMINI_API_KEY
-    sync: false
-  - key: VISION_MODEL
-    value: gemini-2.5-flash
+  - type: web
+    name: smart-agri-market-ai
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: GROQ_API_KEY
+        sync: false
+      - key: XAI_API_KEY
+        sync: false
+      - key: XAI_MODEL
+        value: grok-4.7
+      - key: GROQ_MODEL
+        value: openai/gpt-oss-120b
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GEMINI_VISION_MODEL
+        value: gemini-3.6-flash
+      - key: DATA_GOV_API_KEY
+        sync: false
+      - key: DATA_GOV_RESOURCE_ID
+        value: 9ef84268-d588-465a-a308-a864a43d0070
+      - key: CEDA_API_KEY
+        sync: false
+      - key: MANDI_FALLBACK_MAX_AGE_HOURS
+        value: "48"
