@@ -32,7 +32,7 @@ from openai import OpenAI
 from google import genai
 from google.genai import types
 
-APP_VERSION = "13.9 LIVE MANDI PROVIDER CIRCUITS + MARKET MASTER FIX"
+APP_VERSION = "14.0 LIVE MANDI DATEWISE PRIMARY REGRESSION FIX"
 XAI_MODEL = os.getenv("XAI_MODEL", "grok-4.7").strip() or "grok-4.7"
 GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b").strip() or "openai/gpt-oss-120b"
 GEMINI_VISION_MODEL = os.getenv("GEMINI_VISION_MODEL", "gemini-3.6-flash").strip()
@@ -1409,6 +1409,7 @@ AGMARKNET_CAPTCHA_COOLDOWN_SECONDS = _mandi_env_seconds(
     "AGMARKNET_CAPTCHA_COOLDOWN_SECONDS", 21600, 60, 86400
 )
 _agmarknet_captcha_required_until: float = 0.0
+_agmarknet_datewise_captcha_required_until: float = 0.0
 
 
 def _ceda_metadata_rows(value: Any) -> list[dict[str, Any]]:
@@ -1564,22 +1565,22 @@ def _ag_response_shape(body: Any) -> dict[str, Any]:
     return info
 
 async def _fetch_agmarknet_2_live(state: str, market: str, commodity: str, request_deadline: float | None = None) -> tuple[list[dict[str, Any]], str]:
-    """Fetch only date-specific AGMARKNET daily reports.
+    """Fetch genuine dated AGMARKNET prices for a selected crop.
 
-    Search order is today, yesterday, then the previous three calendar days.
-    The month-scoped report endpoint is deliberately not called here. A daily report request is date-scoped; if the upstream
-    omits a repeated date on a nested price row, the request date is inherited
-    as report context. If the upstream supplies a date that conflicts with the
-    requested report date, the row is rejected.
+    Crop-specific reports use the public date-wise/specific-commodity endpoint,
+    then retain only the newest valid upstream arrival date from today through
+    three calendar days ago. No month-level average is presented. The separate
+    daily-report-state endpoint is retained only for ALL mode.
     """
-    global _agmarknet_captcha_required_until
-    captcha_remaining = max(0, int(_agmarknet_captcha_required_until - time.monotonic()))
-    if captcha_remaining > 0:
-        print(f"[MANDI_DEBUG] agmarknet_daily_skipped reason='captcha_required_circuit_open' retry_after_seconds={captcha_remaining}")
-        return [], f"AGMARKNET daily report CAPTCHA required; retry suppressed for {captcha_remaining}s"
-
+    global _agmarknet_captcha_required_until, _agmarknet_datewise_captcha_required_until
     requested = (commodity or "ALL").strip() or "ALL"
     wanted = GUJARATI_CROP_ALIASES.get(requested, requested)
+    if wanted.upper() != "ALL":
+        datewise_captcha_remaining = max(0, int(_agmarknet_datewise_captcha_required_until - time.monotonic()))
+        if datewise_captcha_remaining > 0:
+            print("[MANDI_DEBUG] agmarknet_datewise_skipped reason='captcha_required_circuit_open' "
+                  f"retry_after_seconds={datewise_captcha_remaining}")
+            return [], f"AGMARKNET date-wise report CAPTCHA required; retry suppressed for {datewise_captcha_remaining}s"
     state_name = (state or "Gujarat").strip() or "Gujarat"
     market_filter = (market or "").strip()
     ist = timezone(timedelta(hours=5, minutes=30))
@@ -1640,6 +1641,182 @@ async def _fetch_agmarknet_2_live(state: str, market: str, commodity: str, reque
         print(f"[MANDI_DEBUG] agmarknet2_state_resolved state={state_name!r} id={state_id}")
 
         last_error = "AGMARKNET 2.0માં છેલ્લા 3 દિવસના માન્ય ભાવ મળ્યા નથી."
+
+        # Crop-wise prices use the public date-wise/specific-commodity endpoint.
+        # Despite year/month query parameters, it returns daily dated observations,
+        # not a monthly average. Return only the newest valid upstream DATE from
+        # today through D-3. The daily-report-state route has returned CAPTCHA
+        # errors from Render, so selected crops must not depend on that route.
+        if wanted.upper() != "ALL":
+            ckey = _norm_mandi_text(wanted)
+            cached_commodity = _agmarknet_commodity_cache.get(ckey)
+            commodity_id = (
+                cached_commodity[0]
+                if cached_commodity and time.monotonic() - cached_commodity[1] < _AGMARKNET_METADATA_CACHE_SECONDS
+                else None
+            )
+            if commodity_id is None:
+                filters_body, filters_err = await get(
+                    "/daily-price-arrival/filters", {},
+                    max_timeout=MANDI_AGMARKNET_STATE_TIMEOUT_SECONDS,
+                )
+                matches = []
+                for row in _ag_deep_rows(filters_body):
+                    name = str(_ag_pick(
+                        row, "cmdt_name", "cmdtName", "commodity_name", "commodityName",
+                        "commodity", "name", "commodity_name_en",
+                    ) or "").strip()
+                    cid = _ag_pick(
+                        row, "cmdt_id", "cmdtId", "commodity_id", "commodityId",
+                        "commodityCode", "id", "code",
+                    )
+                    if cid is not None and name and (
+                        _norm_mandi_text(name) == ckey or ckey in _norm_mandi_text(name)
+                    ):
+                        matches.append((name, cid))
+                exact = [item for item in matches if _norm_mandi_text(item[0]) == ckey]
+                chosen = exact[0] if exact else (matches[0] if len(matches) == 1 else None)
+                if not chosen:
+                    print(
+                        f"[MANDI_DEBUG] agmarknet2_commodity_resolution_failed requested={wanted!r} "
+                        f"candidate_count={len(matches)} error={filters_err!r}"
+                    )
+                    return [], f"AGMARKNET commodity resolution failed: {filters_err or 'no matching commodity'}"
+                try:
+                    commodity_id = int(chosen[1])
+                except (TypeError, ValueError):
+                    return [], "AGMARKNET commodity id invalid"
+                _agmarknet_commodity_cache[ckey] = (commodity_id, time.monotonic())
+            print(f"[MANDI_DEBUG] agmarknet2_commodity_resolved commodity={wanted!r} id={commodity_id}")
+
+            month_keys = []
+            for day_offset in range(MANDI_MAX_LOOKBACK_DAYS + 1):
+                date_key = today - timedelta(days=day_offset)
+                month_key = (date_key.year, date_key.month)
+                if month_key not in month_keys:
+                    month_keys.append(month_key)
+
+            candidates = []
+            for year, month_num in month_keys:
+                body, err = await get(
+                    "/prices-and-arrivals/date-wise/specific-commodity",
+                    {
+                        "year": str(year), "month": str(month_num),
+                        "stateId": str(state_id), "commodityId": str(commodity_id),
+                        "includeExcel": "false",
+                    },
+                    max_timeout=MANDI_AGMARKNET_DAILY_TIMEOUT_SECONDS,
+                )
+                if body is None:
+                    print(
+                        f"[MANDI_DEBUG] agmarknet2_datewise_failed year={year} month={month_num} error={err!r}"
+                    )
+                    if "TOKEN_OR_CAPTCHA_REQUIRED" in err or "Captcha key and captcha value are required" in err:
+                        _agmarknet_datewise_captcha_required_until = time.monotonic() + AGMARKNET_CAPTCHA_COOLDOWN_SECONDS
+                        print("[MANDI_DEBUG] agmarknet_datewise_captcha_circuit_open "
+                              f"cooldown_seconds={AGMARKNET_CAPTCHA_COOLDOWN_SECONDS} endpoint='date-wise/specific-commodity'")
+                        return [], f"AGMARKNET date-wise report CAPTCHA required: {err}"
+                    # These failures are endpoint/host-wide, not evidence that a
+                    # particular date had no trade. Avoid duplicate month queries.
+                    if any(marker in err for marker in (
+                        "HTTP 400", "HTTP 401", "HTTP 403", "HTTP 429",
+                        "HTTP 500", "HTTP 502", "HTTP 503", "HTTP 504",
+                        "ConnectError", "ConnectTimeout", "ReadTimeout", "TimeoutException",
+                        "NetworkError", "Temporary failure in name resolution", "Connection refused",
+                    )):
+                        return [], f"AGMARKNET date-wise report failed: {err}"
+                    continue
+                rows = _ag_report_rows(body)
+                for row in rows:
+                    item = dict(row)
+                    if not _ag_pick(item, "commodity", "cmdt_name", "cmdtName", "commodity_name", "commodityName"):
+                        item["commodity"] = wanted  # upstream commodityId scopes this response
+                    candidates.append(item)
+                print(
+                    f"[MANDI_DEBUG] agmarknet2_datewise_response year={year} month={month_num} "
+                    f"raw_records={len(rows)} shape={_ag_response_shape(body)!r}"
+                )
+
+            lower_date = today - timedelta(days=MANDI_MAX_LOOKBACK_DAYS)
+            accepted = []
+            rejected = {"commodity": 0, "market": 0, "date_invalid": 0, "outside_window": 0, "future": 0, "price": 0}
+            seen = set()
+            for row in candidates:
+                row_commodity = str(_ag_pick(
+                    row, "cmdt_name", "cmdtName", "commodity", "Commodity", "commodity_name", "commodityName"
+                ) or wanted).strip()
+                if not _commodity_matches({"commodity": row_commodity}, wanted):
+                    rejected["commodity"] += 1
+                    continue
+                market_name = str(_ag_pick(row, "market_name", "marketName", "market", "Market") or "").strip()
+                if market_filter and (not market_name or _norm_mandi_market(market_filter) != _norm_mandi_market(market_name)):
+                    rejected["market"] += 1
+                    continue
+                raw_date = _ag_pick(row, "arrival_date", "arrivalDate", "date", "Date", "reportedDate", "reported_date")
+                parsed = _parse_mandi_date(raw_date)
+                if not parsed:
+                    rejected["date_invalid"] += 1
+                    continue
+                report_day = parsed.astimezone(ist).date()
+                if report_day > today:
+                    rejected["future"] += 1
+                    continue
+                if report_day < lower_date:
+                    rejected["outside_window"] += 1
+                    continue
+                min_value = _normalise_price(_ag_pick(row, "min_price", "minPrice", "minimumPrice", "Min Price", "Min_Price", "min"))
+                modal_value = _normalise_price(_ag_pick(row, "modal_price", "modalPrice", "Modal Price", "Modal_Price", "model_price", "modelPrice", "Model Price", "modal", "model"))
+                max_value = _normalise_price(_ag_pick(row, "max_price", "maxPrice", "maximumPrice", "Max Price", "Max_Price", "max"))
+                min_float, modal_float, max_float = _price_float(min_value), _price_float(modal_value), _price_float(max_value)
+                if min_float is None or modal_float is None or max_float is None or not (
+                    min_float > 0 and modal_float > 0 and max_float > 0 and min_float <= modal_float <= max_float
+                ):
+                    rejected["price"] += 1
+                    continue
+                row_key = (
+                    _norm_mandi_market(market_name), report_day.isoformat(), row_commodity,
+                    min_float, modal_float, max_float,
+                    str(_ag_pick(row, "variety_name", "varietyName", "variety", "Variety") or ""),
+                )
+                if row_key in seen:
+                    continue
+                seen.add(row_key)
+                age_hours = max(0.0, (now - parsed.astimezone(ist)).total_seconds() / 3600.0)
+                accepted.append({
+                    "state": str(_ag_pick(row, "state_name", "stateName", "state", "State") or state_name).strip(),
+                    "district": str(_ag_pick(row, "district_name", "districtName", "district", "District") or "").strip(),
+                    "market": market_name,
+                    "commodity": row_commodity,
+                    "variety": str(_ag_pick(row, "variety_name", "varietyName", "variety", "Variety") or "").strip(),
+                    "grade": str(_ag_pick(row, "grade_name", "gradeName", "grade", "Grade") or "").strip(),
+                    "arrival_date": parsed.strftime("%d/%m/%Y"),
+                    "report_date": report_day.isoformat(),
+                    "min_price": min_float, "max_price": max_float, "modal_price": modal_float,
+                    "source": "AGMARKNET 2.0 (Government of India)",
+                    "source_url": "https://agmarknet.gov.in/home",
+                    "_source_age_hours": round(age_hours, 2),
+                })
+            if not accepted:
+                print(
+                    f"[MANDI_DEBUG] agmarknet2_datewise_validation raw={len(candidates)} accepted=0 "
+                    f"rejected={rejected!r} requested_dates={[(today - timedelta(days=n)).isoformat() for n in range(MANDI_MAX_LOOKBACK_DAYS + 1)]!r}"
+                )
+                return [], "AGMARKNET 2.0 returned no fresh date-stamped records for the requested commodity/market"
+            latest_day = max(row["report_date"] for row in accepted)
+            latest = [row for row in accepted if row["report_date"] == latest_day]
+            print(
+                f"[MANDI_DEBUG] agmarknet2_daily_selected_date date={latest_day!r} "
+                f"records={len(latest)} path='date-wise/specific-commodity' rejected={rejected!r}"
+            )
+            return latest, ""
+
+        # Generic ALL-commodity mode remains on the daily endpoint. Crop-specific
+        # prices never call it, because the endpoint can require CAPTCHA.
+        captcha_remaining = max(0, int(_agmarknet_captcha_required_until - time.monotonic()))
+        if captcha_remaining > 0:
+            print(f"[MANDI_DEBUG] agmarknet_daily_skipped reason='captcha_required_circuit_open' retry_after_seconds={captcha_remaining}")
+            return [], f"AGMARKNET daily report CAPTCHA required; retry suppressed for {captcha_remaining}s"
+
         for delta in range(MANDI_MAX_LOOKBACK_DAYS + 1):
             if request_deadline is not None and time.monotonic() >= request_deadline:
                 return [], "mandi_total_budget_exceeded"
