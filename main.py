@@ -32,7 +32,7 @@ from openai import OpenAI
 from google import genai
 from google.genai import types
 
-APP_VERSION = "13.7 LIVE MANDI DAILY DATE PRIORITY + BOUNDED FALLBACK"
+APP_VERSION = "13.9 LIVE MANDI PROVIDER CIRCUITS + MARKET MASTER FIX"
 XAI_MODEL = os.getenv("XAI_MODEL", "grok-4.7").strip() or "grok-4.7"
 GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b").strip() or "openai/gpt-oss-120b"
 GEMINI_VISION_MODEL = os.getenv("GEMINI_VISION_MODEL", "gemini-3.6-flash").strip()
@@ -1345,6 +1345,52 @@ _ceda_commodity_cache: dict[str, tuple[Any, float]] = {}
 _ceda_geography_cache: tuple[Any, float] | None = None
 _CEDA_METADATA_CACHE_SECONDS = 6 * 60 * 60
 _CEDA_PUBLIC_BASE = "https://agmarknet.ceda.ashoka.edu.in/api"
+# CEDA's authenticated and public endpoints both rate-limit the same Render
+# service. After any HTTP 429, open a process-local circuit and do not fan out
+# dozens of requests across Gujarat districts or retry the alternate CEDA API.
+# The provider's Retry-After may be several days; honor it up to a safe 7-day cap.
+_ceda_rate_limit_until: float = 0.0
+_ceda_rate_limit_seconds: int = 0
+_ceda_rate_limit_source: str = ""
+_CEDA_RATE_LIMIT_MAX_SECONDS = 7 * 24 * 60 * 60
+
+
+def _ceda_retry_after_seconds(value: Any) -> int:
+    """Parse CEDA Retry-After seconds/date, safely bounded to one week."""
+    raw = str(value or "").strip()
+    if raw:
+        try:
+            return max(60, min(int(raw), _CEDA_RATE_LIMIT_MAX_SECONDS))
+        except ValueError:
+            try:
+                retry_at = parsedate_to_datetime(raw)
+                if retry_at.tzinfo is None:
+                    retry_at = retry_at.replace(tzinfo=timezone.utc)
+                seconds = int((retry_at - datetime.now(timezone.utc)).total_seconds())
+                return max(60, min(seconds, _CEDA_RATE_LIMIT_MAX_SECONDS))
+            except Exception:
+                pass
+    return max(60, min(MANDI_RATE_LIMIT_COOLDOWN_SECONDS, _CEDA_RATE_LIMIT_MAX_SECONDS))
+
+
+def _ceda_note_rate_limit(retry_after: Any, source: str) -> int:
+    """Open/extend CEDA circuit after a 429; safe to call from concurrent tasks."""
+    global _ceda_rate_limit_until, _ceda_rate_limit_seconds, _ceda_rate_limit_source
+    seconds = _ceda_retry_after_seconds(retry_after)
+    until = time.monotonic() + seconds
+    if until >= _ceda_rate_limit_until:
+        _ceda_rate_limit_until = until
+        _ceda_rate_limit_seconds = seconds
+        _ceda_rate_limit_source = str(source or "CEDA")[:80]
+    print(
+        f"[MANDI_DEBUG] ceda_circuit_open source={_ceda_rate_limit_source!r} "
+        f"cooldown_seconds={max(0, int(_ceda_rate_limit_until-time.monotonic()))}"
+    )
+    return seconds
+
+
+def _ceda_circuit_remaining() -> int:
+    return max(0, int(_ceda_rate_limit_until - time.monotonic()))
 
 
 # AGMARKNET 2.0 public live fallback. This is the official farmer-facing
@@ -1356,6 +1402,13 @@ _agmarknet_state_cache: dict[str, tuple[Any, float]] = {}
 _agmarknet_commodity_cache: dict[str, tuple[Any, float]] = {}
 _agmarknet_commodity_context_cache: dict[int, tuple[Any, float]] = {}
 _AGMARKNET_METADATA_CACHE_SECONDS = 6 * 60 * 60
+# The current AGMARKNET daily-report API can explicitly reject unauthenticated
+# report calls with TOKEN_OR_CAPTCHA_REQUIRED. Avoid repeating the same known
+# provider-level failure once per crop; market-master metadata remains available.
+AGMARKNET_CAPTCHA_COOLDOWN_SECONDS = _mandi_env_seconds(
+    "AGMARKNET_CAPTCHA_COOLDOWN_SECONDS", 21600, 60, 86400
+)
+_agmarknet_captcha_required_until: float = 0.0
 
 
 def _ceda_metadata_rows(value: Any) -> list[dict[str, Any]]:
@@ -1519,6 +1572,12 @@ async def _fetch_agmarknet_2_live(state: str, market: str, commodity: str, reque
     as report context. If the upstream supplies a date that conflicts with the
     requested report date, the row is rejected.
     """
+    global _agmarknet_captcha_required_until
+    captcha_remaining = max(0, int(_agmarknet_captcha_required_until - time.monotonic()))
+    if captcha_remaining > 0:
+        print(f"[MANDI_DEBUG] agmarknet_daily_skipped reason='captcha_required_circuit_open' retry_after_seconds={captcha_remaining}")
+        return [], f"AGMARKNET daily report CAPTCHA required; retry suppressed for {captcha_remaining}s"
+
     requested = (commodity or "ALL").strip() or "ALL"
     wanted = GUJARATI_CROP_ALIASES.get(requested, requested)
     state_name = (state or "Gujarat").strip() or "Gujarat"
@@ -1594,6 +1653,15 @@ async def _fetch_agmarknet_2_live(state: str, market: str, commodity: str, reque
             if body is None:
                 last_error = f"AGMARKNET daily report {report_date} failed: {err}"
                 print(f"[MANDI_DEBUG] agmarknet2_daily_failed date={report_date!r} error={err!r}")
+                if "TOKEN_OR_CAPTCHA_REQUIRED" in err or (
+                    "Captcha key and captcha value are required" in err
+                ):
+                    _agmarknet_captcha_required_until = time.monotonic() + AGMARKNET_CAPTCHA_COOLDOWN_SECONDS
+                    print(
+                        "[MANDI_DEBUG] agmarknet_captcha_circuit_open "
+                        f"cooldown_seconds={AGMARKNET_CAPTCHA_COOLDOWN_SECONDS}"
+                    )
+                    return [], last_error
                 # A rejected/malformed request or an unavailable upstream host
                 # will fail identically for every date. Do not repeat four
                 # doomed requests; preserve the request budget for CEDA and the
@@ -1722,6 +1790,11 @@ async def _fetch_ceda_fresh_mandi(state: str, district: str, commodity: str) -> 
 
     if not CEDA_API_KEY:
         return [], "CEDA_API_KEY not configured"
+    circuit_remaining = _ceda_circuit_remaining()
+    if circuit_remaining > 0:
+        error = f"CEDA rate limited; circuit open for about {circuit_remaining}s"
+        print(f"[MANDI_DEBUG] ceda_request_skipped reason='rate_limit_circuit_open' retry_after_seconds={circuit_remaining}")
+        return [], error
     state = (state or "Gujarat").strip()
     requested = (commodity or "ALL").strip() or "ALL"
     api_commodity = GUJARATI_CROP_ALIASES.get(requested, requested)
@@ -1739,6 +1812,8 @@ async def _fetch_ceda_fresh_mandi(state: str, district: str, commodity: str) -> 
             try:
                 response = await client.request(method, path, json=payload)
                 retry_after = response.headers.get("Retry-After", "")
+                if response.status_code == 429:
+                    _ceda_note_rate_limit(retry_after, f"authenticated:{path}")
                 if response.status_code != 200:
                     suffix = f"; Retry-After={retry_after}" if retry_after else ""
                     return None, f"HTTP {response.status_code}{suffix}"
@@ -1782,6 +1857,9 @@ async def _fetch_ceda_fresh_mandi(state: str, district: str, commodity: str) -> 
             )
             try:
                 response = await public_client.get("/commodities")
+                if response.status_code == 429:
+                    retry_after = response.headers.get("Retry-After", "")
+                    _ceda_note_rate_limit(retry_after, "public:/commodities")
                 if response.status_code != 200:
                     print(f"[MANDI_DEBUG] ceda_public_commodities_http_error status={response.status_code}")
                     return []
@@ -1808,13 +1886,19 @@ async def _fetch_ceda_fresh_mandi(state: str, district: str, commodity: str) -> 
                 commodity_meta_source = "ceda_v1"
             else:
                 print(f"[MANDI_DEBUG] ceda_commodities_failed error={err!r}")
-                # Do not make authenticated metadata 429 a blocker. CEDA's
-                # public Agmarknet interface exposes the same commodity list.
+                # A provider-wide 429 is not a cue to call the alternate host:
+                # it is the same upstream service family and the Retry-After
+                # must be respected. Preserve the request budget for data.gov.in.
+                if _ceda_circuit_remaining() > 0:
+                    return [], f"CEDA rate limit circuit open after metadata request: {err}"
                 public_rows = await public_commodity_metadata()
                 if public_rows:
                     commodity_meta = public_rows
                     commodity_meta_source = "ceda_public_metadata"
                 else:
+                    remaining = _ceda_circuit_remaining()
+                    if remaining > 0:
+                        return [], f"CEDA rate limit circuit open for {remaining}s"
                     return [], f"CEDA commodity metadata unavailable: {err}"
 
         matches = _ceda_find_commodity_matches(commodity_meta, api_commodity)
@@ -1878,6 +1962,10 @@ async def _fetch_ceda_fresh_mandi(state: str, district: str, commodity: str) -> 
         sem = asyncio.Semaphore(5)
         async def district_prices(did: int, dname: str):
             async with sem:
+                circuit_remaining = _ceda_circuit_remaining()
+                if circuit_remaining > 0:
+                    print(f"[MANDI_DEBUG] ceda_district_skipped district={dname!r} reason='rate_limit_circuit_open' retry_after_seconds={circuit_remaining}")
+                    return []
                 payload_v1 = {
                     "commodity_id": commodity_id,
                     "state_id": state_id,
@@ -1917,6 +2005,8 @@ async def _fetch_ceda_fresh_mandi(state: str, district: str, commodity: str) -> 
                     ) as public_client:
                         pr = await public_client.post("/prices", json=public_payload)
                         retry_after = pr.headers.get("Retry-After", "")
+                        if pr.status_code == 429:
+                            _ceda_note_rate_limit(retry_after, f"public:/prices:{dname}")
                         if pr.status_code == 200:
                             rows = _extract_public_data(pr.json())
                             print(f"[MANDI_DEBUG] ceda_public_prices_response district={dname!r} status=200 raw_records={len(rows)} chart_type='datadownload'")
@@ -1932,6 +2022,10 @@ async def _fetch_ceda_fresh_mandi(state: str, district: str, commodity: str) -> 
                 # CEDA price endpoint. Never call /agmarknet/markets merely to make
                 # a price response usable: market metadata is optional.
                 if rows is None:
+                    circuit_remaining = _ceda_circuit_remaining()
+                    if circuit_remaining > 0:
+                        print(f"[MANDI_DEBUG] ceda_v1_retry_skipped district={dname!r} reason='rate_limit_circuit_open' retry_after_seconds={circuit_remaining}")
+                        return []
                     rows, v1_err = await call("POST", "/agmarknet/prices", payload_v1)
                     if rows is not None:
                         call_err = ""
@@ -2214,7 +2308,11 @@ def mandi_markets(state: str = "Gujarat", commodity: str = "ALL"):
     def clean(v):
         return str(v or "").strip()
 
-    market_keys=("market_name","marketName","market_name_en","marketNameEn","market","Market","apmc_name","apmcName","apmc","APMC")
+    # AGMARKNET 2.0 /daily-price-arrival/filters currently returns market_data
+    # rows using the short field name `mkt_name` (with `id`, `state_id`,
+    # `district_id`). Include these exact upstream keys or the valid 4k+ market
+    # master rows are silently parsed as zero markets.
+    market_keys=("market_name","marketName","market_name_en","marketNameEn","mkt_name","mktName","market","Market","apmc_name","apmcName","apmc","APMC")
     state_id_keys=("state_id","stateId","stateID","state_code","stateCode","stateid")
     state_name_keys=("state_name","stateName","state","State")
     district_id_keys=("district_id","districtId","districtID","district_code","districtCode","districtid")
