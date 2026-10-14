@@ -1351,6 +1351,21 @@ def _norm_mandi_market(value: Any) -> str:
     return text.strip()
 
 
+def _mandi_market_match_key(value: Any) -> str:
+    """Canonical key for strict market equality, ignoring punctuation/spacing only."""
+    text = _norm_mandi_market(value)
+    return re.sub(r"[\W_]+", "", text, flags=re.UNICODE)
+
+
+def _mandi_row_market(row: dict[str, Any]) -> str:
+    """Read the raw market/APMC field from known data.gov.in row shapes."""
+    for key in ("market", "Market", "market_name", "marketName", "market_name_en", "marketNameEn", "apmc_name", "apmcName"):
+        value = row.get(key)
+        if value is not None and str(value).strip():
+            return str(value).strip()
+    return ""
+
+
 def _commodity_matches(row: dict[str, Any], requested: str) -> bool:
     """Keep only rows belonging to the requested commodity."""
     if not requested or requested.strip().upper() == "ALL":
@@ -1402,8 +1417,13 @@ def _mandi_latest_rows(rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]]
     return [row for row, parsed in dated if parsed and parsed.date() == latest_day], latest_day.strftime("%d-%m-%Y")
 
 
-def _mandi_normalized_result(payload: dict[str, Any], requested_commodity: str, fallback_used: bool = False):
-    """Normalize only date-stamped rows inside the agreed 3-day lookback."""
+def _mandi_normalized_result(
+    payload: dict[str, Any],
+    requested_commodity: str,
+    fallback_used: bool = False,
+    requested_market: str = "",
+):
+    """Normalize fresh rows and fail closed on rows from a different market."""
     raw_records = payload.get("records") or []
     if not isinstance(raw_records, list):
         raw_records = []
@@ -1433,6 +1453,31 @@ def _mandi_normalized_result(payload: dict[str, Any], requested_commodity: str, 
     raw_records = dated_records
     if requested_commodity and requested_commodity.strip().upper() != "ALL":
         raw_records = [r for r in raw_records if _commodity_matches(r, requested_commodity)]
+
+    # Never trust an upstream market filter by itself. Enforce the selected
+    # market again on actual rows before any prices are returned to the app.
+    rejected_market_mismatch = 0
+    observed_markets: list[str] = []
+    if requested_market.strip():
+        wanted_market_key = _mandi_market_match_key(requested_market)
+        market_filtered = []
+        for row in raw_records:
+            row_market = _mandi_row_market(row)
+            if row_market and row_market not in observed_markets and len(observed_markets) < 12:
+                observed_markets.append(row_market)
+            if wanted_market_key and row_market and _mandi_market_match_key(row_market) == wanted_market_key:
+                market_filtered.append(row)
+            else:
+                rejected_market_mismatch += 1
+        raw_records = market_filtered
+        print(
+            "[MANDI_DEBUG] official_api_market_filter "
+            f"requested_market={requested_market!r} accepted={len(raw_records)} "
+            f"rejected_market_mismatch={rejected_market_mismatch} "
+            f"observed_markets={observed_markets!r}",
+            flush=True,
+        )
+
     latest_rows, latest_date = _mandi_latest_rows(raw_records)
     normalized = _normalise_mandi_records(latest_rows)
     raw_keys = sorted(list(raw_records[0].keys())) if raw_records and isinstance(raw_records[0], dict) else []
@@ -1445,6 +1490,9 @@ def _mandi_normalized_result(payload: dict[str, Any], requested_commodity: str, 
             "raw_record_count": len(raw_records),
             "raw_sample_keys": raw_keys[:30],
             "latest_date": latest_date,
+            "requested_market": requested_market,
+            "rejected_market_mismatch": rejected_market_mismatch,
+            "observed_markets": observed_markets,
             "rejected_undated_or_outside_lookback": rejected_undated_or_stale,
             "fallback_used": fallback_used,
         },
@@ -1598,7 +1646,7 @@ def _mandi_api_get(state: str, market: str, commodity: str, request_deadline: fl
                             aggregated.append(row)
                     print(f"[MANDI_DEBUG] official_api_page rows={len(page_rows)} aggregated={len(aggregated)}")
                     if len(page_rows) < MANDI_PAGE_SIZE:
-                        normalized = _mandi_normalized_result({"records": aggregated}, normalized_commodity, fallback_used=False)
+                        normalized = _mandi_normalized_result({"records": aggregated}, normalized_commodity, fallback_used=False, requested_market=market)
                         normalized["_diagnostics"]["pagination_complete"] = True
                         normalized["_diagnostics"]["pagination_reason"] = "short_page"
                         normalized["_diagnostics"]["http_status"] = status
@@ -1611,7 +1659,7 @@ def _mandi_api_get(state: str, market: str, commodity: str, request_deadline: fl
                         return normalized, "", 0, status
 
                     if page + 1 >= MANDI_MAX_PAGES:
-                        normalized = _mandi_normalized_result({"records": aggregated}, normalized_commodity, fallback_used=False)
+                        normalized = _mandi_normalized_result({"records": aggregated}, normalized_commodity, fallback_used=False, requested_market=market)
                         normalized["_diagnostics"]["pagination_complete"] = False
                         normalized["_diagnostics"]["pagination_reason"] = "max_pages_reached"
                         normalized["_diagnostics"]["http_status"] = status
@@ -2063,7 +2111,7 @@ async def _fetch_agmarknet_2_live(state: str, market: str, commodity: str, reque
                     rejected["commodity"] += 1
                     continue
                 market_name = str(_ag_pick(row, "market_name", "marketName", "market", "Market") or "").strip()
-                if market_filter and (not market_name or _norm_mandi_market(market_filter) != _norm_mandi_market(market_name)):
+                if market_filter and (not market_name or _mandi_market_match_key(market_filter) != _mandi_market_match_key(market_name)):
                     rejected["market"] += 1
                     continue
                 raw_date = _ag_pick(row, "arrival_date", "arrivalDate", "date", "Date", "reportedDate", "reported_date")
@@ -2184,7 +2232,7 @@ async def _fetch_agmarknet_2_live(state: str, market: str, commodity: str, reque
                     continue
 
                 market_name = str(_ag_pick(row, "market_name", "marketName", "market", "Market") or "").strip()
-                if market_filter and (not market_name or _norm_mandi_market(market_filter) != _norm_mandi_market(market_name)):
+                if market_filter and (not market_name or _mandi_market_match_key(market_filter) != _mandi_market_match_key(market_name)):
                     rejected["market"] += 1
                     continue
 
