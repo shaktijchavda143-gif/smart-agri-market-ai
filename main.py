@@ -893,6 +893,21 @@ async def diagnose(image: UploadFile = File(...), crop: str = Form(""), context:
             }
         except Exception as exc:
             last_error = str(exc)[:500]
+            safe_error = last_error
+            if GEMINI_API_KEY:
+                safe_error = safe_error.replace(GEMINI_API_KEY, "[REDACTED_API_KEY]")
+
+            print(
+                "[AI_DIAGNOSE_DEBUG] "
+                f"attempt={attempt + 1}/4 "
+                f"exception_type={type(exc).__name__} "
+                f"model={GEMINI_VISION_MODEL!r} "
+                f"mime_type={image.content_type!r} "
+                f"image_bytes={len(data)} "
+                f"error={safe_error!r}",
+                flush=True,
+            )
+
             if attempt < 3:
                 await asyncio.sleep(float(2 ** attempt))
 
