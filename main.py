@@ -36,11 +36,15 @@ from openai import OpenAI
 from google import genai
 from google.genai import types
 
-APP_VERSION = "14.1 LIVE MANDI FORENSIC FIX + NETWORK TEST 1"
+APP_VERSION = "14.2 AI VISION QUOTA FALLBACK FIX"
 XAI_MODEL = os.getenv("XAI_MODEL", "grok-4.7").strip() or "grok-4.7"
 GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b").strip() or "openai/gpt-oss-120b"
 GEMINI_VISION_MODEL = os.getenv("GEMINI_VISION_MODEL", "gemini-3.6-flash").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+# Separate vision models are used for fallback so the text-only Smart Guide model
+# configured in GROQ_MODEL is never mistakenly used for image diagnosis.
+GROQ_VISION_MODEL = os.getenv("GROQ_VISION_MODEL", "qwen/qwen3.8-27b").strip() or "qwen/qwen3.8-27b"
+XAI_VISION_MODEL = os.getenv("XAI_VISION_MODEL", os.getenv("XAI_MODEL", "grok-4.7")).strip() or "grok-4.7"
 
 app = FastAPI(title="Smart Agri Market AI Backend", version=APP_VERSION)
 app.add_middleware(
@@ -166,6 +170,10 @@ def health():
         "groq_model": GROQ_MODEL,
         "gemini_vision_configured": bool(GEMINI_API_KEY),
         "gemini_vision_model": GEMINI_VISION_MODEL,
+        "groq_vision_configured": bool(os.getenv("GROQ_API_KEY", "").strip()),
+        "groq_vision_model": GROQ_VISION_MODEL,
+        "xai_vision_configured": bool(os.getenv("XAI_API_KEY", "").strip()),
+        "xai_vision_model": XAI_VISION_MODEL,
         "mandi_api_configured": bool(MANDI_API_KEY),
         "mandi_rate_limit_cooldown_seconds": MANDI_RATE_LIMIT_COOLDOWN_SECONDS,
         "news_service": "google-news-rss",
@@ -847,16 +855,23 @@ def ask(req: Ask):
 
 @app.post("/api/v1/ai/diagnose")
 async def diagnose(image: UploadFile = File(...), crop: str = Form(""), context: str = Form("")):
+    """Diagnose a crop photo with Gemini first, then configured vision fallbacks.
+
+    Quota/rate-limit errors are not retried four times: the request immediately
+    proceeds to configured fallback providers, avoiding wasted calls and delay.
+    """
     crop = crop.strip()
     if not crop:
         raise HTTPException(status_code=400, detail="Please select a crop before diagnosis")
+
     data = await image.read()
     if not data:
         raise HTTPException(status_code=400, detail="Image is empty")
     if len(data) > 7 * 1024 * 1024:
         raise HTTPException(status_code=413, detail="Image must be under 7 MB")
-    if not GEMINI_API_KEY:
-        raise HTTPException(status_code=503, detail="GEMINI_API_KEY is missing")
+
+    mime_type = (image.content_type or "image/jpeg").split(";", 1)[0].strip().lower()
+    data_url = f"data:{mime_type};base64,{base64.b64encode(data).decode('ascii')}"
 
     prompt = f"""
 તમે Smart Agri-Market AI ના ગુજરાતી કૃષિ ફોટો નિષ્ણાત છો.
@@ -866,13 +881,66 @@ async def diagnose(image: UploadFile = File(...), crop: str = Form(""), context:
 ફોટાનું વિશ્લેષણ કરીને સંપૂર્ણ ગુજરાતીમાં જવાબ આપો.
 વિભાગો: ફોટામાં શું દેખાય છે, સંભવિત સમસ્યા, કારણ, શું કરવું, નિયંત્રણ માર્ગદર્શન, સાવચેતી.
 ફોટામાં ન દેખાતી બાબતોની કલ્પના ન કરો. ચોક્કસ દવા/ડોઝ અંગે સાવચેતી રાખો.
+જો ફોટા પરથી રોગ અથવા જીવાત ખાતરીપૂર્વક ઓળખી ન શકાય, તો તે સ્પષ્ટ જણાવો.
 """
 
-    last_error = "Gemini Vision service unavailable"
-    for attempt in range(4):
+    gemini_error = ""
+    quota_exhausted = False
+
+    def _safe_error(exc: Exception) -> str:
+        message = str(exc)[:600]
+        # Never emit API credentials to Render logs.
+        for secret in (
+            GEMINI_API_KEY,
+            os.getenv("GROQ_API_KEY", "").strip(),
+            os.getenv("XAI_API_KEY", "").strip(),
+        ):
+            if secret:
+                message = message.replace(secret, "[REDACTED_API_KEY]")
+        return message
+
+    def _is_quota_error(exc: Exception) -> bool:
+        body = f"{type(exc).__name__} {exc}".lower()
+        return any(marker in body for marker in (
+            "resource_exhausted", "quota exceeded", "free_tier_requests",
+            "rate limit", "429 too many requests", "status_code=429",
+        )) or getattr(exc, "code", None) == 429
+
+    def _text_from_content(content: Any) -> str:
+        if isinstance(content, str):
+            return content.strip()
+        if isinstance(content, list):
+            bits = []
+            for item in content:
+                if isinstance(item, dict):
+                    value = item.get("text")
+                    if value:
+                        bits.append(str(value))
+                else:
+                    value = getattr(item, "text", None)
+                    if value:
+                        bits.append(str(value))
+            return "\n".join(bits).strip()
+        return ""
+
+    def _success(answer: str, provider: str, model: str, mode: str, warning: str | None = None):
+        result = {
+            "success": True,
+            "answer": answer,
+            "mode": mode,
+            "provider": provider,
+            "model": model,
+        }
+        if warning:
+            result["warning"] = warning
+        return result
+
+    # Primary provider: Gemini. Make one app-level request. A 429 quota error
+    # is handled as a provider failure and falls through immediately.
+    if GEMINI_API_KEY:
         try:
             client = genai.Client(api_key=GEMINI_API_KEY)
-            part = types.Part.from_bytes(data=data, mime_type=image.content_type or "image/jpeg")
+            part = types.Part.from_bytes(data=data, mime_type=mime_type)
             response = await client.aio.models.generate_content(
                 model=GEMINI_VISION_MODEL,
                 contents=[part, prompt],
@@ -883,35 +951,144 @@ async def diagnose(image: UploadFile = File(...), crop: str = Form(""), context:
                 ),
             )
             answer = (getattr(response, "text", "") or "").strip()
-            if not answer:
-                raise RuntimeError("Empty Gemini response")
-            return {
-                "success": True,
-                "answer": answer,
-                "mode": "gemini_vision",
-                "model": GEMINI_VISION_MODEL,
-            }
+            if answer:
+                print(
+                    f"[AI_DIAGNOSE] provider=gemini model={GEMINI_VISION_MODEL!r} status=success image_bytes={len(data)}",
+                    flush=True,
+                )
+                return _success(answer, "gemini", GEMINI_VISION_MODEL, "gemini_vision")
+            raise RuntimeError("Gemini returned an empty response")
         except Exception as exc:
-            last_error = str(exc)[:500]
-            safe_error = last_error
-            if GEMINI_API_KEY:
-                safe_error = safe_error.replace(GEMINI_API_KEY, "[REDACTED_API_KEY]")
-
+            gemini_error = _safe_error(exc)
+            quota_exhausted = _is_quota_error(exc)
             print(
-                "[AI_DIAGNOSE_DEBUG] "
-                f"attempt={attempt + 1}/4 "
-                f"exception_type={type(exc).__name__} "
-                f"model={GEMINI_VISION_MODEL!r} "
-                f"mime_type={image.content_type!r} "
-                f"image_bytes={len(data)} "
-                f"error={safe_error!r}",
+                "[AI_DIAGNOSE] "
+                f"provider=gemini model={GEMINI_VISION_MODEL!r} "
+                f"exception_type={type(exc).__name__} quota_or_rate_limit={quota_exhausted} "
+                f"image_bytes={len(data)} error={gemini_error!r}",
                 flush=True,
             )
+    else:
+        gemini_error = "GEMINI_API_KEY is not configured"
+        print("[AI_DIAGNOSE] provider=gemini status=skipped reason=missing_api_key", flush=True)
 
-            if attempt < 3:
-                await asyncio.sleep(float(2 ** attempt))
+    # Fallback 1: Groq Qwen vision model (do not use GROQ_MODEL here; it may
+    # be text-only). Enabled only when GROQ_API_KEY is configured.
+    groq_key = os.getenv("GROQ_API_KEY", "").strip()
+    if groq_key:
+        try:
+            client = OpenAI(
+                api_key=groq_key,
+                base_url="https://api.groq.com/openai/v1",
+                timeout=90.0,
+                max_retries=0,
+            )
+            completion = await asyncio.to_thread(
+                client.chat.completions.create,
+                model=GROQ_VISION_MODEL,
+                messages=[
+                    {"role": "system", "content": SYSTEM},
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt},
+                            {"type": "image_url", "image_url": {"url": data_url}},
+                        ],
+                    },
+                ],
+                temperature=0.2,
+                max_tokens=4096,
+            )
+            message = completion.choices[0].message.content if completion.choices else ""
+            answer = _text_from_content(message)
+            if answer:
+                print(
+                    f"[AI_DIAGNOSE] provider=groq model={GROQ_VISION_MODEL!r} status=success image_bytes={len(data)}",
+                    flush=True,
+                )
+                return _success(
+                    answer, "groq", GROQ_VISION_MODEL, "groq_vision_fallback",
+                    "Gemini unavailable; Groq vision fallback used.",
+                )
+            raise RuntimeError("Groq vision returned an empty response")
+        except Exception as exc:
+            print(
+                "[AI_DIAGNOSE] "
+                f"provider=groq model={GROQ_VISION_MODEL!r} "
+                f"exception_type={type(exc).__name__} error={_safe_error(exc)!r}",
+                flush=True,
+            )
+    else:
+        print("[AI_DIAGNOSE] provider=groq status=skipped reason=missing_api_key", flush=True)
 
-    raise HTTPException(status_code=502, detail=f"Gemini Vision error after 3 retries: {last_error}")
+    # Fallback 2: xAI Grok vision, enabled only when XAI_API_KEY exists.
+    xai_key = os.getenv("XAI_API_KEY", "").strip()
+    if xai_key:
+        try:
+            client = OpenAI(
+                api_key=xai_key,
+                base_url="https://api.x.ai/v1",
+                timeout=120.0,
+                max_retries=0,
+            )
+            response = await asyncio.to_thread(
+                client.responses.create,
+                model=XAI_VISION_MODEL,
+                instructions=SYSTEM,
+                input=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "input_image", "image_url": data_url, "detail": "high"},
+                            {"type": "input_text", "text": prompt},
+                        ],
+                    }
+                ],
+            )
+            answer = (getattr(response, "output_text", "") or "").strip()
+            if answer:
+                print(
+                    f"[AI_DIAGNOSE] provider=xai model={XAI_VISION_MODEL!r} status=success image_bytes={len(data)}",
+                    flush=True,
+                )
+                return _success(
+                    answer, "xai", XAI_VISION_MODEL, "xai_vision_fallback",
+                    "Gemini unavailable; xAI vision fallback used.",
+                )
+            raise RuntimeError("xAI vision returned an empty response")
+        except Exception as exc:
+            print(
+                "[AI_DIAGNOSE] "
+                f"provider=xai model={XAI_VISION_MODEL!r} "
+                f"exception_type={type(exc).__name__} error={_safe_error(exc)!r}",
+                flush=True,
+            )
+    else:
+        print("[AI_DIAGNOSE] provider=xai status=skipped reason=missing_api_key", flush=True)
+
+    # Use client-safe Gujarati errors. Detailed causes stay in server logs.
+    if quota_exhausted:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "હાલમાં Gemini APIની ક્વોટા મર્યાદા પૂરી થઈ છે અને કોઈ વૈકલ્પિક "
+                "ફોટો-નિદાન સેવા સફળ થઈ નથી. કૃપા કરીને AI પ્રોવાઇડરની ક્વોટા/બિલિંગ "
+                "તપાસો અથવા થોડા સમય પછી ફરી પ્રયાસ કરો."
+            ),
+        )
+
+    configured = bool(GEMINI_API_KEY or groq_key or xai_key)
+    if not configured:
+        raise HTTPException(
+            status_code=503,
+            detail="AI ફોટો નિદાન માટે કોઈ API પ્રોવાઇડરની કી ગોઠવેલી નથી.",
+        )
+    raise HTTPException(
+        status_code=502,
+        detail=(
+            "AI ફોટો નિદાનની સેવાઓ હાલમાં જવાબ આપી રહી નથી. કૃપા કરીને થોડા સમય પછી ફરી પ્રયાસ કરો."
+        ),
+    )
 
 
 # ---------------- Secure Mandi price bridge ----------------
@@ -2710,7 +2887,7 @@ def mandi_today_summary_crop(state: str = "Gujarat", market: str = "", commodity
         "live_error": str(payload.get("live_error", "") or "") if isinstance(payload, dict) else "",
         "records": records[:100],
         "latest_arrival_date": payload.get("latest_arrival_date", "") if isinstance(payload, dict) else "",
-        "source_policy": "AGMARKNET 2.0 daily date-priority + CEDA daily fallback + data.gov.in fallback",
+        "source_policy": "data.gov.in official API (primary) → AGMARKNET 2.0 public API → CEDA/Agmarknet daily fallback; no fabricated prices",
         "request_budget_seconds": MANDI_TOTAL_BUDGET_SECONDS,
         "elapsed_seconds": elapsed,
     }
@@ -2736,23 +2913,159 @@ def mandi_today_summary(state: str = "Gujarat", market: str = ""):
             "records":records[:100]
         })
     available=sum(1 for x in items if x["live_available"] and x["records"])
-    return {"ok":True,"state":(state or "Gujarat").strip() or "Gujarat","market":(market or "").strip(),"checked_at":checked_at,"items":items,"available_crops":available,"total_crops":len(items),"source_policy":"AGMARKNET 2.0 daily date-priority + CEDA daily fallback + data.gov.in fallback"}
+    return {"ok":True,"state":(state or "Gujarat").strip() or "Gujarat","market":(market or "").strip(),"checked_at":checked_at,"items":items,"available_crops":available,"total_crops":len(items),"source_policy":"data.gov.in official API (primary) → AGMARKNET 2.0 public API → CEDA/Agmarknet daily fallback; no fabricated prices"}
+
+def _mandi_source_log(source: str, event: str, *, elapsed_ms: int | None = None,
+                      status: str = "", http_status: int | None = None,
+                      records: int | None = None, state: str = "", market: str = "",
+                      commodity: str = "", error: str = "") -> None:
+    """Consistent, secret-safe log line for each live mandi source attempt."""
+    fields = [f"source={source!r}", f"event={event!r}"]
+    if status:
+        fields.append(f"result={status!r}")
+    if elapsed_ms is not None:
+        fields.append(f"elapsed_ms={int(elapsed_ms)}")
+    if http_status is not None:
+        fields.append(f"http_status={int(http_status)}")
+    if records is not None:
+        fields.append(f"usable_records={int(records)}")
+    if state:
+        fields.append(f"state={state!r}")
+    if market:
+        fields.append(f"market={market!r}")
+    if commodity:
+        fields.append(f"commodity={commodity!r}")
+    if error:
+        # Do not log credentials or full response bodies.
+        safe = re.sub(r"(?i)(api[-_ ]?key|authorization|bearer)\s*[:= ]\s*[^ ,;]+", r"\1=[REDACTED]", " ".join(str(error).split()))[:240]
+        if MANDI_API_KEY:
+            safe = safe.replace(MANDI_API_KEY, "[REDACTED]")
+        if CEDA_API_KEY:
+            safe = safe.replace(CEDA_API_KEY, "[REDACTED]")
+        fields.append(f"error={safe!r}")
+    print("[MANDI_SOURCE_TEST] " + " ".join(fields), flush=True)
+
+
+@app.get("/api/v1/mandi/source-test")
+async def mandi_source_test(state: str = "Gujarat", market: str = "", commodity: str = "કપાસ"):
+    """Independently probe all three live sources for diagnostics; enable explicitly in Render."""
+    if os.getenv("MANDI_SOURCE_TEST_ENABLED", "false").strip().lower() not in {"1", "true", "yes", "on"}:
+        raise HTTPException(status_code=404, detail="Mandi source diagnostic is disabled")
+
+    state_name = (state or "Gujarat").strip() or "Gujarat"
+    market_name = (market or "").strip()
+    commodity_name = (commodity or "કપાસ").strip() or "કપાસ"
+    # Diagnostic calls are sequential and capped; this endpoint tests every source,
+    # even if an earlier source succeeds. It is not the normal production fallback path.
+    results: dict[str, Any] = {}
+
+    # 1. data.gov.in
+    source = "data.gov.in"
+    started = time.monotonic()
+    _mandi_source_log(source, "START", state=state_name, market=market_name, commodity=commodity_name)
+    try:
+        dg_deadline = time.monotonic() + min(12, MANDI_API_TIMEOUT_SECONDS)
+        dg_result = _mandi_api_get(state_name, market_name, commodity_name, request_deadline=dg_deadline)
+        dg_data = dg_result[0] if isinstance(dg_result, tuple) and len(dg_result) >= 1 else None
+        dg_error = str(dg_result[1] or "") if isinstance(dg_result, tuple) and len(dg_result) >= 2 else "unexpected_data_gov_response"
+        dg_status = int(dg_result[3] or 0) if isinstance(dg_result, tuple) and len(dg_result) >= 4 else 0
+        dg_rows = dg_data.get("records", []) if isinstance(dg_data, dict) else []
+        dg_rows = dg_rows if isinstance(dg_rows, list) else []
+        dg_count = len(dg_rows)
+        dg_ok = dg_count > 0
+        dg_result_status = "SUCCESS" if dg_ok else ("FAILED" if dg_error else "NO_USABLE_DATA")
+        results[source] = {"result": dg_result_status, "http_status": dg_status, "usable_records": dg_count,
+                           "error": _mandi_safe_error(Exception(dg_error)) if dg_error else ""}
+        _mandi_source_log(source, "RESULT", status=dg_result_status, elapsed_ms=int((time.monotonic()-started)*1000),
+                          http_status=dg_status, records=dg_count, state=state_name, market=market_name,
+                          commodity=commodity_name, error=dg_error)
+    except Exception as exc:
+        dg_error = _mandi_safe_error(exc)
+        results[source] = {"result": "FAILED", "http_status": 0, "usable_records": 0, "error": dg_error}
+        _mandi_source_log(source, "RESULT", status="FAILED", elapsed_ms=int((time.monotonic()-started)*1000),
+                          http_status=0, records=0, state=state_name, market=market_name,
+                          commodity=commodity_name, error=dg_error)
+
+    # 2. Public AGMARKNET source
+    source = "agmarknet_2_public"
+    started = time.monotonic()
+    _mandi_source_log(source, "START", state=state_name, market=market_name, commodity=commodity_name)
+    try:
+        ag_deadline = time.monotonic() + min(15, AGMARKNET_PUBLIC_TIMEOUT_SECONDS)
+        ag_rows, ag_error = await asyncio.wait_for(
+            _fetch_agmarknet_2_live(state_name, market_name, commodity_name, request_deadline=ag_deadline),
+            timeout=max(0.5, ag_deadline-time.monotonic()),
+        )
+        ag_normalized = _normalise_mandi_records(ag_rows) if ag_rows else []
+        ag_latest, ag_date = _mandi_latest_rows(ag_normalized) if ag_normalized else ([], "")
+        ag_count = len(ag_latest)
+        ag_result_status = "SUCCESS" if ag_count else ("FAILED" if ag_error else "NO_USABLE_DATA")
+        results[source] = {"result": ag_result_status, "http_status": 0, "usable_records": ag_count,
+                           "latest_date": ag_date, "error": str(ag_error or "")[:240]}
+        _mandi_source_log(source, "RESULT", status=ag_result_status, elapsed_ms=int((time.monotonic()-started)*1000),
+                          http_status=0, records=ag_count, state=state_name, market=market_name,
+                          commodity=commodity_name, error=ag_error)
+    except Exception as exc:
+        ag_error = _mandi_safe_error(exc)
+        results[source] = {"result": "FAILED", "http_status": 0, "usable_records": 0, "error": ag_error}
+        _mandi_source_log(source, "RESULT", status="FAILED", elapsed_ms=int((time.monotonic()-started)*1000),
+                          http_status=0, records=0, state=state_name, market=market_name,
+                          commodity=commodity_name, error=ag_error)
+
+    # 3. CEDA-hosted Agmarknet-derived source
+    source = "ceda_agmarknet_fallback"
+    started = time.monotonic()
+    _mandi_source_log(source, "START", state=state_name, market=market_name, commodity=commodity_name)
+    try:
+        if market_name:
+            ceda_rows, ceda_error = [], "CEDA fallback does not support exact market filter"
+        else:
+            ceda_deadline = time.monotonic() + min(12, MANDI_CEDA_TIMEOUT_SECONDS)
+            ceda_rows, ceda_error = await asyncio.wait_for(
+                _fetch_ceda_fresh_mandi(state_name, "", commodity_name),
+                timeout=max(0.5, ceda_deadline-time.monotonic()),
+            )
+        ceda_normalized = _normalise_mandi_records(ceda_rows) if ceda_rows else []
+        ceda_latest, ceda_date = _mandi_latest_rows(ceda_normalized) if ceda_normalized else ([], "")
+        ceda_count = len(ceda_latest)
+        ceda_result_status = "SUCCESS" if ceda_count else ("FAILED" if ceda_error else "NO_USABLE_DATA")
+        results[source] = {"result": ceda_result_status, "http_status": 0, "usable_records": ceda_count,
+                           "latest_date": ceda_date, "error": str(ceda_error or "")[:240]}
+        _mandi_source_log(source, "RESULT", status=ceda_result_status, elapsed_ms=int((time.monotonic()-started)*1000),
+                          http_status=0, records=ceda_count, state=state_name, market=market_name,
+                          commodity=commodity_name, error=ceda_error)
+    except Exception as exc:
+        ceda_error = _mandi_safe_error(exc)
+        results[source] = {"result": "FAILED", "http_status": 0, "usable_records": 0, "error": ceda_error}
+        _mandi_source_log(source, "RESULT", status="FAILED", elapsed_ms=int((time.monotonic()-started)*1000),
+                          http_status=0, records=0, state=state_name, market=market_name,
+                          commodity=commodity_name, error=ceda_error)
+
+    success_sources = [name for name, result in results.items() if result.get("result") == "SUCCESS"]
+    overall = "SUCCESS" if success_sources else "ALL_FAILED_OR_NO_DATA"
+    print(f"[MANDI_SOURCE_TEST] SUMMARY result={overall!r} successful_sources={success_sources!r} tested_sources={list(results.keys())!r}", flush=True)
+    return {"ok": True, "test_mode": True, "state": state_name, "market": market_name,
+            "commodity": commodity_name, "overall": overall, "successful_sources": success_sources,
+            "results": results,
+            "note": "This diagnostic endpoint independently probes all sources; production /api/v1/mandi still follows priority order and stops at first usable source."}
+
 
 @app.get("/api/v1/mandi")
 def mandi(state: str = "Gujarat", market: str = "", commodity: str = "ALL", request_deadline: float | None = None):
+    """Fetch mandi prices in the required source priority: data.gov.in, Agmarknet, then CEDA."""
     ist = timezone(timedelta(hours=5, minutes=30))
     checked_at = datetime.now(timezone.utc).astimezone(ist).strftime("%d-%m-%Y %H:%M")
     requested_commodity = (commodity or "ALL").strip() or "ALL"
     state_name = (state or "Gujarat").strip() or "Gujarat"
     market_name = (market or "").strip()
     deadline = request_deadline if request_deadline is not None else (time.monotonic() + MANDI_TOTAL_BUDGET_SECONDS)
-    source_policy = "AGMARKNET 2.0 daily (today → yesterday → last 3 days) + CEDA daily fallback + data.gov.in fallback"
+    source_policy = "data.gov.in official API (primary) → AGMARKNET 2.0 public API → CEDA/Agmarknet daily fallback; no fabricated prices"
 
     def unavailable(message: str, live_error: str, diagnostics: dict[str, Any] | None = None):
         return {
             "ok": True,
             "live_available": False,
-            "live_api_configured": True,
+            "live_api_configured": bool(MANDI_API_KEY),
             "source": "none",
             "checked_at": checked_at,
             "price_unit_source": "₹/quintal",
@@ -2768,24 +3081,80 @@ def mandi(state: str = "Gujarat", market: str = "", commodity: str = "ALL", requ
     if time.monotonic() >= deadline:
         return unavailable("Live Mandi માટે સમય મર્યાદા પૂરી થઈ ગઈ.", "mandi_total_budget_exceeded")
 
-    # 1) Primary: try exact date-scoped AGMARKNET reports in priority order.
+    # 1) PRIMARY: Government of India data.gov.in API.
+    _mandi_source_log("data.gov.in", "START", state=state_name, market=market_name, commodity=requested_commodity)
+    _dg_started = time.monotonic()
+    data_error = ""
+    upstream_status = 0
+    data = None
     try:
-        remaining = max(0.5, deadline - time.monotonic())
-        async def _ag_bounded():
-            return await asyncio.wait_for(
-                _fetch_agmarknet_2_live(state_name, market_name, requested_commodity, request_deadline=deadline),
-                timeout=remaining,
-            )
-        ag_records, ag_error = asyncio.run(_ag_bounded())
+        result = _mandi_api_get(state_name, market_name, requested_commodity, request_deadline=deadline)
+        if isinstance(result, tuple) and len(result) == 4:
+            data, data_error, _cooldown, upstream_status = result
+        elif isinstance(result, tuple) and len(result) >= 2:
+            data, data_error = result[0], result[1]
+        else:
+            data_error = "unexpected_data_gov_response"
     except Exception as exc:
-        ag_records, ag_error = [], f"{type(exc).__name__}: {str(exc)[:180]}"
+        data_error = f"{type(exc).__name__}: {str(exc)[:180]}"
+        print(f"[MANDI_DEBUG] data_gov_primary_exception error={data_error!r}")
+
+    if isinstance(data, dict):
+        records = data.get("records") or []
+        if not isinstance(records, list):
+            records = []
+        raw_diag = data.get("_diagnostics", {}) if isinstance(data.get("_diagnostics", {}), dict) else {}
+        raw_count = int(raw_diag.get("raw_record_count", len(records)) or len(records))
+        http_status = int(raw_diag.get("http_status", upstream_status or 200) or 200)
+        if records:
+            latest_rows, latest_date = _mandi_latest_rows(records)
+            if latest_rows:
+                print(f"[MANDI_DEBUG] source_success priority=1 source='data.gov.in' latest_date={latest_date!r} records={len(latest_rows)}")
+                _mandi_source_log("data.gov.in", "RESULT", status="SUCCESS", elapsed_ms=int((time.monotonic()-_dg_started)*1000), http_status=http_status, records=len(latest_rows), state=state_name, market=market_name, commodity=requested_commodity)
+                return {
+                    "ok": True,
+                    "live_available": True,
+                    "live_api_configured": bool(MANDI_API_KEY),
+                    "source": "official_api",
+                    "checked_at": checked_at,
+                    "price_unit_source": "₹/quintal (data.gov.in)",
+                    "display_price_unit": "₹/20kg",
+                    "records": latest_rows[:100],
+                    "message": f"ભારત સરકારના data.gov.in ડેટામાંથી {latest_date}નો ભાવ મળ્યો.",
+                    "latest_arrival_date": latest_rows[0].get("arrival_date", "") if latest_rows else latest_date,
+                    "source_policy": source_policy,
+                    "diagnostics": {
+                        "primary": {"request_ok": True, "http_status": http_status, "records": len(latest_rows), "source": "data.gov.in", "raw_records": raw_count, "latest_date": latest_date}
+                    },
+                }
+    _mandi_source_log("data.gov.in", "RESULT", status="FAILED" if data_error else "NO_USABLE_DATA", elapsed_ms=int((time.monotonic()-_dg_started)*1000), http_status=upstream_status, records=0, state=state_name, market=market_name, commodity=requested_commodity, error=data_error or "no_fresh_records")
+    print(f"[MANDI_DEBUG] primary_failed source='data.gov.in' error={data_error or 'no_fresh_records'!r} http_status={upstream_status}")
+
+    # 2) SECONDARY: AGMARKNET 2.0 public API, only after data.gov.in fails or has no usable records.
+    ag_error = ""
+    _ag_started = time.monotonic()
+    _mandi_source_log("agmarknet_2_public", "START", state=state_name, market=market_name, commodity=requested_commodity)
+    if time.monotonic() < deadline:
+        try:
+            remaining = max(0.5, deadline - time.monotonic())
+            async def _ag_bounded():
+                return await asyncio.wait_for(
+                    _fetch_agmarknet_2_live(state_name, market_name, requested_commodity, request_deadline=deadline),
+                    timeout=remaining,
+                )
+            ag_records, ag_error = asyncio.run(_ag_bounded())
+        except Exception as exc:
+            ag_records, ag_error = [], f"{type(exc).__name__}: {str(exc)[:180]}"
+    else:
+        ag_records, ag_error = [], "mandi_total_budget_exceeded_before_agmarknet"
 
     if ag_records:
         normalized = _normalise_mandi_records(ag_records)
         if normalized:
             latest_rows, latest_date = _mandi_latest_rows(normalized)
             normalized = latest_rows
-            print(f"[MANDI_DEBUG] fast_primary_success source='agmarknet_2_public' latest_date={latest_date!r} records={len(normalized)}")
+            print(f"[MANDI_DEBUG] source_success priority=2 source='agmarknet_2_public' latest_date={latest_date!r} records={len(normalized)}")
+            _mandi_source_log("agmarknet_2_public", "RESULT", status="SUCCESS", elapsed_ms=int((time.monotonic()-_ag_started)*1000), http_status=0, records=len(normalized), state=state_name, market=market_name, commodity=requested_commodity)
             return {
                 "ok": True,
                 "live_available": True,
@@ -2795,15 +3164,22 @@ def mandi(state: str = "Gujarat", market: str = "", commodity: str = "ALL", requ
                 "price_unit_source": "₹/quintal (AGMARKNET 2.0)",
                 "display_price_unit": "₹/20kg",
                 "records": normalized[:100],
-                "message": f"AGMARKNETનો {latest_date}નો અધિકૃત ભાવ મળ્યો.",
+                "message": f"AGMARKNETના {latest_date}ના ડેટામાંથી અધિકૃત ભાવ મળ્યો.",
                 "latest_arrival_date": normalized[0].get("arrival_date", "") if normalized else latest_date,
                 "source_policy": source_policy,
-                "diagnostics": {"primary": {"request_ok": True, "records": len(normalized), "source": "agmarknet_2_public", "latest_date": latest_date}},
+                "diagnostics": {
+                    "primary": {"request_ok": False, "records": 0, "source": "data.gov.in", "error": data_error or "no_fresh_records", "http_status": int(upstream_status or 0)},
+                    "secondary": {"request_ok": True, "records": len(normalized), "source": "agmarknet_2_public", "latest_date": latest_date},
+                },
             }
-    print(f"[MANDI_DEBUG] fast_primary_failed source='agmarknet_2_public' error={ag_error!r}")
+    _mandi_source_log("agmarknet_2_public", "RESULT", status="FAILED" if ag_error else "NO_USABLE_DATA", elapsed_ms=int((time.monotonic()-_ag_started)*1000), http_status=0, records=0, state=state_name, market=market_name, commodity=requested_commodity, error=ag_error or "no_fresh_records")
+    print(f"[MANDI_DEBUG] secondary_failed source='agmarknet_2_public' error={ag_error or 'no_fresh_records'!r}")
 
-    # 2) Secondary dated source on a different host (CEDA).
+    # 3) THIRD: CEDA-hosted Agmarknet daily data, only after the first two sources fail.
     ceda_error = ""
+    ceda_records = []
+    _ceda_started = time.monotonic()
+    _mandi_source_log("ceda_agmarknet_fallback", "START", state=state_name, market=market_name, commodity=requested_commodity)
     if time.monotonic() < deadline and market_name:
         ceda_error = "CEDA skipped because the request specifies an exact market"
     elif time.monotonic() < deadline:
@@ -2817,82 +3193,46 @@ def mandi(state: str = "Gujarat", market: str = "", commodity: str = "ALL", requ
             ceda_records, ceda_error = asyncio.run(_ceda_bounded())
         except Exception as exc:
             ceda_records, ceda_error = [], f"{type(exc).__name__}: {str(exc)[:180]}"
-        if ceda_records:
-            latest_rows, latest_date = _mandi_latest_rows(ceda_records)
-            normalized = _normalise_mandi_records(latest_rows)
-            if normalized:
-                print(f"[MANDI_DEBUG] ceda_daily_fallback_success latest_date={latest_date!r} records={len(normalized)}")
-                return {
-                    "ok": True,
-                    "live_available": True,
-                    "live_api_configured": True,
-                    "source": "ceda_agmarknet_fallback",
-                    "checked_at": checked_at,
-                    "price_unit_source": "₹/quintal (Agmarknet via CEDA)",
-                    "display_price_unit": "₹/20kg",
-                    "records": normalized[:100],
-                    "latest_arrival_date": normalized[0].get("arrival_date", "") if normalized else latest_date,
-                    "message": f"CEDAના દૈનિક Agmarknet ડેટામાંથી {latest_date}નો ભાવ મળ્યો.",
-                    "source_policy": source_policy,
-                    "diagnostics": {
-                        "primary": {"request_ok": False, "records": 0, "source": "agmarknet_2_public", "error": ag_error or "no_fresh_records"},
-                        "fallback": {"request_ok": True, "records": len(normalized), "source": "ceda_agmarknet_fallback", "latest_date": latest_date},
-                    },
-                }
-
-    # 3) Third fallback: official data.gov.in daily-price dataset.
-    if time.monotonic() >= deadline:
-        return unavailable("Live Mandi માટે સમય મર્યાદા પૂરી થઈ ગઈ.", "mandi_total_budget_exceeded", {
-            "primary": {"error": ag_error or "no_fresh_records"},
-            "ceda": {"error": ceda_error or "no_fresh_records"},
-        })
-
-    result = _mandi_api_get(state_name, market_name, requested_commodity, request_deadline=deadline)
-    if len(result) == 4:
-        data, data_error, _cooldown, upstream_status = result
     else:
-        data, data_error = result
-        upstream_status = 0
+        ceda_error = "mandi_total_budget_exceeded_before_ceda"
 
-    if isinstance(data, dict):
-        records = data.get("records") or []
-        if not isinstance(records, list):
-            records = []
-        raw_diag = data.get("_diagnostics", {}) if isinstance(data, dict) else {}
-        raw_count = int(raw_diag.get("raw_record_count", len(records)) or len(records))
-        http_status = int(raw_diag.get("http_status", upstream_status or 200) or 200)
-        if records:
-            latest_rows, latest_date = _mandi_latest_rows(records)
-            print(f"[MANDI_DEBUG] data_gov_fallback_success latest_date={latest_date!r} records={len(latest_rows)}")
+    if ceda_records:
+        latest_rows, latest_date = _mandi_latest_rows(ceda_records)
+        normalized = _normalise_mandi_records(latest_rows)
+        if normalized:
+            print(f"[MANDI_DEBUG] source_success priority=3 source='ceda_agmarknet_fallback' latest_date={latest_date!r} records={len(normalized)}")
+            _mandi_source_log("ceda_agmarknet_fallback", "RESULT", status="SUCCESS", elapsed_ms=int((time.monotonic()-_ceda_started)*1000), http_status=0, records=len(normalized), state=state_name, market=market_name, commodity=requested_commodity)
             return {
                 "ok": True,
                 "live_available": True,
-                "live_api_configured": bool(MANDI_API_KEY),
-                "source": "official_api",
+                "live_api_configured": True,
+                "source": "ceda_agmarknet_fallback",
                 "checked_at": checked_at,
-                "price_unit_source": "₹/quintal (data.gov.in)",
+                "price_unit_source": "₹/quintal (Agmarknet via CEDA)",
                 "display_price_unit": "₹/20kg",
-                "records": latest_rows[:100],
-                "message": f"સરકારી ડેટામાંથી {latest_date}નો ભાવ મળ્યો.",
-                "latest_arrival_date": latest_rows[0].get("arrival_date", "") if latest_rows else latest_date,
+                "records": normalized[:100],
+                "latest_arrival_date": normalized[0].get("arrival_date", "") if normalized else latest_date,
+                "message": f"CEDAના Agmarknet ડેટામાંથી {latest_date}નો ભાવ મળ્યો.",
                 "source_policy": source_policy,
                 "diagnostics": {
-                    "primary": {"request_ok": False, "records": 0, "source": "agmarknet_2_public", "error": ag_error or "no_fresh_records"},
-                    "ceda": {"request_ok": False, "source": "ceda_agmarknet_fallback", "error": ceda_error or "no_fresh_records"},
-                    "fallback": {"request_ok": True, "http_status": http_status, "records": len(latest_rows), "source": "data.gov.in", "raw_records": raw_count, "latest_date": latest_date},
+                    "primary": {"request_ok": False, "records": 0, "source": "data.gov.in", "error": data_error or "no_fresh_records", "http_status": int(upstream_status or 0)},
+                    "secondary": {"request_ok": False, "records": 0, "source": "agmarknet_2_public", "error": ag_error or "no_fresh_records"},
+                    "third": {"request_ok": True, "records": len(normalized), "source": "ceda_agmarknet_fallback", "latest_date": latest_date},
                 },
             }
 
+    _mandi_source_log("ceda_agmarknet_fallback", "RESULT", status="FAILED" if ceda_error else "NO_USABLE_DATA", elapsed_ms=int((time.monotonic()-_ceda_started)*1000), http_status=0, records=0, state=state_name, market=market_name, commodity=requested_commodity, error=ceda_error or "no_fresh_records")
     print(
-        f"[MANDI_DEBUG] final_result state={state_name!r} market={market_name!r} commodity={requested_commodity!r} "
-        f"records=0 source=none agmarknet_error={ag_error!r} ceda_error={ceda_error!r} data_gov_error={data_error or ''!r}"
+        f"[MANDI_DEBUG] all_sources_failed state={state_name!r} market={market_name!r} commodity={requested_commodity!r} "
+        f"data_gov_error={data_error or 'no_fresh_records'!r} agmarknet_error={ag_error or 'no_fresh_records'!r} "
+        f"ceda_error={ceda_error or 'no_fresh_records'!r}"
     )
     return unavailable(
-        "આજનો, ગઈકાલનો કે છેલ્લા 3 દિવસનો માન્ય બજાર ભાવ ઉપલબ્ધ નથી.",
-        data_error or ceda_error or ag_error or "no_fresh_data_in_last_3_days",
+        "આજનો, ગઈકાલનો કે છેલ્લા 3 દિવસનો માન્ય બજાર ભાવ કોઈપણ ઉપલબ્ધ સ્રોતમાંથી મળ્યો નથી.",
+        data_error or ag_error or ceda_error or "no_fresh_data_in_last_3_days",
         {
-            "primary": {"request_ok": False, "records": 0, "source": "agmarknet_2_public", "error": ag_error or "no_fresh_records"},
-            "ceda": {"request_ok": False, "records": 0, "source": "ceda_agmarknet_fallback", "error": ceda_error or "no_fresh_records"},
-            "data_gov": {"request_ok": False, "http_status": int(upstream_status or 0), "records": 0, "source": "data.gov.in", "error": data_error or "no_fresh_records"},
+            "primary": {"request_ok": False, "records": 0, "source": "data.gov.in", "http_status": int(upstream_status or 0), "error": data_error or "no_fresh_records"},
+            "secondary": {"request_ok": False, "records": 0, "source": "agmarknet_2_public", "error": ag_error or "no_fresh_records"},
+            "third": {"request_ok": False, "records": 0, "source": "ceda_agmarknet_fallback", "error": ceda_error or "no_fresh_records"},
         },
     )
