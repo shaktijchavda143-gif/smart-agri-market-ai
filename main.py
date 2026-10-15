@@ -3434,3 +3434,106 @@ def mandi(state: str = "Gujarat", market: str = "", commodity: str = "ALL", requ
             "third": {"request_ok": False, "records": 0, "source": "ceda_agmarknet_fallback", "error": ceda_error or "no_fresh_records"},
         },
     )
+
+
+# Phase 1: Mukadam marketplace API (appended; existing backend code preserved)
+from fastapi.responses import Response
+from typing import Optional
+from mukadam_service import (
+    init_mukadam_db,
+    register_or_update_mukadam,
+    update_mukadam_quick_status,
+    search_nearby_mukadams,
+    record_rating_or_contact,
+    export_mukadams_csv,
+)
+
+init_mukadam_db()
+
+
+class MukadamRegisterRequest(BaseModel):
+    name: str
+    mobile: str
+    pin: str
+    district: str = ""
+    taluka: str = ""
+    village: str = ""
+    latitude: float = 0.0
+    longitude: float = 0.0
+    available_status: str = "available"
+    available_from_date: str = ""
+    total_labors: int = 0
+    male_labors: int = 0
+    female_labors: int = 0
+    wage_type: str = "daily"
+    daily_wage_rate: float = 0.0
+    contract_rate_details: str = ""
+    rickshaw_fare_type: str = "per_km"
+    rickshaw_fare_rate: float = 0.0
+    mukadami_type: str = "per_labor"
+    mukadami_rate: float = 0.0
+    skills: str = ""
+    notes: str = ""
+
+
+class MukadamStatusRequest(BaseModel):
+    mobile: str
+    pin: str
+    available_status: str = "unavailable"
+    available_from_date: str = ""
+    total_labors: Optional[int] = None
+
+
+class MukadamActionRequest(BaseModel):
+    mobile: str
+    action: str = "contact"
+    stars: Optional[float] = None
+
+
+@app.post("/api/mukadam/register")
+async def api_mukadam_register(req: MukadamRegisterRequest):
+    return register_or_update_mukadam(req.dict())
+
+
+@app.post("/api/mukadam/status")
+async def api_mukadam_status(req: MukadamStatusRequest):
+    return update_mukadam_quick_status(req.dict())
+
+
+@app.get("/api/mukadam/search")
+async def api_mukadam_search(
+    district: str = "",
+    taluka: str = "",
+    skill: str = "",
+    lat: Optional[float] = None,
+    lon: Optional[float] = None,
+    max_km: float = 60.0,
+    required_labors: int = 0,
+    include_unavailable: bool = True,
+):
+    return search_nearby_mukadams(
+        district=district,
+        taluka=taluka,
+        skill=skill,
+        farmer_lat=lat,
+        farmer_lon=lon,
+        max_km=max_km,
+        required_labors=required_labors,
+        include_unavailable=include_unavailable,
+    )
+
+
+@app.post("/api/mukadam/action")
+async def api_mukadam_action(req: MukadamActionRequest):
+    return record_rating_or_contact(req.dict())
+
+
+@app.get("/api/mukadam/export_csv")
+async def api_mukadam_export_csv():
+    csv_data = export_mukadams_csv()
+    bom_csv = "\ufeff" + csv_data
+    return Response(
+        content=bom_csv.encode("utf-8"),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": "attachment; filename=gujarat_mukadam_list.csv"},
+    )
