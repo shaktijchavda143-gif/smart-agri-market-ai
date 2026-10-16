@@ -29,14 +29,14 @@ except Exception as _panchang_import_error:
     get_panchang = None
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from openai import OpenAI
 from google import genai
 from google.genai import types
 
-APP_VERSION = "14.2 AI VISION QUOTA FALLBACK FIX"
+APP_VERSION = "14.3 MUKADAM PHONE OTP SECURITY GATE"
 XAI_MODEL = os.getenv("XAI_MODEL", "grok-4.7").strip() or "grok-4.7"
 GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b").strip() or "openai/gpt-oss-120b"
 GEMINI_VISION_MODEL = os.getenv("GEMINI_VISION_MODEL", "gemini-3.6-flash").strip()
@@ -3447,17 +3447,36 @@ from mukadam_service import (
     record_rating_or_contact,
     export_mukadams_csv,
 )
+from mukadam_otp_service import (
+    init_mukadam_otp_db,
+    request_mukadam_otp,
+    verify_mukadam_otp,
+)
 
 init_mukadam_db()
+init_mukadam_otp_db()
+
+
+class MukadamOtpRequestModel(BaseModel):
+    mobile: str
+
+
+class MukadamOtpVerifyRequestModel(BaseModel):
+    mobile: str
+    otp: str
 
 
 class MukadamRegisterRequest(BaseModel):
     name: str
     mobile: str
     pin: str
+    verification_token: str
     district: str = ""
     taluka: str = ""
     village: str = ""
+    district_code: str = ""
+    taluka_code: str = ""
+    village_code: str = ""
     latitude: float = 0.0
     longitude: float = 0.0
     available_status: str = "available"
@@ -3490,9 +3509,29 @@ class MukadamActionRequest(BaseModel):
     stars: Optional[float] = None
 
 
+@app.post("/api/mukadam/otp/request")
+def api_mukadam_otp_request(req: MukadamOtpRequestModel, request: Request):
+    client_ip = request.client.host if request.client else "unknown"
+    result = request_mukadam_otp(req.mobile, client_ip)
+    if not result.get("ok"):
+        raise HTTPException(status_code=int(result.get("http_status", 400)), detail=result.get("message_gu", "OTP મોકલી શકાયો નથી."))
+    return result
+
+
+@app.post("/api/mukadam/otp/verify")
+def api_mukadam_otp_verify(req: MukadamOtpVerifyRequestModel):
+    result = verify_mukadam_otp(req.mobile, req.otp)
+    if not result.get("ok"):
+        raise HTTPException(status_code=int(result.get("http_status", 400)), detail=result.get("message_gu", "OTP verify થઈ શક્યો નથી."))
+    return result
+
+
 @app.post("/api/mukadam/register")
 async def api_mukadam_register(req: MukadamRegisterRequest):
-    return register_or_update_mukadam(req.dict())
+    result = register_or_update_mukadam(req.dict())
+    if not result.get("ok") and "OTP" in str(result.get("message_gu", "")):
+        raise HTTPException(status_code=403, detail=result.get("message_gu", "OTP verification required."))
+    return result
 
 
 @app.post("/api/mukadam/status")
@@ -3505,6 +3544,9 @@ async def api_mukadam_search(
     district: str = "",
     taluka: str = "",
     village: str = "",
+    district_code: str = "",
+    taluka_code: str = "",
+    village_code: str = "",
     skill: str = "",
     lat: Optional[float] = None,
     lon: Optional[float] = None,
@@ -3512,10 +3554,12 @@ async def api_mukadam_search(
     required_labors: int = 0,
     include_unavailable: bool = False,
 ):
-    return search_nearby_mukadams(
+    search_args = dict(
         district=district,
         taluka=taluka,
-        village=village,
+        district_code=district_code,
+        taluka_code=taluka_code,
+        village_code=village_code,
         skill=skill,
         farmer_lat=lat,
         farmer_lon=lon,
@@ -3523,6 +3567,14 @@ async def api_mukadam_search(
         required_labors=required_labors,
         include_unavailable=include_unavailable,
     )
+    try:
+        # Current mukadam_service.py supports village. Keep compatibility with a
+        # temporarily older deployed service during rolling/manual deployments.
+        return search_nearby_mukadams(village=village, **search_args)
+    except TypeError as exc:
+        if "unexpected keyword argument 'village'" not in str(exc):
+            raise
+        return search_nearby_mukadams(**search_args)
 
 
 @app.post("/api/mukadam/action")
