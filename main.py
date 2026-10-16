@@ -3504,16 +3504,18 @@ async def api_mukadam_status(req: MukadamStatusRequest):
 async def api_mukadam_search(
     district: str = "",
     taluka: str = "",
+    village: str = "",
     skill: str = "",
     lat: Optional[float] = None,
     lon: Optional[float] = None,
     max_km: float = 60.0,
     required_labors: int = 0,
-    include_unavailable: bool = True,
+    include_unavailable: bool = False,
 ):
     return search_nearby_mukadams(
         district=district,
         taluka=taluka,
+        village=village,
         skill=skill,
         farmer_lat=lat,
         farmer_lon=lon,
