@@ -13,6 +13,19 @@ import re
 import unicodedata
 from typing import List, Optional, Dict, Any, Tuple
 
+try:
+    from location_master import (
+        LocationMasterError, get_location_master_and_index, load_location_master,
+        location_labels_match_codes, resolve_location_names, resolve_location_selection, validate_location_codes,
+        validate_location_filter_codes,
+    )
+except ImportError:  # package-import compatibility for tests/tools
+    from .location_master import (
+        LocationMasterError, get_location_master_and_index, load_location_master,
+        location_labels_match_codes, resolve_location_names, resolve_location_selection, validate_location_codes,
+        validate_location_filter_codes,
+    )
+
 # On Render, mount a Persistent Disk at /var/data and set MUKADAM_DB_PATH and
 # MUKADAM_JSON_PATH to paths on that disk. Without it, files fall back to this project
 # directory; that directory is ephemeral on Render Free unless a remote snapshot is configured.
@@ -45,7 +58,17 @@ def _hash_pin(pin: str) -> str:
 
 
 def _clean_mobile(mobile: str) -> str:
-    digits = "".join(ch for ch in str(mobile) if ch.isdigit())
+    # Convert native Gujarati/other Unicode decimal digits to ASCII so OTP hashes,
+    # Twilio Verify, database keys, and Android payloads use one canonical number.
+    ascii_digits = []
+    for ch in str(mobile or ""):
+        if not ch.isdigit():
+            continue
+        try:
+            ascii_digits.append(str(unicodedata.digit(ch)))
+        except (TypeError, ValueError):
+            continue
+    digits = "".join(ascii_digits)
     if len(digits) > 10 and digits.startswith("91"):
         digits = digits[-10:]
     return digits
@@ -334,17 +357,20 @@ def _restore_from_local_json_if_empty() -> None:
                 """
                 INSERT OR IGNORE INTO mukadams (
                     name, mobile, pin_hash, district, taluka, village,
+                    district_code, taluka_code, village_code,
                     latitude, longitude, available_status, available_from_date,
                     total_labors, male_labors, female_labors,
                     wage_type, daily_wage_rate, contract_rate_details,
                     rickshaw_fare_type, rickshaw_fare_rate,
                     mukadami_type, mukadami_rate,
-                    skills, notes, rating_sum, rating_count, contact_clicks, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    skills, notes, rating_sum, rating_count, contact_clicks, updated_at,
+                    phone_verified_at, phone_verified
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     str(rec.get("name", "")), mobile, str(rec.get("pin_hash", "")),
                     str(rec.get("district", "")), str(rec.get("taluka", "")), str(rec.get("village", "")),
+                    str(rec.get("district_code", "")), str(rec.get("taluka_code", "")), str(rec.get("village_code", "")),
                     float(rec.get("latitude", 0.0) or 0.0), float(rec.get("longitude", 0.0) or 0.0),
                     str(rec.get("available_status", "available")), str(rec.get("available_from_date", "")),
                     int(rec.get("total_labors", 0) or 0), int(rec.get("male_labors", 0) or 0),
@@ -355,6 +381,8 @@ def _restore_from_local_json_if_empty() -> None:
                     str(rec.get("skills", "")), str(rec.get("notes", "")),
                     float(rec.get("rating_sum", 5.0) or 5.0), max(1, int(rec.get("rating_count", 1) or 1)),
                     int(rec.get("contact_clicks", 0) or 0), float(rec.get("updated_at", time.time()) or time.time()),
+                    max(0.0, float(rec.get("phone_verified_at", 0.0) or 0.0)) if int(rec.get("phone_verified", 0) or 0) == 1 else 0.0,
+                    1 if int(rec.get("phone_verified", 0) or 0) == 1 and float(rec.get("phone_verified_at", 0.0) or 0.0) > 0 else 0,
                 ),
             )
         conn.commit()
@@ -403,6 +431,9 @@ def init_mukadam_db() -> None:
                     district TEXT DEFAULT '',
                     taluka TEXT DEFAULT '',
                     village TEXT DEFAULT '',
+                    district_code TEXT DEFAULT '',
+                    taluka_code TEXT DEFAULT '',
+                    village_code TEXT DEFAULT '',
                     latitude REAL DEFAULT 0.0,
                     longitude REAL DEFAULT 0.0,
                     available_status TEXT DEFAULT 'available',
@@ -422,18 +453,66 @@ def init_mukadam_db() -> None:
                     rating_sum REAL DEFAULT 5.0,
                     rating_count INTEGER DEFAULT 1,
                     contact_clicks INTEGER DEFAULT 0,
-                    updated_at REAL DEFAULT 0.0
+                    updated_at REAL DEFAULT 0.0,
+                    phone_verified_at REAL NOT NULL DEFAULT 0.0,
+                    phone_verified INTEGER NOT NULL DEFAULT 0
                 )
                 """
             )
+            # Add columns to existing databases. A pre-OTP row has no proof, so SQLite's
+            # default 0 keeps it unverified until its owner completes a fresh OTP registration.
+            columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(mukadams)").fetchall()}
+            if "phone_verified_at" not in columns:
+                conn.execute("ALTER TABLE mukadams ADD COLUMN phone_verified_at REAL NOT NULL DEFAULT 0.0")
+            if "phone_verified" not in columns:
+                conn.execute("ALTER TABLE mukadams ADD COLUMN phone_verified INTEGER NOT NULL DEFAULT 0")
+            for location_column in ("district_code", "taluka_code", "village_code"):
+                if location_column not in columns:
+                    conn.execute(f"ALTER TABLE mukadams ADD COLUMN {location_column} TEXT NOT NULL DEFAULT ''")
             conn.commit()
         finally:
             conn.close()
         _restore_from_local_json_if_empty()
         _restore_from_github_if_empty()
+        _backfill_location_codes()
         _backfill_fallback_coordinates()
         _refresh_ram_cache()
         _CACHE_INITIALIZED = True
+
+
+def _backfill_location_codes() -> None:
+    """Attach LGD codes to legacy rows only when every text label resolves uniquely in its parent chain."""
+    try:
+        master, _ = load_location_master()
+    except (FileNotFoundError, LocationMasterError) as exc:
+        print(f"[Mukadam] LGD code backfill skipped: {exc}")
+        return
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        rows = conn.execute(
+            "SELECT mobile, district, taluka, village, district_code, taluka_code, village_code FROM mukadams"
+        ).fetchall()
+        changed = False
+        for mobile, district, taluka, village, dc, tc, vc in rows:
+            if str(dc or "").strip() and str(tc or "").strip() and str(vc or "").strip():
+                continue
+            # Do not infer from an isolated village name; all three levels must uniquely resolve.
+            resolved = resolve_location_selection(
+                district=district or "", taluka=taluka or "", village=village or "",
+                master=master, require_village=True,
+            )
+            if not resolved:
+                continue
+            conn.execute(
+                "UPDATE mukadams SET district=?, taluka=?, village=?, district_code=?, taluka_code=?, village_code=? WHERE mobile=?",
+                (resolved["district"], resolved["taluka"], resolved["village"],
+                 resolved["district_code"], resolved["taluka_code"], resolved["village_code"], _clean_mobile(mobile)),
+            )
+            changed = True
+        if changed:
+            conn.commit()
+    finally:
+        conn.close()
 
 
 def _backfill_fallback_coordinates() -> None:
@@ -593,13 +672,15 @@ def _restore_from_github_if_empty() -> None:
                 """
                 INSERT OR IGNORE INTO mukadams (
                     name, mobile, pin_hash, district, taluka, village,
+                    district_code, taluka_code, village_code,
                     latitude, longitude, available_status, available_from_date,
                     total_labors, male_labors, female_labors,
                     wage_type, daily_wage_rate, contract_rate_details,
                     rickshaw_fare_type, rickshaw_fare_rate,
                     mukadami_type, mukadami_rate,
-                    skills, notes, rating_sum, rating_count, contact_clicks, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    skills, notes, rating_sum, rating_count, contact_clicks, updated_at,
+                    phone_verified_at, phone_verified
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     rec.get("name", ""),
@@ -608,6 +689,9 @@ def _restore_from_github_if_empty() -> None:
                     rec.get("district", ""),
                     rec.get("taluka", ""),
                     rec.get("village", ""),
+                    str(rec.get("district_code", "")),
+                    str(rec.get("taluka_code", "")),
+                    str(rec.get("village_code", "")),
                     float(rec.get("latitude", 0.0)),
                     float(rec.get("longitude", 0.0)),
                     rec.get("available_status", "available"),
@@ -628,6 +712,8 @@ def _restore_from_github_if_empty() -> None:
                     int(rec.get("rating_count", 1)),
                     int(rec.get("contact_clicks", 0)),
                     float(rec.get("updated_at", time.time())),
+                    max(0.0, float(rec.get("phone_verified_at", 0.0) or 0.0)) if int(rec.get("phone_verified", 0) or 0) == 1 else 0.0,
+                    1 if int(rec.get("phone_verified", 0) or 0) == 1 and float(rec.get("phone_verified_at", 0.0) or 0.0) > 0 else 0,
                 ),
             )
         conn.commit()
@@ -653,11 +739,50 @@ def register_or_update_mukadam(payload: Dict[str, Any]) -> Dict[str, Any]:
             "message_gu": "સુરક્ષા માટે ૪ આંકડાનો સિક્રેટ પિન (દા.ત. 1234) રાખવો ફરજિયાત છે.",
         }
 
+    district_input = str(payload.get("district", "")).strip()
+    taluka_input = str(payload.get("taluka", "")).strip()
+    village_input = str(payload.get("village", "")).strip()
+    try:
+        location_master, _ = load_location_master()
+    except (FileNotFoundError, LocationMasterError) as exc:
+        print(f"[Mukadam] Registration blocked because LGD master is unavailable: {exc}")
+        return {"ok": False, "message_gu": "અધિકૃત LGD ગામ યાદી ઉપલબ્ધ નથી. હાલ નોંધણી કરી શકાતી નથી."}
+    location = resolve_location_selection(
+        district_code=payload.get("district_code", ""),
+        taluka_code=payload.get("taluka_code", ""),
+        village_code=payload.get("village_code", ""),
+        district=district_input, taluka=taluka_input, village=village_input,
+        master=location_master, require_village=True,
+    )
+    if not location:
+        return {"ok": False, "message_gu": "અધિકૃત યાદીમાંથી સાચો જિલ્લો, તાલુકો અને ગામ પસંદ કરો; LGD કોડનો parent chain ખોટો અથવા અધૂરો છે."}
+    # Check each provided label against the entity selected by its LGD code.
+    # This also permits duplicate locality names to remain addressable by unique codes.
+    if not location_labels_match_codes(
+        location, district=district_input, taluka=taluka_input, village=village_input, master=location_master
+    ):
+        return {"ok": False, "message_gu": "નામ અને LGD કોડ વચ્ચે મેળ નથી. જિલ્લા, તાલુકો અને ગામ ફરી પસંદ કરો."}
+    district_value = location["district"]
+    taluka_value = location["taluka"]
+    village_value = location["village"]
+    district_code_value = location["district_code"]
+    taluka_code_value = location["taluka_code"]
+    village_code_value = location["village_code"]
+
+    verification_token = str(payload.get("verification_token", "")).strip()
+    try:
+        from mukadam_otp_service import consume_registration_token
+        phone_verified = consume_registration_token(verification_token, mobile)
+    except Exception:
+        phone_verified = False
+    if not phone_verified:
+        return {
+            "ok": False,
+            "message_gu": "મુકાદમ નોંધણી માટે આ જ મોબાઇલ નંબરનો OTP સફળતાપૂર્વક verify કરવો જરૂરી છે. કૃપા કરીને OTP ફરી ચકાસો.",
+        }
+
     pin_hash = _hash_pin(pin)
     now = time.time()
-    district_value = str(payload.get("district", "")).strip()
-    taluka_value = str(payload.get("taluka", "")).strip()
-    village_value = str(payload.get("village", "")).strip()
     try:
         latitude_value = float(payload.get("latitude", 0.0) or 0.0)
         longitude_value = float(payload.get("longitude", 0.0) or 0.0)
@@ -696,13 +821,14 @@ def register_or_update_mukadam(payload: Dict[str, Any]) -> Dict[str, Any]:
                     """
                     UPDATE mukadams SET
                         name = ?, district = ?, taluka = ?, village = ?,
+                        district_code = ?, taluka_code = ?, village_code = ?,
                         latitude = ?, longitude = ?,
                         available_status = ?, available_from_date = ?,
                         total_labors = ?, male_labors = ?, female_labors = ?,
                         wage_type = ?, daily_wage_rate = ?, contract_rate_details = ?,
                         rickshaw_fare_type = ?, rickshaw_fare_rate = ?,
                         mukadami_type = ?, mukadami_rate = ?,
-                        skills = ?, notes = ?, updated_at = ?
+                        skills = ?, notes = ?, updated_at = ?, phone_verified_at = ?, phone_verified = 1
                     WHERE mobile = ?
                     """,
                     (
@@ -710,6 +836,9 @@ def register_or_update_mukadam(payload: Dict[str, Any]) -> Dict[str, Any]:
                         district_value,
                         taluka_value,
                         village_value,
+                        district_code_value,
+                        taluka_code_value,
+                        village_code_value,
                         latitude_value,
                         longitude_value,
                         str(payload.get("available_status", "available")).strip(),
@@ -727,6 +856,7 @@ def register_or_update_mukadam(payload: Dict[str, Any]) -> Dict[str, Any]:
                         skills_str,
                         str(payload.get("notes", "")).strip(),
                         now,
+                        now,
                         mobile,
                     ),
                 )
@@ -736,13 +866,15 @@ def register_or_update_mukadam(payload: Dict[str, Any]) -> Dict[str, Any]:
                     """
                     INSERT INTO mukadams (
                         name, mobile, pin_hash, district, taluka, village,
+                        district_code, taluka_code, village_code,
                         latitude, longitude, available_status, available_from_date,
                         total_labors, male_labors, female_labors,
                         wage_type, daily_wage_rate, contract_rate_details,
                         rickshaw_fare_type, rickshaw_fare_rate,
                         mukadami_type, mukadami_rate,
-                        skills, notes, rating_sum, rating_count, contact_clicks, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 5.0, 1, 0, ?)
+                        skills, notes, rating_sum, rating_count, contact_clicks, updated_at,
+                        phone_verified_at, phone_verified
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 5.0, 1, 0, ?, ?, 1)
                     """,
                     (
                         name,
@@ -751,6 +883,9 @@ def register_or_update_mukadam(payload: Dict[str, Any]) -> Dict[str, Any]:
                         district_value,
                         taluka_value,
                         village_value,
+                        district_code_value,
+                        taluka_code_value,
+                        village_code_value,
                         latitude_value,
                         longitude_value,
                         str(payload.get("available_status", "available")).strip(),
@@ -767,6 +902,7 @@ def register_or_update_mukadam(payload: Dict[str, Any]) -> Dict[str, Any]:
                         float(payload.get("mukadami_rate", 0.0) or 0.0),
                         skills_str,
                         str(payload.get("notes", "")).strip(),
+                        now,
                         now,
                     ),
                 )
@@ -810,6 +946,8 @@ def update_mukadam_quick_status(payload: Dict[str, Any]) -> Dict[str, Any]:
                 }
             if existing["pin_hash"] != pin_hash:
                 return {"ok": False, "message_gu": "તમારો ૪ આંકડાનો સિક્રેટ પિન ખોટો છે."}
+            if int(existing["phone_verified"] or 0) != 1:
+                return {"ok": False, "message_gu": "તમારી જૂની પ્રોફાઇલમાં મોબાઇલ OTP ચકાસણી બાકી છે. પહેલાં સંપૂર્ણ નોંધણીમાં OTP verify કરો."}
             if total_labors is not None:
                 conn.execute(
                     """
@@ -846,6 +984,8 @@ def update_mukadam_quick_status(payload: Dict[str, Any]) -> Dict[str, Any]:
         )
     if public_profile is not None:
         public_profile.pop("pin_hash", None)
+        public_profile.pop("phone_verified", None)
+        public_profile.pop("phone_verified_at", None)
     return {
         "ok": True,
         "message_gu": f"તમારું સ્ટેટસ બદલાઈ ગયું છે: {status_gu}",
@@ -899,16 +1039,44 @@ def search_nearby_mukadams(
     max_km: float = 60.0,
     required_labors: int = 0,
     include_unavailable: bool = False,
+    district_code: str = "",
+    taluka_code: str = "",
+    village_code: str = "",
 ) -> Dict[str, Any]:
-    """Search with strict locality matching and user-controlled availability."""
+    """Search using validated LGD codes; names are only display/legacy resolution inputs."""
     if not _CACHE_INITIALIZED:
         init_mukadam_db()
-    now = time.time()
-    district_filter = _norm_gu(district)
-    taluka_filter = _norm_gu(taluka)
-    village_filter = _norm_gu(village)
+    try:
+        location_master, location_index = get_location_master_and_index()
+    except (FileNotFoundError, LocationMasterError) as exc:
+        print(f"[MUKADAM_SEARCH_DIAG] location_master_unavailable=true error={type(exc).__name__}")
+        return {"ok": False, "count": 0, "message_gu": "અધિકૃત LGD ગામ યાદી ઉપલબ્ધ નથી; સુરક્ષિત લોકેશન સર્ચ હાલ થઈ શકતું નથી.", "mukadams": []}
+
+    selection = resolve_location_selection(
+        district_code=district_code, taluka_code=taluka_code, village_code=village_code,
+        district=district, taluka=taluka, village=village, master=location_master, require_village=False,
+    )
+    if selection is None:
+        return {"ok": False, "count": 0, "message_gu": "પસંદ કરેલો જિલ્લો, તાલુકો અથવા ગામ સત્તાવાર LGD કોડ સાથે મેળ ખાતો નથી.", "mukadams": []}
+    # Verify labels against the entity selected by each code. Some talukas contain
+    # duplicate English/Gujarati village names; the LGD code remains the identity.
+    if not location_labels_match_codes(
+        selection, district=district, taluka=taluka, village=village, master=location_master
+    ):
+        return {"ok": False, "count": 0, "message_gu": "લોકેશનનું નામ અને LGD કોડ અલગ છે; ફરી પસંદ કરો.", "mukadams": []}
+
+    district_code_filter = selection["district_code"]
+    taluka_code_filter = selection["taluka_code"]
+    village_code_filter = selection["village_code"]
+    district = selection["district"]
+    taluka = selection["taluka"]
+    village = selection["village"]
+    district_filter = district_code_filter
+    taluka_filter = taluka_code_filter
+    village_filter = village_code_filter
     skill_filter = _norm_gu(skill)
     ref_lat, ref_lon = _resolve_coordinates(farmer_lat, farmer_lon, district, taluka, village)
+    now = time.time()
 
     with _MUKADAM_LOCK:
         cached_list = [dict(item) for item in _MUKADAM_RAM_CACHE]
@@ -917,6 +1085,8 @@ def search_nearby_mukadams(
     # names, phone numbers, PIN hashes, or precise coordinates.
     search_diag = {
         "cached": len(cached_list),
+        "excluded_unverified": 0,
+        "excluded_invalid_location": 0,
         "excluded_unavailable": 0,
         "excluded_district": 0,
         "excluded_skill": 0,
@@ -926,10 +1096,26 @@ def search_nearby_mukadams(
         "included_radius": 0,
         "included_fallback": 0,
     }
+    nearest_distance_km: Optional[float] = None
+    has_real_farmer_gps = (
+        farmer_lat is not None and farmer_lon is not None
+        and abs(float(farmer_lat or 0.0)) > 0.001 and abs(float(farmer_lon or 0.0)) > 0.001
+    )
+    # A selected village/taluka is a valid approximate search origin when the
+    # phone cannot provide GPS. Previously radius matching required real GPS only,
+    # so nearby profiles were discarded even when both village centroids were known.
+    has_reference_coordinates = (
+        ref_lat is not None and ref_lon is not None
+        and abs(float(ref_lat or 0.0)) > 0.001 and abs(float(ref_lon or 0.0)) > 0.001
+    )
     eligible: List[Dict[str, Any]] = []
     for raw in cached_list:
         item = dict(raw)
         item.pop("pin_hash", None)
+        # Legacy/backup rows without historical OTP proof must not be presented as verified.
+        if int(item.get("phone_verified", 0) or 0) != 1:
+            search_diag["excluded_unverified"] += 1
+            continue
         status = str(item.get("available_status", "available")).strip().lower()
         if not include_unavailable and status == "unavailable":
             search_diag["excluded_unavailable"] += 1
@@ -938,17 +1124,47 @@ def search_nearby_mukadams(
             status = "available"
             item["available_status"] = status
 
-        item_district = _norm_gu(item.get("district", ""))
-        item_taluka = _norm_gu(item.get("taluka", ""))
-        item_village = _norm_gu(item.get("village", ""))
-        same_district = bool(district_filter and item_district == district_filter)
-        same_taluka = bool(taluka_filter and item_taluka == taluka_filter)
-        same_village = bool(village_filter and item_village == village_filter)
+        item_dc = str(item.get("district_code", "") or "").strip()
+        item_tc = str(item.get("taluka_code", "") or "").strip()
+        item_vc = str(item.get("village_code", "") or "").strip()
+        if any((item_dc, item_tc, item_vc)):
+            indexed_district = location_index["districts"].get(item_dc)
+            indexed_taluka = location_index["talukas_by_parent"].get((item_dc, item_tc))
+            indexed_village = location_index["villages_by_parent"].get((item_dc, item_tc, item_vc))
+            if indexed_district and indexed_taluka and indexed_village:
+                item_location = {
+                    "district_code": item_dc, "district": str(indexed_district.get("name_gu") or indexed_district.get("name_en") or ""),
+                    "taluka_code": item_tc, "taluka": str(indexed_taluka.get("name_gu") or indexed_taluka.get("name_en") or ""),
+                    "village_code": item_vc, "village": str(indexed_village.get("name_gu") or indexed_village.get("name_en") or ""),
+                }
+            else:
+                item_location = None
+        else:
+            # Legacy verified rows can participate only if their entire name chain resolves uniquely.
+            item_location = resolve_location_selection(
+                district=item.get("district", ""), taluka=item.get("taluka", ""), village=item.get("village", ""),
+                master=location_master, require_village=True,
+            )
+        if not item_location:
+            search_diag["excluded_invalid_location"] += 1
+            continue
+        item["district_code"] = item_location["district_code"]
+        item["taluka_code"] = item_location["taluka_code"]
+        item["village_code"] = item_location["village_code"]
+        item["district"] = item_location["district"]
+        item["taluka"] = item_location["taluka"]
+        item["village"] = item_location["village"]
+        item_district = item_location["district_code"]
+        item_taluka = item_location["taluka_code"]
+        item_village = item_location["village_code"]
+        same_district = bool(district_code_filter and item_district == district_code_filter)
+        same_taluka = bool(taluka_code_filter and item_taluka == taluka_code_filter)
+        same_village = bool(village_code_filter and item_village == village_code_filter)
 
         # District remains a hard boundary when the farmer selected it. Village and
         # taluka are ranking preferences, not hard exclusions, when real farmer GPS is
         # available: nearby villages must still be discoverable within max_km.
-        if district_filter and item_district != district_filter:
+        if district_code_filter and item_district != district_code_filter:
             search_diag["excluded_district"] += 1
             continue
         if skill_filter and skill_filter not in (_norm_gu("બધા કામ"), _norm_gu("તમામ"), _norm_gu("બધા"), _norm_gu("all")):
@@ -969,26 +1185,31 @@ def search_nearby_mukadams(
         item["_same_taluka"] = same_taluka
         item["_same_village"] = same_village
         item["_distance_km_for_sort"] = distance_km
-        item["_locality_rank"] = 0 if village_filter and same_village else (1 if taluka_filter and same_taluka else (2 if district_filter and same_district else 3))
+        item["_locality_rank"] = 0 if village_code_filter and same_village else (1 if taluka_code_filter and same_taluka else (2 if district_code_filter and same_district else 3))
+        if distance_km is not None:
+            nearest_distance_km = distance_km if nearest_distance_km is None else min(nearest_distance_km, distance_km)
 
-        exact_locality = (not village_filter or same_village) and (not taluka_filter or same_taluka)
-        has_real_farmer_gps = (
-            farmer_lat is not None and farmer_lon is not None
-            and abs(float(farmer_lat or 0.0)) > 0.001 and abs(float(farmer_lon or 0.0)) > 0.001
+        # An exact village match in the selected district must not disappear just
+        # because a saved GPS point is stale or the phone has no GPS. If no village
+        # is selected, an exact selected taluka is also a locality match.
+        exact_locality = (
+            (bool(village_code_filter) and same_village and (not district_code_filter or same_district))
+            or (not village_code_filter and bool(taluka_code_filter) and same_taluka and (not district_code_filter or same_district))
+            or (not village_code_filter and not taluka_code_filter and (not district_code_filter or same_district))
         )
         is_nearby = (
-            has_real_farmer_gps and max_km > 0 and distance_km is not None
+            has_reference_coordinates and max_km > 0 and distance_km is not None
             and distance_km <= max_km
         )
-        # With GPS, include the selected locality plus other nearby workers within
-        # radius; without GPS, retain strict village/taluka filtering.
+        # Radius matching works from real GPS or a known village/taluka/district
+        # centroid. If no reference point can be resolved, do not fabricate distance.
         if exact_locality:
             search_diag["included_exact_locality"] += 1
             eligible.append(item)
         elif is_nearby:
             search_diag["included_radius"] += 1
             eligible.append(item)
-        elif not village_filter and not taluka_filter and not has_real_farmer_gps:
+        elif not village_code_filter and not taluka_code_filter and not has_real_farmer_gps:
             # Keep the legacy no-location browsing behavior when the user selected
             # neither a locality nor GPS search.
             search_diag["included_fallback"] += 1
@@ -999,11 +1220,11 @@ def search_nearby_mukadams(
                 search_diag["unknown_distance"] += 1
 
     selected: List[Dict[str, Any]] = eligible
-    if village_filter:
+    if village_code_filter:
         fallback_level = "village"
-    elif taluka_filter:
+    elif taluka_code_filter:
         fallback_level = "taluka"
-    elif district_filter:
+    elif district_code_filter:
         fallback_level = "district"
     else:
         fallback_level = "nearby"
@@ -1031,6 +1252,8 @@ def search_nearby_mukadams(
             distance_sort = 0.0 if fallback_level in ("village", "taluka", "district") else 9999.0
         else:
             distance_sort = float(distance_km)
+        item.pop("phone_verified", None)
+        item.pop("phone_verified_at", None)
         item.pop("_same_district", None)
         item.pop("_same_taluka", None)
         item.pop("_same_village", None)
@@ -1043,15 +1266,17 @@ def search_nearby_mukadams(
     # Emit one aggregate-only line for every search, not just empty lists. This also
     # helps diagnose a missing expected profile when other workers were returned.
     print("[MUKADAM_SEARCH_DIAG] " + json.dumps({
+        "district_code": district_code_filter,
+        "taluka_code": taluka_code_filter,
+        "village_code": village_code_filter,
         "district": district or "",
         "taluka": taluka or "",
         "village": village or "",
         "max_km": max_km,
-        "gps_supplied": bool(
-            farmer_lat is not None and farmer_lon is not None
-            and abs(float(farmer_lat or 0.0)) > 0.001
-            and abs(float(farmer_lon or 0.0)) > 0.001
-        ),
+        "gps_supplied": has_real_farmer_gps,
+        "reference_coordinates_available": has_reference_coordinates,
+        "reference_source": "gps" if has_real_farmer_gps else ("selected_locality_centroid" if has_reference_coordinates and (village_filter or taluka_filter or district_filter) else ("fallback_centroid" if has_reference_coordinates else "none")),
+        "nearest_distance_km": round(nearest_distance_km, 1) if nearest_distance_km is not None else None,
         "returned": len(final_items),
         **search_diag,
     }, ensure_ascii=False))
@@ -1081,14 +1306,14 @@ def record_rating_or_contact(payload: Dict[str, Any]) -> Dict[str, Any]:
                     """
                     UPDATE mukadams
                     SET rating_sum = rating_sum + ?, rating_count = rating_count + 1
-                    WHERE mobile = ?
+                    WHERE mobile = ? AND phone_verified = 1
                     """,
                     (rating, mobile),
                 )
                 message = "તમારું રેટિંગ નોંધાઈ ગયું છે. આભાર!"
             else:
                 conn.execute(
-                    "UPDATE mukadams SET contact_clicks = contact_clicks + 1 WHERE mobile = ?",
+                    "UPDATE mukadams SET contact_clicks = contact_clicks + 1 WHERE mobile = ? AND phone_verified = 1",
                     (mobile,),
                 )
                 message = "સંપર્ક નોંધાયો."
