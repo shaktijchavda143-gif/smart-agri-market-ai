@@ -913,12 +913,26 @@ def search_nearby_mukadams(
     with _MUKADAM_LOCK:
         cached_list = [dict(item) for item in _MUKADAM_RAM_CACHE]
 
+    # Aggregate-only diagnostics help diagnose empty production searches without logging
+    # names, phone numbers, PIN hashes, or precise coordinates.
+    search_diag = {
+        "cached": len(cached_list),
+        "excluded_unavailable": 0,
+        "excluded_district": 0,
+        "excluded_skill": 0,
+        "excluded_radius": 0,
+        "unknown_distance": 0,
+        "included_exact_locality": 0,
+        "included_radius": 0,
+        "included_fallback": 0,
+    }
     eligible: List[Dict[str, Any]] = []
     for raw in cached_list:
         item = dict(raw)
         item.pop("pin_hash", None)
         status = str(item.get("available_status", "available")).strip().lower()
         if not include_unavailable and status == "unavailable":
+            search_diag["excluded_unavailable"] += 1
             continue
         if status not in ("available", "future", "unavailable"):
             status = "available"
@@ -931,16 +945,15 @@ def search_nearby_mukadams(
         same_taluka = bool(taluka_filter and item_taluka == taluka_filter)
         same_village = bool(village_filter and item_village == village_filter)
 
-        # Every user-selected locality is a strict filter. Do not broaden a village
-        # search to the whole taluka/district if that village has no matching profile.
+        # District remains a hard boundary when the farmer selected it. Village and
+        # taluka are ranking preferences, not hard exclusions, when real farmer GPS is
+        # available: nearby villages must still be discoverable within max_km.
         if district_filter and item_district != district_filter:
-            continue
-        if taluka_filter and item_taluka != taluka_filter:
-            continue
-        if village_filter and item_village != village_filter:
+            search_diag["excluded_district"] += 1
             continue
         if skill_filter and skill_filter not in (_norm_gu("બધા કામ"), _norm_gu("તમામ"), _norm_gu("બધા"), _norm_gu("all")):
             if skill_filter not in _norm_gu(item.get("skills", "")):
+                search_diag["excluded_skill"] += 1
                 continue
 
         item_lat, item_lon = _resolve_coordinates(
@@ -956,9 +969,35 @@ def search_nearby_mukadams(
         item["_same_taluka"] = same_taluka
         item["_same_village"] = same_village
         item["_distance_km_for_sort"] = distance_km
-        eligible.append(item)
+        item["_locality_rank"] = 0 if village_filter and same_village else (1 if taluka_filter and same_taluka else (2 if district_filter and same_district else 3))
 
-    # All selected locality dimensions have already been applied strictly above.
+        exact_locality = (not village_filter or same_village) and (not taluka_filter or same_taluka)
+        has_real_farmer_gps = (
+            farmer_lat is not None and farmer_lon is not None
+            and abs(float(farmer_lat or 0.0)) > 0.001 and abs(float(farmer_lon or 0.0)) > 0.001
+        )
+        is_nearby = (
+            has_real_farmer_gps and max_km > 0 and distance_km is not None
+            and distance_km <= max_km
+        )
+        # With GPS, include the selected locality plus other nearby workers within
+        # radius; without GPS, retain strict village/taluka filtering.
+        if exact_locality:
+            search_diag["included_exact_locality"] += 1
+            eligible.append(item)
+        elif is_nearby:
+            search_diag["included_radius"] += 1
+            eligible.append(item)
+        elif not village_filter and not taluka_filter and not has_real_farmer_gps:
+            # Keep the legacy no-location browsing behavior when the user selected
+            # neither a locality nor GPS search.
+            search_diag["included_fallback"] += 1
+            eligible.append(item)
+        else:
+            search_diag["excluded_radius"] += 1
+            if distance_km is None:
+                search_diag["unknown_distance"] += 1
+
     selected: List[Dict[str, Any]] = eligible
     if village_filter:
         fallback_level = "village"
@@ -966,11 +1005,7 @@ def search_nearby_mukadams(
         fallback_level = "taluka"
     elif district_filter:
         fallback_level = "district"
-    elif ref_lat is not None and ref_lon is not None and max_km > 0:
-        selected = [m for m in eligible if m.get("distance_km") is not None and m["distance_km"] <= max_km]
-        fallback_level = "nearby"
     else:
-        # No locality or GPS filter: preserve the prior browse-all behavior.
         fallback_level = "nearby"
 
     final_rows = []
@@ -991,10 +1026,7 @@ def search_nearby_mukadams(
             item["updated_text_gu"] = f"{hours_ago // 24} દિવસ પહેલાં અપડેટ કર્યું"
         item["cost_breakdown"] = _calculate_estimated_cost(item, required_labors, distance_km)
         status_rank = 0 if item.get("available_status") == "available" else (1 if item.get("available_status") == "future" else 2)
-        if fallback_level == "village": locality_rank = 0
-        elif fallback_level == "taluka": locality_rank = 1
-        elif fallback_level == "district": locality_rank = 2
-        else: locality_rank = 3
+        locality_rank = int(item.get("_locality_rank", 3))
         if distance_km is None:
             distance_sort = 0.0 if fallback_level in ("village", "taluka", "district") else 9999.0
         else:
@@ -1002,11 +1034,27 @@ def search_nearby_mukadams(
         item.pop("_same_district", None)
         item.pop("_same_taluka", None)
         item.pop("_same_village", None)
+        item.pop("_locality_rank", None)
         item.pop("_distance_km_for_sort", None)
         final_rows.append((status_rank, locality_rank, distance_sort, -float(item.get("updated_at", 0) or 0), item))
 
     final_rows.sort(key=lambda row: (row[0], row[1], row[2], row[3]))
     final_items = [row[4] for row in final_rows]
+    # Emit one aggregate-only line for every search, not just empty lists. This also
+    # helps diagnose a missing expected profile when other workers were returned.
+    print("[MUKADAM_SEARCH_DIAG] " + json.dumps({
+        "district": district or "",
+        "taluka": taluka or "",
+        "village": village or "",
+        "max_km": max_km,
+        "gps_supplied": bool(
+            farmer_lat is not None and farmer_lon is not None
+            and abs(float(farmer_lat or 0.0)) > 0.001
+            and abs(float(farmer_lon or 0.0)) > 0.001
+        ),
+        "returned": len(final_items),
+        **search_diag,
+    }, ensure_ascii=False))
     return {
         "ok": True,
         "count": len(final_items),
