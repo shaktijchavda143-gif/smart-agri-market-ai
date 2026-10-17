@@ -36,7 +36,7 @@ from openai import OpenAI
 from google import genai
 from google.genai import types
 
-APP_VERSION = "14.3 MUKADAM PHONE OTP SECURITY GATE"
+APP_VERSION = "14.4 MUKADAM PIN ONLY"
 XAI_MODEL = os.getenv("XAI_MODEL", "grok-4.7").strip() or "grok-4.7"
 GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b").strip() or "openai/gpt-oss-120b"
 GEMINI_VISION_MODEL = os.getenv("GEMINI_VISION_MODEL", "gemini-3.6-flash").strip()
@@ -3447,30 +3447,13 @@ from mukadam_service import (
     record_rating_or_contact,
     export_mukadams_csv,
 )
-from mukadam_otp_service import (
-    init_mukadam_otp_db,
-    request_mukadam_otp,
-    verify_mukadam_otp,
-)
-
 init_mukadam_db()
-init_mukadam_otp_db()
-
-
-class MukadamOtpRequestModel(BaseModel):
-    mobile: str
-
-
-class MukadamOtpVerifyRequestModel(BaseModel):
-    mobile: str
-    otp: str
 
 
 class MukadamRegisterRequest(BaseModel):
     name: str
     mobile: str
     pin: str
-    verification_token: str
     district: str = ""
     taluka: str = ""
     village: str = ""
@@ -3509,34 +3492,22 @@ class MukadamActionRequest(BaseModel):
     stars: Optional[float] = None
 
 
-@app.post("/api/mukadam/otp/request")
-def api_mukadam_otp_request(req: MukadamOtpRequestModel, request: Request):
-    client_ip = request.client.host if request.client else "unknown"
-    result = request_mukadam_otp(req.mobile, client_ip)
-    if not result.get("ok"):
-        raise HTTPException(status_code=int(result.get("http_status", 400)), detail=result.get("message_gu", "OTP મોકલી શકાયો નથી."))
-    return result
-
-
-@app.post("/api/mukadam/otp/verify")
-def api_mukadam_otp_verify(req: MukadamOtpVerifyRequestModel):
-    result = verify_mukadam_otp(req.mobile, req.otp)
-    if not result.get("ok"):
-        raise HTTPException(status_code=int(result.get("http_status", 400)), detail=result.get("message_gu", "OTP verify થઈ શક્યો નથી."))
-    return result
-
-
 @app.post("/api/mukadam/register")
-async def api_mukadam_register(req: MukadamRegisterRequest):
-    result = register_or_update_mukadam(req.dict())
-    if not result.get("ok") and "OTP" in str(result.get("message_gu", "")):
-        raise HTTPException(status_code=403, detail=result.get("message_gu", "OTP verification required."))
+async def api_mukadam_register(req: MukadamRegisterRequest, request: Request):
+    client_ip = request.client.host if request.client else "unknown"
+    result = register_or_update_mukadam(req.dict(), client_ip=client_ip)
+    if int(result.get("http_status", 200) or 200) == 429:
+        raise HTTPException(status_code=429, detail=result.get("message_gu", "ઘણા પ્રયાસ થયા છે. થોડા સમય પછી ફરી પ્રયાસ કરો."))
     return result
 
 
 @app.post("/api/mukadam/status")
-async def api_mukadam_status(req: MukadamStatusRequest):
-    return update_mukadam_quick_status(req.dict())
+async def api_mukadam_status(req: MukadamStatusRequest, request: Request):
+    client_ip = request.client.host if request.client else "unknown"
+    result = update_mukadam_quick_status(req.dict(), client_ip=client_ip)
+    if int(result.get("http_status", 200) or 200) == 429:
+        raise HTTPException(status_code=429, detail=result.get("message_gu", "ઘણા પ્રયાસ થયા છે. થોડા સમય પછી ફરી પ્રયાસ કરો."))
+    return result
 
 
 @app.get("/api/mukadam/search")
