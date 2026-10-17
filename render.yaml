@@ -1,9 +1,20 @@
+# SQLite + JSON mirror use /var/data automatically if a Persistent Disk is mounted.
+# Render Free has ephemeral storage and does not support Persistent Disks, so configure
+# GITHUB_BACKUP_TOKEN (repo Contents: write) and GITHUB_BACKUP_REPO for durable off-instance
+# snapshots. To enable a disk, use a paid plan and uncomment the disk block below; this file
+# intentionally does not upgrade the existing Free service or create billing without approval.
 services:
   - type: web
     name: smart-agri-market-ai
     runtime: python
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    # Paid-plan Persistent Disk option (requires an explicit plan change in Render):
+    # plan: starter
+    # disk:
+    #   name: mukadam-data
+    #   mountPath: /var/data
+    #   sizeGB: 1
     envVars:
       - key: GROQ_API_KEY
         sync: false
@@ -25,5 +36,13 @@ services:
         value: https://api.data.gov.in
       - key: CEDA_API_KEY
         sync: false
+      # Optional durable Mukadam snapshots for instances without a Persistent Disk.
+      # Set the token and repository name in Render; the token needs repository Contents write access. The path defaults below.
+      - key: GITHUB_BACKUP_TOKEN
+        sync: false
+      - key: GITHUB_BACKUP_REPO
+        sync: false
+      - key: GITHUB_BACKUP_PATH
+        value: backups/mukadam_data.json
       - key: MANDI_FALLBACK_MAX_AGE_HOURS
         value: "96"
