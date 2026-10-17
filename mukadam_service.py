@@ -4,6 +4,7 @@ import time
 import json
 import base64
 import hashlib
+import hmac
 import sqlite3
 import threading
 import csv
@@ -52,14 +53,113 @@ _MUKADAM_RAM_CACHE: List[Dict[str, Any]] = []
 _CACHE_INITIALIZED = False
 
 
+PIN_HASH_ITERATIONS = 310_000
+PIN_HASH_PREFIX = "pbkdf2_sha256"
+PIN_MOBILE_FAILURE_LIMIT = 5
+PIN_MOBILE_LOCK_SECONDS = 15 * 60
+PIN_IP_FAILURE_LIMIT = 20
+PIN_IP_WINDOW_SECONDS = 60 * 60
+PIN_NEW_REGISTRATIONS_PER_IP_PER_HOUR = 10
+
+
+def _clean_pin(pin: str) -> str:
+    """Normalize four decimal digits (including Gujarati digits) to ASCII."""
+    digits = []
+    for ch in str(pin or "").strip():
+        if not ch.isdigit():
+            return ""
+        try:
+            if not ch.isdecimal():
+                return ""
+            digits.append(str(unicodedata.decimal(ch)))
+        except (TypeError, ValueError):
+            return ""
+    return "".join(digits)
+
+
 def _hash_pin(pin: str) -> str:
-    clean_pin = str(pin).strip()
-    return hashlib.sha256(f"smart_agri_mukadam_{clean_pin}".encode("utf-8")).hexdigest()
+    """Store a random-salted, deliberately slow PIN hash (never a reusable static hash)."""
+    clean_pin = _clean_pin(pin)
+    if len(clean_pin) != 4:
+        raise ValueError("PIN must contain exactly four decimal digits")
+    salt = os.urandom(16)
+    digest = hashlib.pbkdf2_hmac("sha256", clean_pin.encode("utf-8"), salt, PIN_HASH_ITERATIONS)
+    return f"{PIN_HASH_PREFIX}${PIN_HASH_ITERATIONS}${salt.hex()}${digest.hex()}"
+
+
+def _verify_pin_hash(stored_hash: str, pin: str) -> Tuple[bool, bool]:
+    """Return (matches, needs_upgrade); supports the previous static SHA-256 hash once."""
+    clean_pin = _clean_pin(pin)
+    if len(clean_pin) != 4:
+        return False, False
+    stored = str(stored_hash or "")
+    if stored.startswith(PIN_HASH_PREFIX + "$"):
+        try:
+            prefix, iterations_raw, salt_hex, digest_hex = stored.split("$", 3)
+            iterations = int(iterations_raw)
+            if prefix != PIN_HASH_PREFIX or iterations < 100_000 or iterations > 2_000_000:
+                return False, False
+            salt = bytes.fromhex(salt_hex)
+            expected = bytes.fromhex(digest_hex)
+            if len(salt) < 16 or len(expected) != 32:
+                return False, False
+            actual = hashlib.pbkdf2_hmac("sha256", clean_pin.encode("utf-8"), salt, iterations)
+            return hmac.compare_digest(actual, expected), False
+        except (ValueError, TypeError):
+            return False, False
+    # Migration compatibility: old rows stored SHA-256(static-prefix + PIN). A correct
+    # PIN is accepted once, then the update path replaces that digest with PBKDF2.
+    legacy = hashlib.sha256(f"smart_agri_mukadam_{clean_pin}".encode("utf-8")).hexdigest()
+    return hmac.compare_digest(stored, legacy), True
+
+
+def _client_ip_key(client_ip: str) -> str:
+    value = str(client_ip or "unknown").strip()[:80]
+    return value if value and value.lower() != "unknown" else ""
+
+
+def _pin_auth_limited(conn: sqlite3.Connection, mobile: str, client_ip: str, now: Optional[float] = None) -> bool:
+    now = float(now if now is not None else time.time())
+    ip = _client_ip_key(client_ip)
+    mobile_failures = int(conn.execute(
+        "SELECT COUNT(*) FROM mukadam_pin_attempts WHERE mobile = ? AND success = 0 AND attempted_at >= ?",
+        (mobile, now - PIN_MOBILE_LOCK_SECONDS),
+    ).fetchone()[0] or 0)
+    if mobile_failures >= PIN_MOBILE_FAILURE_LIMIT:
+        return True
+    if ip:
+        ip_failures = int(conn.execute(
+            "SELECT COUNT(*) FROM mukadam_pin_attempts WHERE client_ip = ? AND success = 0 AND attempted_at >= ?",
+            (ip, now - PIN_IP_WINDOW_SECONDS),
+        ).fetchone()[0] or 0)
+        if ip_failures >= PIN_IP_FAILURE_LIMIT:
+            return True
+    return False
+
+
+def _pin_registration_rate_limited(conn: sqlite3.Connection, client_ip: str, now: Optional[float] = None) -> bool:
+    ip = _client_ip_key(client_ip)
+    if not ip:
+        return False
+    now = float(now if now is not None else time.time())
+    count = int(conn.execute(
+        "SELECT COUNT(*) FROM mukadam_pin_attempts WHERE client_ip = ? AND action = 'register_new' AND success = 1 AND attempted_at >= ?",
+        (ip, now - PIN_IP_WINDOW_SECONDS),
+    ).fetchone()[0] or 0)
+    return count >= PIN_NEW_REGISTRATIONS_PER_IP_PER_HOUR
+
+
+def _record_pin_attempt(conn: sqlite3.Connection, mobile: str, client_ip: str, action: str, success: bool, now: Optional[float] = None) -> None:
+    stamp = float(now if now is not None else time.time())
+    conn.execute(
+        "INSERT INTO mukadam_pin_attempts (mobile, client_ip, action, success, attempted_at) VALUES (?, ?, ?, ?, ?)",
+        (mobile, _client_ip_key(client_ip), action, 1 if success else 0, stamp),
+    )
+    conn.execute("DELETE FROM mukadam_pin_attempts WHERE attempted_at < ?", (stamp - 24 * 60 * 60,))
 
 
 def _clean_mobile(mobile: str) -> str:
-    # Convert native Gujarati/other Unicode decimal digits to ASCII so OTP hashes,
-    # Twilio Verify, database keys, and Android payloads use one canonical number.
+    # Normalize Gujarati/other Unicode decimal digits to ASCII for mobile database keys.
     ascii_digits = []
     for ch in str(mobile or ""):
         if not ch.isdigit():
@@ -459,8 +559,8 @@ def init_mukadam_db() -> None:
                 )
                 """
             )
-            # Add columns to existing databases. A pre-OTP row has no proof, so SQLite's
-            # default 0 keeps it unverified until its owner completes a fresh OTP registration.
+            # Retain legacy phone_verified columns as inert compatibility fields. PIN-only
+            # account eligibility never reads them; keeping the columns avoids a risky SQLite rebuild.
             columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(mukadams)").fetchall()}
             if "phone_verified_at" not in columns:
                 conn.execute("ALTER TABLE mukadams ADD COLUMN phone_verified_at REAL NOT NULL DEFAULT 0.0")
@@ -469,6 +569,14 @@ def init_mukadam_db() -> None:
             for location_column in ("district_code", "taluka_code", "village_code"):
                 if location_column not in columns:
                     conn.execute(f"ALTER TABLE mukadams ADD COLUMN {location_column} TEXT NOT NULL DEFAULT ''")
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS mukadam_pin_attempts ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT, mobile TEXT NOT NULL DEFAULT '', "
+                "client_ip TEXT NOT NULL DEFAULT '', action TEXT NOT NULL DEFAULT 'auth', "
+                "success INTEGER NOT NULL DEFAULT 0, attempted_at REAL NOT NULL)"
+            )
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_mukadam_pin_mobile_time ON mukadam_pin_attempts(mobile, attempted_at)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_mukadam_pin_ip_time ON mukadam_pin_attempts(client_ip, attempted_at)")
             conn.commit()
         finally:
             conn.close()
@@ -723,12 +831,12 @@ def _restore_from_github_if_empty() -> None:
         conn.close()
 
 
-def register_or_update_mukadam(payload: Dict[str, Any]) -> Dict[str, Any]:
+def register_or_update_mukadam(payload: Dict[str, Any], client_ip: str = "unknown") -> Dict[str, Any]:
     if not _CACHE_INITIALIZED:
         init_mukadam_db()
     name = str(payload.get("name", "")).strip()
     mobile = _clean_mobile(payload.get("mobile", ""))
-    pin = str(payload.get("pin", "")).strip()
+    pin = _clean_pin(payload.get("pin", ""))
     if not name:
         return {"ok": False, "message_gu": "કૃપા કરીને મુકાદમનું નામ લખો."}
     if len(mobile) != 10:
@@ -769,19 +877,6 @@ def register_or_update_mukadam(payload: Dict[str, Any]) -> Dict[str, Any]:
     taluka_code_value = location["taluka_code"]
     village_code_value = location["village_code"]
 
-    verification_token = str(payload.get("verification_token", "")).strip()
-    try:
-        from mukadam_otp_service import consume_registration_token
-        phone_verified = consume_registration_token(verification_token, mobile)
-    except Exception:
-        phone_verified = False
-    if not phone_verified:
-        return {
-            "ok": False,
-            "message_gu": "મુકાદમ નોંધણી માટે આ જ મોબાઇલ નંબરનો OTP સફળતાપૂર્વક verify કરવો જરૂરી છે. કૃપા કરીને OTP ફરી ચકાસો.",
-        }
-
-    pin_hash = _hash_pin(pin)
     now = time.time()
     try:
         latitude_value = float(payload.get("latitude", 0.0) or 0.0)
@@ -808,19 +903,27 @@ def register_or_update_mukadam(payload: Dict[str, Any]) -> Dict[str, Any]:
         conn = sqlite3.connect(DB_PATH)
         conn.row_factory = sqlite3.Row
         try:
+            if _pin_auth_limited(conn, mobile, client_ip, now):
+                conn.commit()
+                return {"ok": False, "http_status": 429, "message_gu": "ઘણા ખોટા PIN પ્રયાસ થયા છે. સુરક્ષા માટે ૧૫ મિનિટ પછી ફરી પ્રયાસ કરો."}
             existing = conn.execute(
                 "SELECT * FROM mukadams WHERE mobile = ?", (mobile,)
             ).fetchone()
             if existing:
-                if existing["pin_hash"] != pin_hash:
+                pin_matches, needs_pin_upgrade = _verify_pin_hash(existing["pin_hash"], pin)
+                if not pin_matches:
+                    _record_pin_attempt(conn, mobile, client_ip, "register", False, now)
+                    conn.commit()
                     return {
                         "ok": False,
-                        "message_gu": "આ મોબાઇલ નંબર પહેલેથી રજીસ્ટર છે. વિગત બદલવા માટે તમારો સાચો ૪ આંકડાનો પિન નાખો.",
+                        "message_gu": "આ મોબાઇલ નંબર પહેલેથી રજીસ્ટર છે. વિગતો બદલવા માટે સાચો ૪ અંકનો PIN નાખો.",
                     }
+                active_pin_hash = _hash_pin(pin) if needs_pin_upgrade else str(existing["pin_hash"])
+                _record_pin_attempt(conn, mobile, client_ip, "register", True, now)
                 conn.execute(
                     """
                     UPDATE mukadams SET
-                        name = ?, district = ?, taluka = ?, village = ?,
+                        name = ?, pin_hash = ?, district = ?, taluka = ?, village = ?,
                         district_code = ?, taluka_code = ?, village_code = ?,
                         latitude = ?, longitude = ?,
                         available_status = ?, available_from_date = ?,
@@ -828,11 +931,12 @@ def register_or_update_mukadam(payload: Dict[str, Any]) -> Dict[str, Any]:
                         wage_type = ?, daily_wage_rate = ?, contract_rate_details = ?,
                         rickshaw_fare_type = ?, rickshaw_fare_rate = ?,
                         mukadami_type = ?, mukadami_rate = ?,
-                        skills = ?, notes = ?, updated_at = ?, phone_verified_at = ?, phone_verified = 1
+                        skills = ?, notes = ?, updated_at = ?, phone_verified_at = 0.0, phone_verified = 0
                     WHERE mobile = ?
                     """,
                     (
                         name,
+                        active_pin_hash,
                         district_value,
                         taluka_value,
                         village_value,
@@ -856,12 +960,16 @@ def register_or_update_mukadam(payload: Dict[str, Any]) -> Dict[str, Any]:
                         skills_str,
                         str(payload.get("notes", "")).strip(),
                         now,
-                        now,
                         mobile,
                     ),
                 )
                 action_msg = "તમારી મુકાદમ પ્રોફાઇલ અને મજૂરની વિગતો સફળતાપૂર્વક અપડેટ થઈ ગઈ છે!"
             else:
+                if _pin_registration_rate_limited(conn, client_ip, now):
+                    conn.commit()
+                    return {"ok": False, "http_status": 429, "message_gu": "આ નેટવર્ક પરથી નોંધણી મર્યાદા પૂરી થઈ છે. એક કલાક પછી ફરી પ્રયાસ કરો."}
+                pin_hash = _hash_pin(pin)
+                _record_pin_attempt(conn, mobile, client_ip, "register_new", True, now)
                 conn.execute(
                     """
                     INSERT INTO mukadams (
@@ -874,7 +982,7 @@ def register_or_update_mukadam(payload: Dict[str, Any]) -> Dict[str, Any]:
                         mukadami_type, mukadami_rate,
                         skills, notes, rating_sum, rating_count, contact_clicks, updated_at,
                         phone_verified_at, phone_verified
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 5.0, 1, 0, ?, ?, 1)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 5.0, 1, 0, ?, 0.0, 0)
                     """,
                     (
                         name,
@@ -903,7 +1011,6 @@ def register_or_update_mukadam(payload: Dict[str, Any]) -> Dict[str, Any]:
                         skills_str,
                         str(payload.get("notes", "")).strip(),
                         now,
-                        now,
                     ),
                 )
                 action_msg = "મુકાદમ તરીકે તમારી નોંધણી સફળતાપૂર્વક થઈ ગઈ છે! હવે નજીકના ખેડૂતો તમારો સંપર્ક કરી શકશે."
@@ -916,11 +1023,11 @@ def register_or_update_mukadam(payload: Dict[str, Any]) -> Dict[str, Any]:
     return {"ok": True, "message_gu": action_msg, "mobile": mobile}
 
 
-def update_mukadam_quick_status(payload: Dict[str, Any]) -> Dict[str, Any]:
+def update_mukadam_quick_status(payload: Dict[str, Any], client_ip: str = "unknown") -> Dict[str, Any]:
     if not _CACHE_INITIALIZED:
         init_mukadam_db()
     mobile = _clean_mobile(payload.get("mobile", ""))
-    pin = str(payload.get("pin", "")).strip()
+    pin = _clean_pin(payload.get("pin", ""))
     new_status = str(payload.get("available_status", "unavailable")).strip()
     available_from_date = str(payload.get("available_from_date", "")).strip()
     total_labors = payload.get("total_labors", None)
@@ -930,24 +1037,29 @@ def update_mukadam_quick_status(payload: Dict[str, Any]) -> Dict[str, Any]:
             "message_gu": "સાચો ૧૦ આંકડાનો મોબાઇલ નંબર અને ૪ આંકડાનો પિન નાખો.",
         }
 
-    pin_hash = _hash_pin(pin)
     now = time.time()
     with _MUKADAM_LOCK:
         conn = sqlite3.connect(DB_PATH)
         conn.row_factory = sqlite3.Row
         try:
+            if _pin_auth_limited(conn, mobile, client_ip, now):
+                conn.commit()
+                return {"ok": False, "http_status": 429, "message_gu": "ઘણા ખોટા PIN પ્રયાસ થયા છે. સુરક્ષા માટે ૧૫ મિનિટ પછી ફરી પ્રયાસ કરો."}
             existing = conn.execute(
                 "SELECT * FROM mukadams WHERE mobile = ?", (mobile,)
             ).fetchone()
             if not existing:
-                return {
-                    "ok": False,
-                    "message_gu": "આ મોબાઇલ નંબરથી કોઈ મુકાદમ રજીસ્ટર નથી. પહેલા નોંધણી કરો.",
-                }
-            if existing["pin_hash"] != pin_hash:
-                return {"ok": False, "message_gu": "તમારો ૪ આંકડાનો સિક્રેટ પિન ખોટો છે."}
-            if int(existing["phone_verified"] or 0) != 1:
-                return {"ok": False, "message_gu": "તમારી જૂની પ્રોફાઇલમાં મોબાઇલ OTP ચકાસણી બાકી છે. પહેલાં સંપૂર્ણ નોંધણીમાં OTP verify કરો."}
+                _record_pin_attempt(conn, mobile, client_ip, "quick_status", False, now)
+                conn.commit()
+                return {"ok": False, "message_gu": "મોબાઇલ નંબર અથવા PIN ખોટો છે. તપાસીને ફરી પ્રયાસ કરો."}
+            pin_matches, needs_pin_upgrade = _verify_pin_hash(existing["pin_hash"], pin)
+            if not pin_matches:
+                _record_pin_attempt(conn, mobile, client_ip, "quick_status", False, now)
+                conn.commit()
+                return {"ok": False, "message_gu": "મોબાઇલ નંબર અથવા PIN ખોટો છે. તપાસીને ફરી પ્રયાસ કરો."}
+            _record_pin_attempt(conn, mobile, client_ip, "quick_status", True, now)
+            if needs_pin_upgrade:
+                conn.execute("UPDATE mukadams SET pin_hash = ? WHERE mobile = ?", (_hash_pin(pin), mobile))
             if total_labors is not None:
                 conn.execute(
                     """
@@ -1085,7 +1197,6 @@ def search_nearby_mukadams(
     # names, phone numbers, PIN hashes, or precise coordinates.
     search_diag = {
         "cached": len(cached_list),
-        "excluded_unverified": 0,
         "excluded_invalid_location": 0,
         "excluded_unavailable": 0,
         "excluded_district": 0,
@@ -1112,10 +1223,6 @@ def search_nearby_mukadams(
     for raw in cached_list:
         item = dict(raw)
         item.pop("pin_hash", None)
-        # Legacy/backup rows without historical OTP proof must not be presented as verified.
-        if int(item.get("phone_verified", 0) or 0) != 1:
-            search_diag["excluded_unverified"] += 1
-            continue
         status = str(item.get("available_status", "available")).strip().lower()
         if not include_unavailable and status == "unavailable":
             search_diag["excluded_unavailable"] += 1
@@ -1306,14 +1413,14 @@ def record_rating_or_contact(payload: Dict[str, Any]) -> Dict[str, Any]:
                     """
                     UPDATE mukadams
                     SET rating_sum = rating_sum + ?, rating_count = rating_count + 1
-                    WHERE mobile = ? AND phone_verified = 1
+                    WHERE mobile = ?
                     """,
                     (rating, mobile),
                 )
                 message = "તમારું રેટિંગ નોંધાઈ ગયું છે. આભાર!"
             else:
                 conn.execute(
-                    "UPDATE mukadams SET contact_clicks = contact_clicks + 1 WHERE mobile = ? AND phone_verified = 1",
+                    "UPDATE mukadams SET contact_clicks = contact_clicks + 1 WHERE mobile = ?",
                     (mobile,),
                 )
                 message = "સંપર્ક નોંધાયો."
