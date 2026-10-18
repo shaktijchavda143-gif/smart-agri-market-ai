@@ -276,7 +276,7 @@ LOCATION_COORDINATES: Dict[str, Tuple[float, float]] = {
     "જેપુર": (21.0100, 70.5100), "આંબળાશ": (21.0600, 70.5000),
     "મૂળ દ્વારકા": (20.7500, 70.7000), "ઘાંટવડ": (20.7800, 70.7200),
     "ડોળાસા": (20.7700, 70.7400), "વેળણ": (20.7900, 70.6900),
-    "સરખડી": (20.8000, 70.7100), "છારા": (20.7900, 70.6900),
+    "સરખડી": (20.8000, 70.7100), "સાંઢણીધાર": (20.8250, 70.7250), "છારા": (20.7900, 70.6900),
     "અરણેજ": (20.7800, 70.7000), "દેવળી": (20.7900, 70.6800),
     "સિંધાજ": (20.8000, 70.7100), "પીપળી": (20.7900, 70.6900),
     "માઢવાડ": (20.7800, 70.7100), "કડવાસણ": (20.7900, 70.7000),
@@ -663,14 +663,22 @@ def _backfill_location_codes() -> None:
         ).fetchall()
         changed = False
         for mobile, district, taluka, village, dc, tc, vc in rows:
-            if str(dc or "").strip() and str(tc or "").strip() and str(vc or "").strip():
-                continue
-            # Do not infer from an isolated village name; all three levels must uniquely resolve.
+            dc_s, tc_s, vc_s = str(dc or "").strip(), str(tc or "").strip(), str(vc or "").strip()
             resolved = resolve_location_selection(
+                district_code=dc_s, taluka_code=tc_s, village_code=vc_s,
                 district=district or "", taluka=taluka or "", village=village or "",
                 master=master, require_village=True,
             )
             if not resolved:
+                continue
+            if (
+                district == resolved["district"]
+                and taluka == resolved["taluka"]
+                and village == resolved["village"]
+                and dc_s == resolved["district_code"]
+                and tc_s == resolved["taluka_code"]
+                and vc_s == resolved["village_code"]
+            ):
                 continue
             conn.execute(
                 "UPDATE mukadams SET district=?, taluka=?, village=?, district_code=?, taluka_code=?, village_code=? WHERE mobile=?",
@@ -1209,6 +1217,23 @@ def update_mukadam_quick_status(payload: Dict[str, Any], client_ip: str = "unkno
         public_profile.pop("pin_hash", None)
         public_profile.pop("phone_verified", None)
         public_profile.pop("phone_verified_at", None)
+        try:
+            loc_master, loc_index = get_location_master_and_index()
+            p_dc = str(public_profile.get("district_code", "") or "").strip()
+            p_tc = str(public_profile.get("taluka_code", "") or "").strip()
+            p_vc = str(public_profile.get("village_code", "") or "").strip()
+            idx_d = loc_index["districts"].get(p_dc)
+            idx_t = loc_index["talukas_by_parent"].get((p_dc, p_tc))
+            idx_v = loc_index["villages_by_parent"].get((p_dc, p_tc, p_vc))
+            if idx_d and idx_t and idx_v:
+                public_profile["district"] = str(idx_d.get("name_gu") or idx_d.get("name_en") or "")
+                public_profile["district_en"] = str(idx_d.get("name_en") or "")
+                public_profile["taluka"] = str(idx_t.get("name_gu") or idx_t.get("name_en") or "")
+                public_profile["taluka_en"] = str(idx_t.get("name_en") or "")
+                public_profile["village"] = str(idx_v.get("name_gu") or idx_v.get("name_en") or "")
+                public_profile["village_en"] = str(idx_v.get("name_en") or "")
+        except Exception:
+            pass
     return {
         "ok": True,
         "message_gu": f"તમારું સ્ટેટસ બદલાઈ ગયું છે: {status_gu}",
@@ -1383,9 +1408,15 @@ def search_nearby_mukadams(
             indexed_village = location_index["villages_by_parent"].get((item_dc, item_tc, item_vc))
             if indexed_district and indexed_taluka and indexed_village:
                 item_location = {
-                    "district_code": item_dc, "district": str(indexed_district.get("name_gu") or indexed_district.get("name_en") or ""),
-                    "taluka_code": item_tc, "taluka": str(indexed_taluka.get("name_gu") or indexed_taluka.get("name_en") or ""),
-                    "village_code": item_vc, "village": str(indexed_village.get("name_gu") or indexed_village.get("name_en") or ""),
+                    "district_code": item_dc,
+                    "district": str(indexed_district.get("name_gu") or indexed_district.get("name_en") or ""),
+                    "district_en": str(indexed_district.get("name_en") or ""),
+                    "taluka_code": item_tc,
+                    "taluka": str(indexed_taluka.get("name_gu") or indexed_taluka.get("name_en") or ""),
+                    "taluka_en": str(indexed_taluka.get("name_en") or ""),
+                    "village_code": item_vc,
+                    "village": str(indexed_village.get("name_gu") or indexed_village.get("name_en") or ""),
+                    "village_en": str(indexed_village.get("name_en") or ""),
                 }
             else:
                 item_location = None
@@ -1402,8 +1433,11 @@ def search_nearby_mukadams(
         item["taluka_code"] = item_location["taluka_code"]
         item["village_code"] = item_location["village_code"]
         item["district"] = item_location["district"]
+        item["district_en"] = item_location.get("district_en", "")
         item["taluka"] = item_location["taluka"]
+        item["taluka_en"] = item_location.get("taluka_en", "")
         item["village"] = item_location["village"]
+        item["village_en"] = item_location.get("village_en", "")
         item_district = item_location["district_code"]
         item_taluka = item_location["taluka_code"]
         item_village = item_location["village_code"]
