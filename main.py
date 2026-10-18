@@ -1,4 +1,8 @@
 # -*- coding: utf-8 -*-
+import sys as _sys, os as _os
+_BACKEND_DIR = _os.path.dirname(_os.path.abspath(__file__))
+if _BACKEND_DIR not in _sys.path:
+    _sys.path.insert(0, _BACKEND_DIR)
 """Smart Agri-Market AI HTTP backend.
 Wraps the supplied Smart Agri-Market Agent so the Android app can call it.
 """
@@ -32,9 +36,17 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from openai import OpenAI
-from google import genai
-from google.genai import types
+try:
+    from openai import OpenAI
+except ImportError:
+    OpenAI = None  # type: ignore
+
+try:
+    from google import genai
+    from google.genai import types
+except ImportError:
+    genai = None  # type: ignore
+    types = None  # type: ignore
 
 APP_VERSION = "14.4 MUKADAM PIN ONLY"
 XAI_MODEL = os.getenv("XAI_MODEL", "grok-4.7").strip() or "grok-4.7"
@@ -3436,18 +3448,67 @@ def mandi(state: str = "Gujarat", market: str = "", commodity: str = "ALL", requ
     )
 
 
-# Phase 1: Mukadam marketplace API (appended; existing backend code preserved)
-from fastapi.responses import Response
-from typing import Optional
+# Phase 1: Mukadam marketplace API + Secure Admin Panel (existing backend code preserved)
+from fastapi import Header
+from fastapi.responses import Response, HTMLResponse, JSONResponse
+from typing import Optional, List, Dict, Any
 from mukadam_service import (
     init_mukadam_db,
     register_or_update_mukadam,
     update_mukadam_quick_status,
     search_nearby_mukadams,
     record_rating_or_contact,
+    self_delete_mukadam_by_pin,
     export_mukadams_csv,
 )
+import admin_service
+from admin_panel_ui import ADMIN_PANEL_HTML
+
 init_mukadam_db()
+
+
+def _extract_client_ip(request: Request) -> str:
+    forwarded = request.headers.get("x-forwarded-for", "").strip()
+    if forwarded:
+        return forwarded.split(",")[0].strip()[:80]
+    return request.client.host if request.client else "unknown"
+
+
+@app.middleware("http")
+async def _security_headers_and_https_middleware(request: Request, call_next):
+    path = request.url.path or ""
+    # Enforce HTTPS for Admin Panel & Admin APIs when deployed behind Render proxy or when ADMIN_ENFORCE_HTTPS=1
+    proto = request.headers.get("x-forwarded-proto", "").strip().lower()
+    enforce_https = os.environ.get("ADMIN_ENFORCE_HTTPS", "0").strip() == "1"
+    if (path.startswith("/api/v1/admin") or path.startswith("/admin")) and (
+        (proto and proto != "https") or (enforce_https and request.url.scheme != "https" and proto != "https")
+    ):
+        return JSONResponse(
+            status_code=403,
+            content={"ok": False, "detail": "HTTPS સુરક્ષિત કનેક્શન ફરજિયાત છે.", "message_gu": "HTTPS સુરક્ષિત કનેક્શન ફરજિયાત છે."},
+        )
+    try:
+        response = await call_next(request)
+    except HTTPException:
+        raise
+    except Exception:
+        if path.startswith("/api/v1/admin"):
+            return JSONResponse(
+                status_code=500,
+                content={"ok": False, "detail": "સર્વર પર આંતરિક ભૂલ આવી છે.", "message_gu": "સર્વર પર આંતરિક ભૂલ આવી છે."},
+            )
+        raise
+
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    if path.startswith("/api/v1/admin") or path.startswith("/admin"):
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'self'; style-src 'self' 'unsafe-inline'; "
+            "script-src 'self' 'unsafe-inline'; img-src 'self' data:; frame-ancestors 'none';"
+        )
+    return response
 
 
 class MukadamRegisterRequest(BaseModel):
@@ -3492,20 +3553,125 @@ class MukadamActionRequest(BaseModel):
     stars: Optional[float] = None
 
 
+class MukadamReportSubmitRequest(BaseModel):
+    mukadam_id: int = 0
+    mukadam_mobile: str = ""
+    report_type: str = "અન્ય"
+    description: str
+    reporter_name: str = ""
+    reporter_mobile: str = ""
+    evidence_meta: Optional[Dict[str, Any]] = None
+
+
+# Admin Request Models
+class AdminLoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+class AdminPasswordResetRequest(BaseModel):
+    username: str
+    master_secret: str
+    new_password: str
+
+
+class AdminBlockRequest(BaseModel):
+    reason: str
+    admin_note: str = ""
+    expires_at: Optional[float] = None
+
+
+class AdminUnblockRequest(BaseModel):
+    reason: str = "એડમિન દ્વારા અનબ્લોક કરવામાં આવ્યા"
+    admin_note: str = ""
+
+
+class AdminSoftDeleteRequest(BaseModel):
+    reason: str
+
+
+class AdminRestoreRequest(BaseModel):
+    reason: str = "એડમિન દ્વારા Restore કરવામાં આવ્યા"
+
+
+class AdminPermanentDeleteRequest(BaseModel):
+    admin_password: str
+    confirm_mobile_or_name: str
+    reason: str
+
+
+class AdminReportReviewRequest(BaseModel):
+    new_status: str = ""
+    admin_notes: str = ""
+    resolution_details: str = ""
+    assigned_moderator: str = ""
+    also_block_mukadam: bool = False
+    block_expiry_hours: Optional[float] = None
+
+
+class AdminUserUpsertRequest(BaseModel):
+    username: str = ""
+    display_name: str = ""
+    role: str = ""
+    password: Optional[str] = None
+    permissions: Optional[List[str]] = None
+    is_active: bool = True
+
+
+def _require_admin(
+    request: Request,
+    required_permission: Optional[str] = None,
+    allowed_roles: Optional[set] = None,
+    require_csrf_on_cookie: bool = True,
+) -> Dict[str, Any]:
+    auth_header = request.headers.get("Authorization", "").strip()
+    bearer_token = ""
+    used_cookie = False
+    if auth_header.lower().startswith("bearer "):
+        bearer_token = auth_header[7:].strip()
+    elif request.cookies.get("sam_admin_session"):
+        bearer_token = request.cookies.get("sam_admin_session", "").strip()
+        used_cookie = True
+
+    csrf_header = request.headers.get("X-CSRF-Token", "").strip()
+    is_mutating = request.method.upper() in ("POST", "PUT", "PATCH", "DELETE")
+    need_csrf = is_mutating and (used_cookie or bool(csrf_header))
+
+    res = admin_service.validate_admin_session(
+        bearer_token,
+        csrf_token=csrf_header,
+        require_csrf=need_csrf and require_csrf_on_cookie,
+        required_permission=required_permission,
+        allowed_roles=allowed_roles,
+        client_ip=_extract_client_ip(request),
+        request_id=request.headers.get("X-Request-ID", ""),
+    )
+    if not res.get("ok"):
+        raise HTTPException(
+            status_code=int(res.get("http_status", 401) or 401),
+            detail=res.get("message_gu", "અનધિકૃત એક્સેસ."),
+        )
+    return res["admin"]
+
+
+# ---------------- Public Mukadam Marketplace Endpoints ----------------
+
 @app.post("/api/mukadam/register")
 async def api_mukadam_register(req: MukadamRegisterRequest, request: Request):
-    client_ip = request.client.host if request.client else "unknown"
+    client_ip = _extract_client_ip(request)
     result = register_or_update_mukadam(req.dict(), client_ip=client_ip)
-    if int(result.get("http_status", 200) or 200) == 429:
+    status_code = int(result.get("http_status", 200) or 200)
+    if status_code == 429:
         raise HTTPException(status_code=429, detail=result.get("message_gu", "ઘણા પ્રયાસ થયા છે. થોડા સમય પછી ફરી પ્રયાસ કરો."))
     return result
 
 
 @app.post("/api/mukadam/status")
 async def api_mukadam_status(req: MukadamStatusRequest, request: Request):
-    client_ip = request.client.host if request.client else "unknown"
+    client_ip = _extract_client_ip(request)
     result = update_mukadam_quick_status(req.dict(), client_ip=client_ip)
-    if int(result.get("http_status", 200) or 200) == 429:
+    status_code = int(result.get("http_status", 200) or 200)
+    if status_code == 429:
         raise HTTPException(status_code=429, detail=result.get("message_gu", "ઘણા પ્રયાસ થયા છે. થોડા સમય પછી ફરી પ્રયાસ કરો."))
     return result
 
@@ -3539,8 +3705,6 @@ async def api_mukadam_search(
         include_unavailable=include_unavailable,
     )
     try:
-        # Current mukadam_service.py supports village. Keep compatibility with a
-        # temporarily older deployed service during rolling/manual deployments.
         return search_nearby_mukadams(village=village, **search_args)
     except TypeError as exc:
         if "unexpected keyword argument 'village'" not in str(exc):
@@ -3549,16 +3713,475 @@ async def api_mukadam_search(
 
 
 @app.post("/api/mukadam/action")
-async def api_mukadam_action(req: MukadamActionRequest):
-    return record_rating_or_contact(req.dict())
+async def api_mukadam_action(req: MukadamActionRequest, request: Request):
+    client_ip = _extract_client_ip(request)
+    res = record_rating_or_contact(req.dict(), client_ip=client_ip)
+    if int(res.get("http_status", 200) or 200) == 429:
+        raise HTTPException(status_code=429, detail=res.get("message_gu", "ઘણા પ્રયાસ થયા છે."))
+    return res
+
+
+@app.post("/api/mukadam/report")
+@app.post("/api/v1/mukadam/report")
+async def api_mukadam_report(req: MukadamReportSubmitRequest, request: Request):
+    client_ip = _extract_client_ip(request)
+    res = admin_service.submit_farmer_report(req.dict(), client_ip=client_ip)
+    status_code = int(res.get("http_status", 200) or 200)
+    if not res.get("ok") and status_code in (400, 404, 429):
+        return JSONResponse(status_code=status_code, content=res)
+    return res
 
 
 @app.get("/api/mukadam/export_csv")
-async def api_mukadam_export_csv():
+async def api_mukadam_export_csv(request: Request):
+    admin = _require_admin(request, required_permission="mukadam:export")
     csv_data = export_mukadams_csv()
-    bom_csv = "\ufeff" + csv_data
+    bom_csv = "﻿" + csv_data
     return Response(
         content=bom_csv.encode("utf-8"),
         media_type="text/csv; charset=utf-8",
         headers={"Content-Disposition": "attachment; filename=gujarat_mukadam_list.csv"},
     )
+
+
+
+
+class MukadamSelfDeletePayload(BaseModel):
+    mobile: str = ""
+    pin: str = ""
+    reason: str = "User requested self deletion"
+
+
+@app.post("/api/mukadam/delete-self")
+@app.post("/api/v1/mukadam/delete-self")
+async def api_mukadam_delete_self(req: MukadamSelfDeletePayload, request: Request):
+    client_ip = _extract_client_ip(request)
+    res = self_delete_mukadam_by_pin(req.dict(), client_ip=client_ip)
+    status_code = int(res.get("http_status", 200) or 200)
+    if not res.get("ok") and status_code in (400, 403, 404, 429):
+        return JSONResponse(status_code=status_code, content=res)
+    return res
+
+
+@app.get("/privacy-policy", response_class=HTMLResponse)
+async def serve_public_privacy_policy():
+    html = """<!DOCTYPE html>
+<html lang="gu">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>સ્માર્ટ એગ્રી (Smart Agri) — Privacy Policy / ગોપનીયતા નીતિ</title>
+<style>
+  body { font-family: system-ui, -apple-system, sans-serif; background: #F3F9F4; color: #1E293B; margin: 0; padding: 20px; line-height: 1.65; }
+  .card { max-width: 860px; margin: 0 auto; background: #FFFFFF; border-radius: 16px; padding: 28px; box-shadow: 0 4px 16px rgba(0,0,0,0.06); border: 1px solid #BBF7D0; }
+  h1, h2 { color: #064E3B; }
+  .badge { display: inline-block; background: #DCFCE7; color: #14532D; padding: 4px 12px; border-radius: 999px; font-weight: 700; font-size: 13px; }
+  hr { border: 0; border-top: 1px solid #CBD5E1; margin: 24px 0; }
+</style>
+</head>
+<body>
+<div class="card">
+  <span class="badge">Google Play Store Official Privacy Policy</span>
+  <h1>સ્માર્ટ એગ્રી (Smart Agri) — ગોપનીયતા નીતિ (Privacy Policy)</h1>
+  <p><strong>છેલ્લો સુધારો (Last Updated):</strong> 18 October 2026 | <strong>Developer:</strong> CHAVDA SHAKTISINH</p>
+  <h2>૧. કયો ડેટા એકત્ર થાય છે (Data Collected)</h2>
+  <ul>
+    <li><strong>સ્થાનિક ડેટા (On-Device Room Database):</strong> ખેડૂત પ્રોફાઇલ (નામ, મોબાઇલ, ગામ, જિલ્લો, મુખ્ય પાક, ફોટો), પાકની યાદી, ખર્ચ-આવક અને ખેડૂત ડાયરી તમારા ફોનના સ્થાનિક ડેટાબેઝમાં જ સંગ્રહાય છે.</li>
+    <li><strong>સર્વર પર મોકલાતો ડેટા (HTTPS Encrypted):</strong> (ક) AI પાક સલાહ અને ફોટો નિદાન માટે મોકલેલો પ્રશ્ન/ફોટો; (ખ) જો તમે સ્વૈચ્છિક રીતે ‘મુકાદમ પેનલ’માં નોંધણી કરો તો નામ, મોબાઇલ નંબર, PBKDF2-HMAC-SHA256 હેશ કરેલો 4-અંકનો PIN, LGD લોકેશન અને મજૂરી વિગતો.</li>
+  </ul>
+  <h2>૨. પરવાનગીઓ (Permissions)</h2>
+  <ul>
+    <li><strong>CAMERA:</strong> પાકના રોગ નિદાન માટે ફોટો પાડવા અથવા ખેડૂત ID કાર્ડ ફોટો લેવા.</li>
+    <li><strong>LOCATION (Coarse/Fine):</strong> સ્થાનિક હવામાન, પંચાંગ અને નજીકના મુકાદમ શોધવા માટે.</li>
+    <li><strong>POST_NOTIFICATIONS:</strong> પાક અને હવામાનની ઉપયોગી સ્થાનિક સૂચનાઓ (Smart Alerts) માટે.</li>
+  </ul>
+  <h2>૩. Third-Party SDK અને સરકારી લિંક્સ (Disclosures)</h2>
+  <p>આ એપમાં AdMob, Firebase Analytics કે કોઈ જાહેરાત/ટ્રેકિંગ SDK નથી. 7/12 (AnyROR), i-Khedut, PM-KISAN અને વીજળી બિલ માટે એપ માત્ર અધિકૃત સરકારી પોર્ટલ બાહ્ય બ્રાઉઝરમાં ખોલે છે; સ્માર્ટ એગ્રી કોઈ સરકારી સંસ્થાનું પ્રતિનિધિત્વ કરતી નથી.</p>
+  <h2>૪. ડેટા અને એકાઉન્ટ કાઢી નાખવું (User Data & Account Deletion)</h2>
+  <p>તમે એપના <strong>સેટિંગ્સ → એકાઉન્ટ / વપરાશકર્તા ડેટા કાઢી નાખો</strong> માંથી સ્થાનિક ડેટા તેમજ નોંધાયેલ મુકાદમ પ્રોફાઇલ કાઢી શકો છો, અથવા વેબ પર <a href="/account-deletion">/account-deletion</a> પેજ પરથી સીધી ડિલીટ કરી શકો છો.</p>
+  <hr>
+  <h2>English Summary — Smart Agri Privacy Policy</h2>
+  <p>Smart Agri stores farmer profile, crop records, expenses, and diary notes locally on your device. AI crop queries/photos and voluntary Mukadam directory registrations (name, mobile, PBKDF2-SHA256 hashed 4-digit PIN, LGD location, labor availability) are transmitted over HTTPS to our backend. We do not use AdMob or third-party advertising SDKs, and we never sell personal data. Users can delete local data in-app (Settings → Delete Data) and delete registered Mukadam profiles in-app or via <a href="/account-deletion">/account-deletion</a>.</p>
+</div>
+</body>
+</html>"""
+    return HTMLResponse(content=html, status_code=200)
+
+
+@app.get("/account-deletion", response_class=HTMLResponse)
+async def serve_public_account_deletion():
+    html = """<!DOCTYPE html>
+<html lang="gu">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>સ્માર્ટ એગ્રી — Account & Data Deletion</title>
+<style>
+  body { font-family: system-ui, -apple-system, sans-serif; background: #F3F9F4; color: #1E293B; margin: 0; padding: 20px; }
+  .card { max-width: 540px; margin: 20px auto; background: #FFFFFF; border-radius: 16px; padding: 24px; box-shadow: 0 4px 16px rgba(0,0,0,0.06); border: 1px solid #FECACA; }
+  h1 { color: #991B1B; font-size: 20px; }
+  input { width: 100%; box-sizing: border-box; padding: 10px 12px; margin: 8px 0; border-radius: 8px; border: 1px solid #CBD5E1; font-size: 15px; }
+  button { width: 100%; padding: 12px; background: #B91C1C; color: #FFF; font-weight: 700; border: 0; border-radius: 10px; font-size: 15px; cursor: pointer; margin-top: 10px; }
+  #msg { margin-top: 12px; font-weight: 700; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>🗑️ સ્માર્ટ એગ્રી — મુકાદમ પ્રોફાઇલ અને ડેટા ડિલીટ કરો</h1>
+  <p>તમારી નોંધાયેલ મુકાદમ પ્રોફાઇલ સર્વર પરથી કાયમી ધોરણે કાઢી નાખવા માટે નોંધાયેલ મોબાઇલ નંબર અને ૪-અંકનો PIN નાખો:</p>
+  <input id="mob" type="tel" maxlength="10" placeholder="૧૦ અંકનો મોબાઇલ નંબર" />
+  <input id="pin" type="password" maxlength="4" placeholder="૪ અંકનો સિક્યોરિટી PIN" />
+  <button onclick="delProfile()">પ્રોફાઇલ કાયમી ધોરણે કાઢી નાખો</button>
+  <div id="msg"></div>
+</div>
+<script>
+async function delProfile() {
+  const mobile = document.getElementById("mob").value.trim();
+  const pin = document.getElementById("pin").value.trim();
+  const msg = document.getElementById("msg");
+  msg.textContent = "પ્રક્રિયા ચાલુ છે...";
+  const r = await fetch("/api/mukadam/delete-self", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({mobile, pin, reason: "Web portal self deletion"})
+  });
+  const d = await r.json();
+  msg.style.color = d.ok ? "#15803D" : "#B91C1C";
+  msg.textContent = d.message_gu || (d.ok ? "પ્રોફાઇલ ડિલીટ થઈ ગઈ છે." : "ભૂલ આવી.");
+}
+</script>
+</body>
+</html>"""
+    return HTMLResponse(content=html, status_code=200)
+
+
+# ---------------- Secure Admin Panel UI & APIs (/admin & /api/v1/admin/*) ----------------
+
+@app.get("/admin", response_class=HTMLResponse)
+async def serve_admin_panel_ui():
+    return HTMLResponse(content=ADMIN_PANEL_HTML, status_code=200)
+
+
+@app.post("/api/v1/admin/auth/login")
+async def api_admin_login(req: AdminLoginRequest, request: Request):
+    res = admin_service.admin_login(
+        username=req.username,
+        password=req.password,
+        client_ip=_extract_client_ip(request),
+        user_agent=request.headers.get("User-Agent", ""),
+        request_id=request.headers.get("X-Request-ID", ""),
+    )
+    status_code = int(res.get("http_status", 200) or 200)
+    if not res.get("ok"):
+        raise HTTPException(status_code=status_code, detail=res.get("message_gu", "લોગિન નિષ્ફળ."))
+    response = JSONResponse(status_code=200, content=res)
+    response.set_cookie(
+        key="sam_admin_session",
+        value=res["session_token"],
+        httponly=True,
+        secure=True,
+        samesite="strict",
+        max_age=admin_service.ADMIN_SESSION_TTL_SECONDS,
+        path="/",
+    )
+    return response
+
+
+@app.post("/api/v1/admin/auth/logout")
+async def api_admin_logout(request: Request):
+    auth_header = request.headers.get("Authorization", "").strip()
+    token = auth_header[7:].strip() if auth_header.lower().startswith("bearer ") else request.cookies.get("sam_admin_session", "")
+    res = admin_service.admin_logout(
+        session_token=token,
+        client_ip=_extract_client_ip(request),
+        request_id=request.headers.get("X-Request-ID", ""),
+    )
+    response = JSONResponse(status_code=200, content=res)
+    response.delete_cookie("sam_admin_session", path="/")
+    return response
+
+
+@app.get("/api/v1/admin/auth/me")
+async def api_admin_me(request: Request):
+    auth_header = request.headers.get("Authorization", "").strip()
+    token = auth_header[7:].strip() if auth_header.lower().startswith("bearer ") else request.cookies.get("sam_admin_session", "")
+    res = admin_service.validate_admin_session(
+        token,
+        client_ip=_extract_client_ip(request),
+    )
+    if not res.get("ok"):
+        raise HTTPException(status_code=int(res.get("http_status", 401)), detail=res.get("message_gu", "સેશન અમાન્ય."))
+    return {"ok": True, "admin": res["admin"], "csrf_token": res["csrf_token"]}
+
+
+@app.post("/api/v1/admin/auth/reset-password")
+async def api_admin_reset_password(req: AdminPasswordResetRequest, request: Request):
+    res = admin_service.reset_admin_password_with_master_secret(
+        username=req.username,
+        new_password=req.new_password,
+        provided_master_secret=req.master_secret,
+        client_ip=_extract_client_ip(request),
+        request_id=request.headers.get("X-Request-ID", ""),
+    )
+    if not res.get("ok"):
+        raise HTTPException(status_code=int(res.get("http_status", 403)), detail=res.get("message_gu", "રીસેટ નિષ્ફળ."))
+    return res
+
+
+@app.get("/api/v1/admin/dashboard")
+async def api_admin_dashboard(request: Request):
+    admin = _require_admin(request, required_permission="dashboard:view")
+    return admin_service.get_dashboard_overview(admin)
+
+
+@app.get("/api/v1/admin/mukadams")
+async def api_admin_list_mukadams(
+    request: Request,
+    q: str = "",
+    mobile: str = "",
+    district: str = "",
+    village: str = "",
+    status_filter: str = "ALL",
+    registered_from: Optional[float] = None,
+    registered_to: Optional[float] = None,
+    sort_by: str = "updated_at",
+    sort_dir: str = "desc",
+    page: int = 1,
+    page_size: int = 20,
+):
+    admin = _require_admin(request, required_permission="mukadam:view")
+    return admin_service.list_mukadams_for_admin(
+        admin,
+        q=q,
+        mobile=mobile,
+        district=district,
+        village=village,
+        status_filter=status_filter,
+        registered_from=registered_from,
+        registered_to=registered_to,
+        sort_by=sort_by,
+        sort_dir=sort_dir,
+        page=page,
+        page_size=page_size,
+    )
+
+
+@app.get("/api/v1/admin/mukadams/{mukadam_id}")
+async def api_admin_get_mukadam(mukadam_id: int, request: Request):
+    if mukadam_id <= 0:
+        raise HTTPException(status_code=400, detail="અમાન્ય મુકાદમ ID.")
+    admin = _require_admin(request, required_permission="mukadam:view")
+    res = admin_service.get_mukadam_profile_for_admin(admin, mukadam_id)
+    if not res.get("ok"):
+        raise HTTPException(status_code=int(res.get("http_status", 404)), detail=res.get("message_gu", "મળ્યું નથી."))
+    return res
+
+
+@app.post("/api/v1/admin/mukadams/{mukadam_id}/block")
+async def api_admin_block_mukadam(mukadam_id: int, req: AdminBlockRequest, request: Request):
+    if mukadam_id <= 0:
+        raise HTTPException(status_code=400, detail="અમાન્ય મુકાદમ ID.")
+    admin = _require_admin(request, required_permission="mukadam:block")
+    res = admin_service.block_mukadam(
+        admin,
+        mukadam_id,
+        reason=req.reason,
+        admin_note=req.admin_note,
+        expires_at=req.expires_at,
+        client_ip=_extract_client_ip(request),
+        request_id=request.headers.get("X-Request-ID", ""),
+    )
+    if not res.get("ok"):
+        raise HTTPException(status_code=int(res.get("http_status", 400)), detail=res.get("message_gu", "બ્લોક નિષ્ફળ."))
+    return res
+
+
+@app.post("/api/v1/admin/mukadams/{mukadam_id}/unblock")
+async def api_admin_unblock_mukadam(mukadam_id: int, req: AdminUnblockRequest, request: Request):
+    if mukadam_id <= 0:
+        raise HTTPException(status_code=400, detail="અમાન્ય મુકાદમ ID.")
+    admin = _require_admin(request, required_permission="mukadam:unblock")
+    res = admin_service.unblock_mukadam(
+        admin,
+        mukadam_id,
+        reason=req.reason,
+        admin_note=req.admin_note,
+        client_ip=_extract_client_ip(request),
+        request_id=request.headers.get("X-Request-ID", ""),
+    )
+    if not res.get("ok"):
+        raise HTTPException(status_code=int(res.get("http_status", 400)), detail=res.get("message_gu", "અનબ્લોક નિષ્ફળ."))
+    return res
+
+
+@app.post("/api/v1/admin/mukadams/{mukadam_id}/soft-delete")
+async def api_admin_soft_delete_mukadam(mukadam_id: int, req: AdminSoftDeleteRequest, request: Request):
+    if mukadam_id <= 0:
+        raise HTTPException(status_code=400, detail="અમાન્ય મુકાદમ ID.")
+    admin = _require_admin(
+        request,
+        required_permission="mukadam:soft_delete",
+        allowed_roles={admin_service.ROLE_SUPER_ADMIN},
+    )
+    res = admin_service.soft_delete_mukadam(
+        admin,
+        mukadam_id,
+        reason=req.reason,
+        client_ip=_extract_client_ip(request),
+        request_id=request.headers.get("X-Request-ID", ""),
+    )
+    if not res.get("ok"):
+        raise HTTPException(status_code=int(res.get("http_status", 400)), detail=res.get("message_gu", "Soft Delete નિષ્ફળ."))
+    return res
+
+
+@app.post("/api/v1/admin/mukadams/{mukadam_id}/restore")
+async def api_admin_restore_mukadam(mukadam_id: int, req: AdminRestoreRequest, request: Request):
+    if mukadam_id <= 0:
+        raise HTTPException(status_code=400, detail="અમાન્ય મુકાદમ ID.")
+    admin = _require_admin(
+        request,
+        required_permission="mukadam:restore",
+        allowed_roles={admin_service.ROLE_SUPER_ADMIN},
+    )
+    res = admin_service.restore_mukadam(
+        admin,
+        mukadam_id,
+        reason=req.reason,
+        client_ip=_extract_client_ip(request),
+        request_id=request.headers.get("X-Request-ID", ""),
+    )
+    if not res.get("ok"):
+        raise HTTPException(status_code=int(res.get("http_status", 400)), detail=res.get("message_gu", "Restore નિષ્ફળ."))
+    return res
+
+
+@app.delete("/api/v1/admin/mukadams/{mukadam_id}/permanent")
+async def api_admin_permanent_delete_mukadam(mukadam_id: int, req: AdminPermanentDeleteRequest, request: Request):
+    if mukadam_id <= 0:
+        raise HTTPException(status_code=400, detail="અમાન્ય મુકાદમ ID.")
+    # First verify session is valid, then let permanent_delete_mukadam enforce SUPER_ADMIN + password re-auth + audit log
+    admin = _require_admin(request)
+    res = admin_service.permanent_delete_mukadam(
+        admin,
+        mukadam_id,
+        admin_password=req.admin_password,
+        confirm_mobile_or_name=req.confirm_mobile_or_name,
+        reason=req.reason,
+        client_ip=_extract_client_ip(request),
+        request_id=request.headers.get("X-Request-ID", ""),
+    )
+    if not res.get("ok"):
+        raise HTTPException(status_code=int(res.get("http_status", 400)), detail=res.get("message_gu", "કાયમી ડિલીટ નિષ્ફળ."))
+    return res
+
+
+@app.get("/api/v1/admin/reports")
+async def api_admin_list_reports(
+    request: Request,
+    status_filter: str = "ALL",
+    mukadam_id: Optional[int] = None,
+    page: int = 1,
+    page_size: int = 20,
+):
+    admin = _require_admin(request, required_permission="reports:view")
+    res = admin_service.list_reports_for_admin(
+        admin,
+        status_filter=status_filter,
+        mukadam_id=mukadam_id,
+        page=page,
+        page_size=page_size,
+    )
+    if not res.get("ok"):
+        raise HTTPException(status_code=int(res.get("http_status", 403)), detail=res.get("message_gu", "પરવાનગી નથી."))
+    return res
+
+
+@app.post("/api/v1/admin/reports/{report_id}/review")
+async def api_admin_review_report(report_id: int, req: AdminReportReviewRequest, request: Request):
+    if report_id <= 0:
+        raise HTTPException(status_code=400, detail="અમાન્ય Report ID.")
+    admin = _require_admin(request, required_permission="reports:review")
+    res = admin_service.review_report(
+        admin,
+        report_id,
+        new_status=req.new_status,
+        admin_notes=req.admin_notes,
+        resolution_details=req.resolution_details,
+        assigned_moderator=req.assigned_moderator,
+        also_block_mukadam=req.also_block_mukadam,
+        block_expiry_hours=req.block_expiry_hours,
+        client_ip=_extract_client_ip(request),
+        request_id=request.headers.get("X-Request-ID", ""),
+    )
+    if not res.get("ok"):
+        raise HTTPException(status_code=int(res.get("http_status", 400)), detail=res.get("message_gu", "સમીક્ષા સેવ નિષ્ફળ."))
+    return res
+
+
+@app.get("/api/v1/admin/audit-logs")
+async def api_admin_list_audit_logs(
+    request: Request,
+    action_filter: str = "",
+    target_type: str = "",
+    page: int = 1,
+    page_size: int = 30,
+):
+    admin = _require_admin(
+        request,
+        required_permission="audit:view",
+        allowed_roles={admin_service.ROLE_SUPER_ADMIN},
+    )
+    res = admin_service.list_audit_logs(
+        admin,
+        action_filter=action_filter,
+        target_type=target_type,
+        page=page,
+        page_size=page_size,
+    )
+    if not res.get("ok"):
+        raise HTTPException(status_code=int(res.get("http_status", 403)), detail=res.get("message_gu", "પરવાનગી નથી."))
+    return res
+
+
+@app.get("/api/v1/admin/users")
+async def api_admin_list_users(request: Request):
+    admin = _require_admin(
+        request,
+        required_permission="admins:manage",
+        allowed_roles={admin_service.ROLE_SUPER_ADMIN},
+    )
+    return admin_service.list_admin_users(admin)
+
+
+@app.post("/api/v1/admin/users")
+async def api_admin_upsert_user(req: AdminUserUpsertRequest, request: Request):
+    admin = _require_admin(
+        request,
+        required_permission="admins:manage",
+        allowed_roles={admin_service.ROLE_SUPER_ADMIN},
+    )
+    res = admin_service.create_or_update_admin_user(
+        admin,
+        username=req.username,
+        display_name=req.display_name,
+        role=req.role,
+        password=req.password,
+        permissions=req.permissions,
+        is_active=req.is_active,
+        client_ip=_extract_client_ip(request),
+        request_id=request.headers.get("X-Request-ID", ""),
+    )
+    if not res.get("ok"):
+        raise HTTPException(status_code=int(res.get("http_status", 400)), detail=res.get("message_gu", "સેવ નિષ્ફળ."))
+    return res
+
+
+@app.post("/api/v1/admin/backup")
+async def api_admin_create_backup(request: Request):
+    admin = _require_admin(
+        request,
+        required_permission="backup:manage",
+        allowed_roles={admin_service.ROLE_SUPER_ADMIN},
+    )
+    return admin_service.create_sqlite_backup(tag=f"admin_{admin['username']}")
