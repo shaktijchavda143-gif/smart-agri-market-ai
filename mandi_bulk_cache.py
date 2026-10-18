@@ -352,3 +352,85 @@ def get_mandi_cache_stats(db_path: str | None = None) -> dict[str, Any]:
         except Exception:
             pass
     return stats
+
+
+def get_recent_records_stepwise(
+    state_key: str,
+    market_key: str,
+    commodity_key: str,
+    *,
+    max_lookback_days: int = 7,
+    today_iso: str = "",
+    db_path: str | None = None,
+) -> list[dict[str, Any]]:
+    """Step-by-step 7-day lookback in SQLite mandi_cached_records:
+    Checks Today (day 0), then Yesterday (day 1), then day 2 ... up to max_lookback_days (7 days).
+    Returns all records for the newest available day within the 7-day window.
+    """
+    from datetime import datetime, timedelta, timezone
+    target = db_path or DB_PATH
+    if not os.path.exists(target):
+        return []
+    ist = timezone(timedelta(hours=5, minutes=30))
+    if today_iso:
+        try:
+            today_dt = datetime.fromisoformat(today_iso).date()
+        except Exception:
+            today_dt = datetime.now(ist).date()
+    else:
+        today_dt = datetime.now(ist).date()
+
+    with _DB_LOCK:
+        try:
+            init_mandi_cache_db(target)
+            conn = sqlite3.connect(target, timeout=5.0)
+            try:
+                if market_key and market_key != "ALL":
+                    cur = conn.execute(
+                        """
+                        SELECT arrival_date_iso, arrival_date, record_json
+                        FROM mandi_cached_records
+                        WHERE state_key = ? AND market_key = ? AND commodity_key = ?
+                        ORDER BY arrival_date_iso DESC
+                        """,
+                        (state_key, market_key, commodity_key),
+                    )
+                else:
+                    cur = conn.execute(
+                        """
+                        SELECT arrival_date_iso, arrival_date, record_json
+                        FROM mandi_cached_records
+                        WHERE state_key = ? AND commodity_key = ?
+                        ORDER BY arrival_date_iso DESC
+                        """,
+                        (state_key, commodity_key),
+                    )
+                rows_by_day: dict[str, list[dict[str, Any]]] = {}
+                for arr_iso, arr_disp, rec_json in cur.fetchall():
+                    day_str = str(arr_iso or "")[:10]
+                    if not day_str and arr_disp:
+                        for fmt in ("%d/%m/%Y", "%d-%m-%Y", "%Y-%m-%d"):
+                            try:
+                                day_str = datetime.strptime(str(arr_disp).strip(), fmt).date().isoformat()
+                                break
+                            except ValueError:
+                                continue
+                    if not day_str:
+                        continue
+                    try:
+                        rec = json.loads(rec_json)
+                        if isinstance(rec, dict):
+                            rows_by_day.setdefault(day_str, []).append(rec)
+                    except Exception:
+                        continue
+
+                # Step-by-step lookback: Day 0 (Today) -> Day 1 (Yesterday) -> Day 2 ... -> Day max_lookback_days
+                for offset in range(max(0, int(max_lookback_days)) + 1):
+                    candidate_day = (today_dt - timedelta(days=offset)).isoformat()
+                    if candidate_day in rows_by_day and rows_by_day[candidate_day]:
+                        return rows_by_day[candidate_day]
+            finally:
+                conn.close()
+        except Exception:
+            return []
+    return []
