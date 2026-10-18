@@ -1127,8 +1127,8 @@ CEDA_API_KEY = os.getenv("CEDA_API_KEY", "").strip()
 CEDA_API_BASE = os.getenv("CEDA_API_BASE", "https://api.ceda.ashoka.edu.in/v1").strip().rstrip("/")
 MANDI_FALLBACK_MAX_AGE_HOURS = _mandi_env_seconds("MANDI_FALLBACK_MAX_AGE_HOURS", 96, 1, 168)
 MANDI_MAX_LOOKBACK_DAYS = 3
-MANDI_AGMARKNET_DAILY_TIMEOUT_SECONDS = _mandi_env_seconds("MANDI_AGMARKNET_DAILY_TIMEOUT_SECONDS", 3, 1, 8)
-MANDI_AGMARKNET_STATE_TIMEOUT_SECONDS = _mandi_env_seconds("MANDI_AGMARKNET_STATE_TIMEOUT_SECONDS", 3, 1, 8)
+MANDI_AGMARKNET_DAILY_TIMEOUT_SECONDS = _mandi_env_seconds("MANDI_AGMARKNET_DAILY_TIMEOUT_SECONDS", 7, 1, 15)
+MANDI_AGMARKNET_STATE_TIMEOUT_SECONDS = _mandi_env_seconds("MANDI_AGMARKNET_STATE_TIMEOUT_SECONDS", 6, 1, 15)
 MANDI_CEDA_TIMEOUT_SECONDS = _mandi_env_seconds("MANDI_CEDA_TIMEOUT_SECONDS", 8, 3, 30)
 MANDI_TOTAL_BUDGET_SECONDS = _mandi_env_seconds("MANDI_TOTAL_BUDGET_SECONDS", 30, 10, 45)
 _mandi_rate_limit_until: dict[str, float] = {}
@@ -1219,13 +1219,102 @@ def _get_from_shared_pool(state: str, market: str, commodity: str, max_age_secon
                     return filtered_payload
     return None
 
-GUJARATI_CROP_ALIASES = {
-    "કપાસ": "Cotton", "મગફળી": "Groundnut", "ઘઉં": "Wheat", "બાજરી": "Bajra",
-    "મકાઈ": "Maize", "જીરું": "Jeera", "ધાણા": "Dhaniya", "તલ": "Sesamum",
-    "એરંડા": "Castor Seed", "ચણા": "Gram", "તુવેર": "Arhar", "મગ": "Moong",
-    "અડદ": "Black Gram", "ડુંગળી": "Onion", "બટાકા": "Potato", "ટામેટા": "Tomato",
-    "મરચાં": "Chilli", "લસણ": "Garlic", "શેરડી": "Sugarcane", "કેરી": "Mango",
-    "કેળા": "Banana", "દાડમ": "Pomegranate"
+GUJARAT_MANDI_CROP_CATALOGUE = [
+    {"crop_gu": "મગફળી", "crop_en": "Groundnut", "category_gu": "તેલીબિયાં", "ceda_id": 10, "aliases": ["groundnut", "ground nuts", "peanut", "peanuts", "groundnut pods (raw)", "groundnut (split)", "મગફળી", "શીંગ"]},
+    {"crop_gu": "કપાસ", "crop_en": "Cotton", "category_gu": "રોકડિયા પાક", "ceda_id": 15, "aliases": ["cotton", "kapas", "shankar 6", "કપાસ", "રૂ"]},
+    {"crop_gu": "જીરું", "crop_en": "Jeera", "category_gu": "મસાલા પાક", "ceda_id": 42, "aliases": ["jeera", "cumin", "cummin", "cummin seed", "cummin seed(jeera)", "જીરું", "જીરુ"]},
+    {"crop_gu": "એરંડા", "crop_en": "Castor Seed", "category_gu": "તેલીબિયાં", "ceda_id": 123, "aliases": ["castor seed", "castor", "arandi", "એરંડા", "એરંડો", "દિવેલા"]},
+    {"crop_gu": "ડુંગળી", "crop_en": "Onion", "category_gu": "શાકભાજી", "ceda_id": 23, "aliases": ["onion", "onion green", "ડુંગળી", "કાંદા"]},
+    {"crop_gu": "ઘઉં", "crop_en": "Wheat", "category_gu": "અનાજ", "ceda_id": 1, "aliases": ["wheat", "lokwan", "tukdi", "ઘઉં"]},
+    {"crop_gu": "બાજરી", "crop_en": "Bajra", "category_gu": "અનાજ", "ceda_id": 28, "aliases": ["bajra", "pearl millet", "bajra(pearl millet/cumbu)", "millet", "બાજરી"]},
+    {"crop_gu": "મકાઈ", "crop_en": "Maize", "category_gu": "અનાજ", "ceda_id": 4, "aliases": ["maize", "corn", "મકાઈ"]},
+    {"crop_gu": "જુવાર", "crop_en": "Jowar", "category_gu": "અનાજ", "ceda_id": 5, "aliases": ["jowar", "sorghum", "jowar(sorghum)", "જુવાર"]},
+    {"crop_gu": "ડાંગર (ચોખા)", "crop_en": "Paddy", "category_gu": "અનાજ", "ceda_id": 2, "aliases": ["paddy", "paddy(dhan)(common)", "rice", "dhan", "ડાંગર", "ડાંગર (ચોખા)", "ચોખા"]},
+    {"crop_gu": "ચણા", "crop_en": "Gram", "category_gu": "કઠોળ", "ceda_id": 6, "aliases": ["gram", "chana", "bengal gram", "bengal gram(gram)(whole)", "kabuli chana", "ચણા"]},
+    {"crop_gu": "તુવેર", "crop_en": "Arhar", "category_gu": "કઠોળ", "ceda_id": 49, "aliases": ["arhar", "tur", "pigeon pea", "arhar (tur/red gram)(whole)", "red gram", "તુવેર"]},
+    {"crop_gu": "મગ", "crop_en": "Moong", "category_gu": "કઠોળ", "ceda_id": 9, "aliases": ["moong", "green gram", "green gram (moong)(whole)", "મગ"]},
+    {"crop_gu": "અડદ", "crop_en": "Black Gram", "category_gu": "કઠોળ", "ceda_id": 8, "aliases": ["black gram", "urad", "black gram (urd beans)(whole)", "અડદ"]},
+    {"crop_gu": "મઠ", "crop_en": "Moth", "category_gu": "કઠોળ", "ceda_id": 95, "aliases": ["moth", "mataki", "moath", "મઠ"]},
+    {"crop_gu": "ચોળા", "crop_en": "Cowpea", "category_gu": "કઠોળ", "ceda_id": 92, "aliases": ["cowpea", "lobia", "cowpea (lobia/karamani)", "ચોળા", "ચોળી"]},
+    {"crop_gu": "વાલ", "crop_en": "Indian Beans", "category_gu": "કઠોળ", "ceda_id": 94, "aliases": ["indian beans", "indian beans (seam)", "val", "વાલ", "વાલ પાપડી"]},
+    {"crop_gu": "વટાણા", "crop_en": "Peas", "category_gu": "કઠોળ", "ceda_id": 74, "aliases": ["peas", "green peas", "white peas", "peas wet", "વટાણા"]},
+    {"crop_gu": "તલ", "crop_en": "Sesamum", "category_gu": "તેલીબિયાં", "ceda_id": 11, "aliases": ["sesamum", "sesame", "sesamum(sesame,gingelly,til)", "til", "તલ"]},
+    {"crop_gu": "રાઈ (સરસવ)", "crop_en": "Mustard", "category_gu": "તેલીબિયાં", "ceda_id": 12, "aliases": ["mustard", "rapeseed", "raydo", "rai", "રાઈ", "રાઈ (સરસવ)", "સરસવ", "રાયડો"]},
+    {"crop_gu": "સોયાબીન", "crop_en": "Soyabean", "category_gu": "તેલીબિયાં", "ceda_id": 13, "aliases": ["soyabean", "soybean", "સોયાબીન"]},
+    {"crop_gu": "સૂર્યમુખી", "crop_en": "Sunflower", "category_gu": "તેલીબિયાં", "ceda_id": 14, "aliases": ["sunflower", "sunflower seed", "સૂર્યમુખી"]},
+    {"crop_gu": "ધાણા", "crop_en": "Dhaniya", "category_gu": "મસાલા પાક", "ceda_id": 43, "aliases": ["dhaniya", "dhania", "coriander", "corriander", "corriander seed", "coriander(leaves)", "ધાણા", "ધાણાજીરું"]},
+    {"crop_gu": "વરિયાળી", "crop_en": "Fennel", "category_gu": "મસાલા પાક", "ceda_id": 45, "aliases": ["fennel", "saunf", "fennel(saunf)", "variyali", "વરિયાળી"]},
+    {"crop_gu": "ઈસબગુલ", "crop_en": "Isabgul", "category_gu": "મસાલા / ઔષધીય", "ceda_id": 140, "aliases": ["isabgul", "isabgul (psyllium)", "psyllium", "isabgol", "ઈસબગુલ", "ઇસબગુલ"]},
+    {"crop_gu": "મેથી", "crop_en": "Methi", "category_gu": "મસાલા પાક", "ceda_id": 46, "aliases": ["methi", "methi(seeds)", "methi seeds", "fenugreek", "મેથી"]},
+    {"crop_gu": "અજમો", "crop_en": "Ajwan", "category_gu": "મસાલા પાક", "ceda_id": 137, "aliases": ["ajwan", "ajwain", "bishop weed", "અજમો"]},
+    {"crop_gu": "સુવા (દિલ)", "crop_en": "Suva", "category_gu": "મસાલા પાક", "ceda_id": 138, "aliases": ["suva", "suva (dill seed)", "dill seed", "સુવા", "સુવા (દિલ)"]},
+    {"crop_gu": "હળદર", "crop_en": "Turmeric", "category_gu": "મસાલા પાક", "ceda_id": 39, "aliases": ["turmeric", "turmeric (raw)", "haldi", "હળદર"]},
+    {"crop_gu": "લસણ", "crop_en": "Garlic", "category_gu": "મસાલા / શાકભાજી", "ceda_id": 25, "aliases": ["garlic", "lasan", "લસણ"]},
+    {"crop_gu": "આદુ", "crop_en": "Ginger", "category_gu": "મસાલા / શાકભાજી", "ceda_id": 27, "aliases": ["ginger", "ginger(green)", "ginger(dry)", "adu", "આદુ"]},
+    {"crop_gu": "મરચાં", "crop_en": "Chilli", "category_gu": "શાકભાજી / મસાલા", "ceda_id": 26, "aliases": ["chilli", "chillies", "green chilli", "chili red", "dry chillies", "મરચાં", "લીલા મરચાં", "સૂકા મરચાં"]},
+    {"crop_gu": "ગુવાર", "crop_en": "Guar", "category_gu": "રોકડિયા / કઠોળ", "ceda_id": 75, "aliases": ["guar", "guar seed", "guar seed(cluster beans seed)", "cluster beans", "ગુવાર", "ગવાર"]},
+    {"crop_gu": "બટાકા", "crop_en": "Potato", "category_gu": "શાકભાજી", "ceda_id": 24, "aliases": ["potato", "bataka", "બટાકા", "બટાટા"]},
+    {"crop_gu": "ટામેટા", "crop_en": "Tomato", "category_gu": "શાકભાજી", "ceda_id": 78, "aliases": ["tomato", "tameta", "ટામેટા", "ટામેટાં"]},
+    {"crop_gu": "રીંગણ", "crop_en": "Brinjal", "category_gu": "શાકભાજી", "ceda_id": 35, "aliases": ["brinjal", "eggplant", "ringan", "રીંગણ", "રીંગણા"]},
+    {"crop_gu": "કોબીજ", "crop_en": "Cabbage", "category_gu": "શાકભાજી", "ceda_id": 154, "aliases": ["cabbage", "kobij", "કોબીજ", "કોબી"]},
+    {"crop_gu": "ફ્લાવર", "crop_en": "Cauliflower", "category_gu": "શાકભાજી", "ceda_id": 34, "aliases": ["cauliflower", "flower", "ફ્લાવર", "ફુલેવર"]},
+    {"crop_gu": "ભીંડા", "crop_en": "Bhindi", "category_gu": "શાકભાજી", "ceda_id": 85, "aliases": ["bhindi", "bhindi(ladies finger)", "ladies finger", "okra", "ભીંડા", "ભીંડો"]},
+    {"crop_gu": "દૂધી", "crop_en": "Bottle Gourd", "category_gu": "શાકભાજી", "ceda_id": 82, "aliases": ["bottle gourd", "dudhi", "lauki", "દૂધી"]},
+    {"crop_gu": "કારેલા", "crop_en": "Bitter Gourd", "category_gu": "શાકભાજી", "ceda_id": 81, "aliases": ["bitter gourd", "karela", "કારેલા", "કારેલાં"]},
+    {"crop_gu": "કેરી", "crop_en": "Mango", "category_gu": "ફળ", "ceda_id": 20, "aliases": ["mango", "mango (raw-ripe)", "kesar mango", "કેરી"]},
+    {"crop_gu": "કેળા", "crop_en": "Banana", "category_gu": "ફળ", "ceda_id": 19, "aliases": ["banana", "banana - green", "કેળા", "કેળાં"]},
+    {"crop_gu": "દાડમ", "crop_en": "Pomegranate", "category_gu": "ફળ", "ceda_id": 190, "aliases": ["pomegranate", "dadam", "દાડમ"]},
+    {"crop_gu": "પપૈયા", "crop_en": "Papaya", "category_gu": "ફળ", "ceda_id": 72, "aliases": ["papaya", "papaya (raw)", "પપૈયા", "પપૈયું"]},
+    {"crop_gu": "લીંબુ", "crop_en": "Lemon", "category_gu": "ફળ / શાકભાજી", "ceda_id": 31, "aliases": ["lemon", "lime", "nimbu", "લીંબુ"]},
+    {"crop_gu": "ચીકુ", "crop_en": "Sapota", "category_gu": "ફળ", "ceda_id": 71, "aliases": ["sapota", "chiku", "ચીકુ"]},
+    {"crop_gu": "નાળિયેર", "crop_en": "Coconut", "category_gu": "ફળ / રોકડિયા", "ceda_id": 37, "aliases": ["coconut", "નાળિયેર", "શ્રીફળ"]},
+    {"crop_gu": "શેરડી", "crop_en": "Sugarcane", "category_gu": "રોકડિયા પાક", "ceda_id": 150, "aliases": ["sugarcane", "sheredi", "શેરડી"]},
+    {"crop_gu": "તમાકુ", "crop_en": "Tobacco", "category_gu": "રોકડિયા પાક", "ceda_id": 141, "aliases": ["tobacco", "તમાકુ"]},
+    {"crop_gu": "રાજગરો", "crop_en": "Amaranthus", "category_gu": "અનાજ", "ceda_id": 165, "aliases": ["amaranthus", "rajgaro", "રાજગરો"]},
+]
+
+GUJARATI_CROP_ALIASES = {}
+for _item in GUJARAT_MANDI_CROP_CATALOGUE:
+    GUJARATI_CROP_ALIASES[_item["crop_gu"]] = _item["crop_en"]
+    GUJARATI_CROP_ALIASES[f"{_item['crop_gu']} ({_item['crop_en']})"] = _item["crop_en"]
+    for _al in _item["aliases"]:
+        GUJARATI_CROP_ALIASES[_al] = _item["crop_en"]
+        GUJARATI_CROP_ALIASES[_al.title()] = _item["crop_en"]
+
+_MANDI_PROVIDER_DIAG_STATE: dict[str, dict[str, Any]] = {
+    "data.gov.in": {
+        "provider": "Government of India Open Data (api.data.gov.in)",
+        "endpoint": "https://api.data.gov.in/resource/9ef84268-d588-465a-a308-a864a43d0070",
+        "last_http_status": 0,
+        "last_response_time_ms": 0,
+        "last_records_received": 0,
+        "last_valid_records": 0,
+        "last_parsing_errors": 0,
+        "last_successful_fetch": "",
+        "last_failure_reason": "not_probed_yet",
+    },
+    "agmarknet_2_public": {
+        "provider": "AGMARKNET 2.0 Public API (api.agmarknet.gov.in)",
+        "endpoint": "https://api.agmarknet.gov.in/v1/prices-and-arrivals/date-wise/specific-commodity",
+        "last_http_status": 0,
+        "last_response_time_ms": 0,
+        "last_records_received": 0,
+        "last_valid_records": 0,
+        "last_parsing_errors": 0,
+        "last_successful_fetch": "",
+        "last_failure_reason": "not_probed_yet",
+    },
+    "ceda_agmarknet_fallback": {
+        "provider": "CEDA Ashoka Agmarknet API (agmarknet.ceda.ashoka.edu.in)",
+        "endpoint": "https://agmarknet.ceda.ashoka.edu.in/api/prices",
+        "last_http_status": 0,
+        "last_response_time_ms": 0,
+        "last_records_received": 0,
+        "last_valid_records": 0,
+        "last_parsing_errors": 0,
+        "last_successful_fetch": "",
+        "last_failure_reason": "not_probed_yet",
+    },
 }
 
 
@@ -1448,13 +1537,14 @@ def _norm_mandi_market(value: Any) -> str:
 
 
 def _mandi_market_match_key(value: Any) -> str:
-    """Canonical key for strict market equality, ignoring APMC/Yard suffixes and punctuation."""
+    """Canonical key for market equality, translating Gujarati yard names to English canonical keys."""
     text = _norm_mandi_market(value)
     for remove_word in (
-        "કૃષિ ઉત્પન્ન બજાર સમિતિ યાર્ડ ",
+        "કૃષિ ઉત્પન્ન બજાર સમિતિ યાર્ડ",
         "કૃષિ ઉત્પન્ન બજાર સમિતિ",
-        "માર્કેટ યાર્ડ ",
-        "યાર્ડ ",
+        "કૃષિ બજાર યાર્ડ",
+        "માર્કેટ યાર્ડ",
+        "યાર્ડ",
         "agricultural produce market committee",
         "market yard",
         "apmc",
@@ -1462,7 +1552,43 @@ def _mandi_market_match_key(value: Any) -> str:
         "market",
     ):
         text = text.replace(remove_word, " ")
+    text = text.strip(" -—,()")
+    _extra_gu_to_en = {
+        "ઊંઝા": "unjha",
+        "ઉંઝા": "unjha",
+        "ડીસા": "deesa",
+        "દિસા": "deesa",
+        "હિંમતનગર": "himatnagar",
+        "હિમતનગર": "himatnagar",
+        "મહેસાણા": "mehsana",
+    }
+    for gu_v, en_k in _extra_gu_to_en.items():
+        if text == gu_v or gu_v in text:
+            text = text.replace(gu_v, en_k)
+    if "_GUJARATI_MARKET_NAME_MAP" in globals():
+        for en_k, gu_v in _GUJARATI_MARKET_NAME_MAP.items():
+            if text == gu_v or gu_v in text:
+                text = text.replace(gu_v, en_k)
     return re.sub(r"[\W_]+", "", text, flags=re.UNICODE).lower()
+
+
+def _mandi_markets_match(row_market: Any, requested_market: Any) -> bool:
+    """Match markets across English/Gujarati labels and sub-yard parentheticals like 'Rajkot(Ghee Peeth)'."""
+    if not requested_market or not str(requested_market).strip():
+        return True
+    if not row_market or not str(row_market).strip():
+        return False
+    req_base = str(requested_market).split("(", 1)[0].strip()
+    row_base = str(row_market).split("(", 1)[0].strip()
+    k_req_full = _mandi_market_match_key(requested_market)
+    k_row_full = _mandi_market_match_key(row_market)
+    k_req_base = _mandi_market_match_key(req_base)
+    k_row_base = _mandi_market_match_key(row_base)
+    if not k_req_full or not k_row_full:
+        return False
+    if k_req_full == k_row_full or (k_req_base and k_req_base == k_row_base):
+        return True
+    return False
 
 
 def _mandi_row_market(row: dict[str, Any]) -> str:
@@ -1499,7 +1625,13 @@ def _commodity_matches(row: dict[str, Any], requested: str) -> bool:
         "chilli": {"chilli", "chillies", "green chilli", "મરચાં"},
         "garlic": {"garlic", "લસણ"},
     }
-    accepted = {_norm_mandi_text(x) for x in aliases.get(wanted, {requested})}
+    extra_aliases = set(aliases.get(wanted, {requested, wanted}))
+    for _cat_item in GUJARAT_MANDI_CROP_CATALOGUE:
+        if _norm_mandi_text(_cat_item["crop_en"]) == wanted or _norm_mandi_text(_cat_item["crop_gu"]) == _norm_mandi_text(requested):
+            extra_aliases.update(_cat_item["aliases"])
+            extra_aliases.add(_cat_item["crop_en"])
+            extra_aliases.add(_cat_item["crop_gu"])
+    accepted = {_norm_mandi_text(x) for x in extra_aliases if x}
     values = []
     for key in ("commodity", "Commodity", "crop", "Crop", "commodity_name", "Commodity Name"):
         if row.get(key):
@@ -1851,24 +1983,9 @@ _CEDA_RATE_LIMIT_MAX_SECONDS = 7 * 24 * 60 * 60
 # metadata fallback when CEDA's /commodities or /geographies endpoint returns 401.
 # Never invents prices or dates; only supplies IDs to query real /api/prices.
 _CEDA_STATIC_COMMODITIES = [
-    {"commodity_id": 10, "commodity_name": "Groundnut"},
-    {"commodity_id": 15, "commodity_name": "Cotton"},
-    {"commodity_id": 1, "commodity_name": "Wheat"},
-    {"commodity_id": 28, "commodity_name": "Bajra"},
-    {"commodity_id": 4, "commodity_name": "Maize"},
-    {"commodity_id": 42, "commodity_name": "Jeera"},
-    {"commodity_id": 43, "commodity_name": "Dhaniya"},
-    {"commodity_id": 11, "commodity_name": "Sesamum"},
-    {"commodity_id": 123, "commodity_name": "Castor Seed"},
-    {"commodity_id": 6, "commodity_name": "Gram"},
-    {"commodity_id": 49, "commodity_name": "Arhar"},
-    {"commodity_id": 9, "commodity_name": "Moong"},
-    {"commodity_id": 8, "commodity_name": "Black Gram"},
-    {"commodity_id": 23, "commodity_name": "Onion"},
-    {"commodity_id": 24, "commodity_name": "Potato"},
-    {"commodity_id": 78, "commodity_name": "Tomato"},
-    {"commodity_id": 26, "commodity_name": "Chilli"},
-    {"commodity_id": 25, "commodity_name": "Garlic"},
+    {"commodity_id": item["ceda_id"], "commodity_name": item["crop_en"]}
+    for item in GUJARAT_MANDI_CROP_CATALOGUE
+    if item.get("ceda_id")
 ]
 
 _CEDA_STATIC_GUJARAT_GEOGRAPHIES = [
@@ -2237,7 +2354,7 @@ async def _fetch_agmarknet_2_live(state: str, market: str, commodity: str, reque
                     rejected["commodity"] += 1
                     continue
                 market_name = str(_ag_pick(row, "market_name", "marketName", "market", "Market") or "").strip()
-                if market_filter and (not market_name or _mandi_market_match_key(market_filter) != _mandi_market_match_key(market_name)):
+                if market_filter and (not market_name or not _mandi_markets_match(market_name, market_filter)):
                     rejected["market"] += 1
                     continue
                 raw_date = _ag_pick(row, "arrival_date", "arrivalDate", "date", "Date", "reportedDate", "reported_date")
@@ -2358,7 +2475,7 @@ async def _fetch_agmarknet_2_live(state: str, market: str, commodity: str, reque
                     continue
 
                 market_name = str(_ag_pick(row, "market_name", "marketName", "market", "Market") or "").strip()
-                if market_filter and (not market_name or _mandi_market_match_key(market_filter) != _mandi_market_match_key(market_name)):
+                if market_filter and (not market_name or not _mandi_markets_match(market_name, market_filter)):
                     rejected["market"] += 1
                     continue
 
@@ -2864,6 +2981,49 @@ def _mandi_market_display_gu(raw: str) -> str:
     cleaned=" ".join(cleaned.split()).strip(" -,")
     return f"{cleaned} યાર્ડ" if cleaned else "કૃષિ બજાર યાર્ડ"
 
+
+
+@app.get("/api/v1/mandi/crops")
+def mandi_crops_catalogue(state: str = "Gujarat"):
+    """Return the complete Gujarat Mandi Crop Catalogue (51+ crops) with Gujarati/English names and search aliases."""
+    _load_mandi_shared_pool()
+    cached_crop_keys = set()
+    for pool_key, entry in _mandi_shared_pool.items():
+        if isinstance(entry, dict) and isinstance(entry.get("payload"), dict):
+            if entry["payload"].get("records"):
+                parts = pool_key.split("|")
+                if len(parts) == 3:
+                    cached_crop_keys.add(parts[2])
+
+    crops_out = []
+    seen_en = set()
+    for item in GUJARAT_MANDI_CROP_CATALOGUE:
+        en_norm = _norm_mandi_text(item["crop_en"])
+        if en_norm in seen_en:
+            continue
+        seen_en.add(en_norm)
+        crops_out.append({
+            "crop_gu": item["crop_gu"],
+            "crop_en": item["crop_en"],
+            "display_label": f"{item['crop_gu']} ({item['crop_en']})",
+            "category_gu": item.get("category_gu", "કૃષિ પાક"),
+            "aliases": item["aliases"],
+            "has_recent_cached_price": en_norm in cached_crop_keys,
+        })
+
+    # Merge any additional dynamic commodities discovered in the live cache
+    for c_en, cid in list(_agmarknet_commodity_cache.keys()):
+        pass
+
+    return {
+        "ok": True,
+        "state": (state or "Gujarat").strip() or "Gujarat",
+        "count": len(crops_out),
+        "crops": crops_out,
+        "note_gu": "આ યાદીમાં ગુજરાતના તમામ મુખ્ય APMC પાકો સામેલ છે. જે તે દિવસે યાર્ડમાં હરાજી અને આવક નોંધાઈ હોય તે પાકના જ Live ભાવ ઉપલબ્ધ થશે.",
+    }
+
+
 @app.get("/api/v1/mandi/markets")
 def mandi_markets(state: str = "Gujarat", commodity: str = "ALL"):
     state_name=(state or "Gujarat").strip() or "Gujarat"
@@ -3021,10 +3181,16 @@ def mandi_markets(state: str = "Gujarat", commodity: str = "ALL"):
         with ThreadPoolExecutor(max_workers=1) as pool:
             pool.submit(_runner).result(timeout=AGMARKNET_PUBLIC_TIMEOUT_SECONDS*4+5)
 
+    market_source = "AGMARKNET 2.0"
+    if not names and state_key == "gujarat":
+        for en_mkt in _GUJARATI_MARKET_NAME_MAP.keys():
+            if en_mkt not in ("unja", "mundra apmc", "mandvi kutch"):
+                add_name(en_mkt.title())
+        market_source = "Gujarat Official APMC Catalogue"
     names=sorted(names,key=lambda x:_norm_mandi_market(x))
-    print(f"[MANDI_DEBUG] agmarknet_market_master state={state_name!r} count={len(names)}")
+    print(f"[MANDI_DEBUG] agmarknet_market_master state={state_name!r} count={len(names)} source={market_source!r}")
     options=[{"official_name":name,"display_name_gu":_mandi_market_display_gu(name)} for name in names[:2000]]
-    return {"ok":bool(names),"state":state_name,"commodity":"ALL","markets":names[:2000],"market_options":options,"count":len(names),"source":"AGMARKNET 2.0","source_url":"https://agmarknet.gov.in/home","errors":errors[:10]}
+    return {"ok":bool(names),"state":state_name,"commodity":"ALL","markets":names[:2000],"market_options":options,"count":len(names),"source":market_source,"source_url":"https://agmarknet.gov.in/home","errors":errors[:10]}
 
 @app.get("/api/v1/mandi/today-summary/crop")
 def mandi_today_summary_crop(state: str = "Gujarat", market: str = "", commodity: str = ""):
@@ -3093,6 +3259,20 @@ def _mandi_source_log(source: str, event: str, *, elapsed_ms: int | None = None,
                       status: str = "", http_status: int | None = None,
                       records: int | None = None, state: str = "", market: str = "",
                       commodity: str = "", error: str = "") -> None:
+    if event == "RESULT" and source in _MANDI_PROVIDER_DIAG_STATE:
+        st = _MANDI_PROVIDER_DIAG_STATE[source]
+        if http_status is not None:
+            st["last_http_status"] = int(http_status)
+        if elapsed_ms is not None:
+            st["last_response_time_ms"] = int(elapsed_ms)
+        if records is not None:
+            st["last_valid_records"] = int(records)
+            st["last_records_received"] = max(int(records), int(st.get("last_records_received", 0)))
+        if status == "SUCCESS":
+            st["last_successful_fetch"] = datetime.now(timezone.utc).isoformat()
+            st["last_failure_reason"] = ""
+        elif error:
+            st["last_failure_reason"] = str(error)[:240]
     """Consistent, secret-safe log line for each live mandi source attempt."""
     fields = [f"source={source!r}", f"event={event!r}"]
     if status:
@@ -3245,7 +3425,12 @@ def mandi(state: str = "Gujarat", market: str = "", commodity: str = "ALL", requ
         cached_backup = _get_from_shared_pool(state_name, market_name, requested_commodity, max_age_seconds=72 * 3600)
         if cached_backup:
             backup_out = dict(cached_backup)
+            backup_out["live_available"] = False
+            backup_out["is_cached_data"] = True
+            backup_out["cached_checked_at"] = backup_out.get("checked_at", "")
             backup_out["checked_at"] = checked_at
+            backup_out["live_error"] = live_error
+            backup_out["message"] = "લાઇવ સર્વર હાલ ઉપલબ્ધ ન હોવાથી અગાઉ સાચવેલો (Cached) અધિકૃત ભાવ દર્શાવેલ છે."
             return backup_out
         return {
             "ok": True,
@@ -3388,17 +3573,40 @@ def mandi(state: str = "Gujarat", market: str = "", commodity: str = "ALL", requ
     ceda_records = []
     _ceda_started = time.monotonic()
     _mandi_source_log("ceda_agmarknet_fallback", "START", state=state_name, market=market_name, commodity=requested_commodity)
-    if time.monotonic() < deadline and market_name:
-        ceda_error = "CEDA skipped because the request specifies an exact market"
-    elif time.monotonic() < deadline:
+    if time.monotonic() < deadline:
         try:
             remaining = max(0.5, deadline - time.monotonic())
+            target_district = ""
+            if market_name:
+                m_key = _mandi_market_match_key(market_name)
+                _yard_to_dist = {
+                    "rajkot": "Rajkot", "gondal": "Rajkot", "jetpur": "Rajkot", "dhoraji": "Rajkot", "upleta": "Rajkot", "jasdan": "Rajkot",
+                    "jamnagar": "Jamnagar", "kalavad": "Jamnagar", "jamjodhpur": "Jamnagar", "dhrol": "Jamnagar",
+                    "junagadh": "Junagadh", "keshod": "Junagadh", "visavadar": "Junagadh", "manavadar": "Junagadh", "mangrol": "Junagadh",
+                    "amreli": "Amreli", "savarkundla": "Amreli", "bagasara": "Amreli", "rajula": "Amreli", "dhari": "Amreli", "babra": "Amreli",
+                    "bhavnagar": "Bhavnagar", "mahuva": "Bhavnagar", "talaja": "Bhavnagar", "palitana": "Bhavnagar", "gariadhar": "Bhavnagar",
+                    "surendranagar": "Surendranagar", "dhrangadhra": "Surendranagar", "limbdi": "Surendranagar", "chotila": "Surendranagar",
+                    "mehsana": "Mehsana", "unjha": "Mehsana", "unja": "Mehsana", "visnagar": "Mehsana", "kadi": "Mehsana", "vijapur": "Mehsana",
+                    "patan": "Patan", "sidhpur": "Patan", "harij": "Patan", "radhanpur": "Patan", "chanasma": "Patan",
+                    "banaskantha": "Banaskantha", "palanpur": "Banaskantha", "deesa": "Banaskantha", "dhanera": "Banaskantha", "tharad": "Banaskantha",
+                    "sabarkantha": "Sabarkantha", "himmatnagar": "Sabarkantha", "idar": "Sabarkantha", "talod": "Sabarkantha",
+                    "ahmedabad": "Ahmedabad", "viramgam": "Ahmedabad", "bavla": "Ahmedabad", "sanand": "Ahmedabad", "dholka": "Ahmedabad",
+                    "kachchh": "Kachchh", "bhuj": "Kachchh", "anjar": "Kachchh", "mandvi": "Kachchh", "rapar": "Kachchh", "gandhidham": "Kachchh",
+                }
+                target_district = _yard_to_dist.get(m_key, "")
             async def _ceda_bounded():
                 return await asyncio.wait_for(
-                    _fetch_ceda_fresh_mandi(state_name, "", requested_commodity),
+                    _fetch_ceda_fresh_mandi(state_name, target_district, requested_commodity),
                     timeout=min(float(MANDI_CEDA_TIMEOUT_SECONDS), remaining),
                 )
             ceda_records, ceda_error = asyncio.run(_ceda_bounded())
+            if ceda_records and market_name:
+                matched_ceda = [r for r in ceda_records if _mandi_markets_match(_mandi_row_market(r), market_name)]
+                if matched_ceda:
+                    ceda_records = matched_ceda
+                else:
+                    ceda_records = []
+                    ceda_error = f"CEDA returned district records but none matched market {market_name}"
         except Exception as exc:
             ceda_records, ceda_error = [], f"{type(exc).__name__}: {str(exc)[:180]}"
     else:
@@ -4185,3 +4393,89 @@ async def api_admin_create_backup(request: Request):
         allowed_roles={admin_service.ROLE_SUPER_ADMIN},
     )
     return admin_service.create_sqlite_backup(tag=f"admin_{admin['username']}")
+
+
+@app.get("/api/v1/admin/mandi-diagnostics")
+async def api_admin_mandi_diagnostics(request: Request, probe_live: bool = False, commodity: str = "કપાસ"):
+    """Admin-only Mandi Provider Diagnostics (never exposes API keys or stack traces to public users)."""
+    admin = _require_admin(request, required_permission="dashboard:view")
+    import socket
+
+    def _dns_and_tcp_check(hostname: str, port: int = 443) -> dict[str, Any]:
+        t0 = time.monotonic()
+        try:
+            infos = socket.getaddrinfo(hostname, port, socket.AF_UNSPEC, socket.SOCK_STREAM)
+            ips = sorted({sockaddr[0] for _, _, _, _, sockaddr in infos})
+            dns_ok = len(ips) > 0
+        except Exception as exc:
+            return {
+                "dns_ok": False,
+                "resolved_ips_count": 0,
+                "tcp_ok": False,
+                "latency_ms": int((time.monotonic() - t0) * 1000),
+                "error": f"{type(exc).__name__}: {str(exc)[:120]}",
+            }
+        tcp_ok = False
+        tcp_err = ""
+        for fam, socktype, proto, _, sockaddr in infos[:2]:
+            s = None
+            try:
+                s = socket.socket(fam, socktype, proto)
+                s.settimeout(3.5)
+                s.connect(sockaddr)
+                tcp_ok = True
+                tcp_err = ""
+                break
+            except Exception as exc:
+                tcp_err = f"{type(exc).__name__}: {str(exc)[:120]}"
+            finally:
+                if s:
+                    try: s.close()
+                    except Exception: pass
+        return {
+            "dns_ok": dns_ok,
+            "resolved_ips_count": len(ips),
+            "tcp_ok": tcp_ok,
+            "latency_ms": int((time.monotonic() - t0) * 1000),
+            "error": tcp_err,
+        }
+
+    providers_report = {
+        "data.gov.in": {
+            "provider_name": "Government of India Open Data Portal (api.data.gov.in)",
+            "endpoint": f"{MANDI_API_SCHEME}://{MANDI_API_HOST}{MANDI_API_BASE_PATH}/resource/{MANDI_RESOURCE_ID}",
+            "configuration_status": "CONFIGURED" if bool(MANDI_API_KEY) else "MISSING_API_KEY",
+            "api_key_present": bool(MANDI_API_KEY),
+            "network_probe": _dns_and_tcp_check(MANDI_API_HOST, 443) if probe_live else {"note": "Pass ?probe_live=true to run live DNS/TCP check"},
+            "rate_limit_cooldown_remaining_s": max(0, int(_mandi_global_rate_limit_until - time.monotonic())),
+            "runtime_stats": _MANDI_PROVIDER_DIAG_STATE.get("data.gov.in", {}),
+        },
+        "agmarknet_2_public": {
+            "provider_name": "AGMARKNET 2.0 Public API (api.agmarknet.gov.in)",
+            "endpoint": f"{AGMARKNET_PUBLIC_BASE}/prices-and-arrivals/date-wise/specific-commodity",
+            "configuration_status": "CONFIGURED_PUBLIC",
+            "api_key_present": False,
+            "captcha_circuit_open_remaining_s": max(
+                0,
+                int(max(_agmarknet_captcha_required_until, _agmarknet_datewise_captcha_required_until) - time.monotonic()),
+            ),
+            "network_probe": _dns_and_tcp_check("api.agmarknet.gov.in", 443) if probe_live else {"note": "Pass ?probe_live=true to run live DNS/TCP check"},
+            "runtime_stats": _MANDI_PROVIDER_DIAG_STATE.get("agmarknet_2_public", {}),
+        },
+        "ceda_agmarknet_fallback": {
+            "provider_name": "CEDA Ashoka Agmarknet API (agmarknet.ceda.ashoka.edu.in)",
+            "endpoint": f"{_CEDA_PUBLIC_BASE}/prices",
+            "configuration_status": "CONFIGURED_WITH_KEY" if bool(CEDA_API_KEY) else "CONFIGURED_PUBLIC_FALLBACK",
+            "api_key_present": bool(CEDA_API_KEY),
+            "rate_limit_circuit_remaining_s": _ceda_circuit_remaining(),
+            "network_probe": _dns_and_tcp_check("agmarknet.ceda.ashoka.edu.in", 443) if probe_live else {"note": "Pass ?probe_live=true to run live DNS/TCP check"},
+            "runtime_stats": _MANDI_PROVIDER_DIAG_STATE.get("ceda_agmarknet_fallback", {}),
+        },
+    }
+    return {
+        "ok": True,
+        "checked_by": admin["username"],
+        "catalogue_crops_count": len(GUJARAT_MANDI_CROP_CATALOGUE),
+        "shared_cache_entries": len(_mandi_shared_pool),
+        "providers": providers_report,
+    }
