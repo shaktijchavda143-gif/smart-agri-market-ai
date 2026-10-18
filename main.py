@@ -1120,7 +1120,9 @@ MANDI_API_BASE_PATH = _parsed_dg.path.rstrip("/")
 
 MANDI_API_TIMEOUT_SECONDS = _mandi_env_seconds("MANDI_TIMEOUT_SECONDS", 10, 5, 30)
 MANDI_RATE_LIMIT_COOLDOWN_SECONDS = _mandi_env_seconds("MANDI_RATE_LIMIT_COOLDOWN_SECONDS", 15, 5, 60)
-MANDI_PAGE_SIZE = _mandi_env_seconds("MANDI_PAGE_SIZE", 500, 100, 1000)
+import mandi_bulk_cache
+
+MANDI_PAGE_SIZE = _mandi_env_seconds("MANDI_PAGE_SIZE", 1000, 100, 1000)
 MANDI_MAX_PAGES = _mandi_env_seconds("MANDI_MAX_PAGES", 5, 1, 20)
 MANDI_SUMMARY_CROPS = ("મગફળી", "કપાસ", "જીરું", "એરંડા", "ડુંગળી")
 CEDA_API_KEY = os.getenv("CEDA_API_KEY", "").strip()
@@ -1134,24 +1136,54 @@ MANDI_TOTAL_BUDGET_SECONDS = _mandi_env_seconds("MANDI_TOTAL_BUDGET_SECONDS", 30
 _mandi_rate_limit_until: dict[str, float] = {}
 _mandi_global_rate_limit_until: float = 0.0
 _mandi_lock = threading.RLock()
+_mandi_singleflight_lock = threading.RLock()
 
 MANDI_SHARED_CACHE_FILE = "/tmp/playstore_shared_mandi_cache.json"
-MANDI_SHARED_FRESH_TTL_SECONDS = 1800
+# Model 3: 4-hour fresh TTL (14,400s) for statewide bulk shared cache
+MANDI_SHARED_FRESH_TTL_SECONDS = _mandi_env_seconds("MANDI_SHARED_FRESH_TTL_SECONDS", 14400, 300, 86400)
+MANDI_MODEL3_STATEWIDE_BULK = os.getenv("MANDI_MODEL3_STATEWIDE_BULK", "1").strip().lower() in {"1", "true", "yes", "on"}
 _mandi_shared_pool: dict[str, dict[str, Any]] = {}
+_mandi_cache_metrics: dict[str, int] = {
+    "cache_hits": 0,
+    "cache_misses": 0,
+    "bulk_sync_runs": 0,
+    "singleflight_coalesced": 0,
+    "stale_fallback_serves": 0,
+}
+
+try:
+    mandi_bulk_cache.init_mandi_cache_db()
+except Exception:
+    pass
 
 
 def _load_mandi_shared_pool() -> None:
     global _mandi_shared_pool
     if _mandi_shared_pool:
         return
+    loaded: dict[str, dict[str, Any]] = {}
+    try:
+        sqlite_data = mandi_bulk_cache.load_pool_from_sqlite()
+        if isinstance(sqlite_data, dict):
+            loaded.update(sqlite_data)
+    except Exception:
+        pass
     if os.path.exists(MANDI_SHARED_CACHE_FILE):
         try:
             with open(MANDI_SHARED_CACHE_FILE, "r", encoding="utf-8") as fh:
                 data = json.load(fh)
                 if isinstance(data, dict):
-                    _mandi_shared_pool = data
+                    for k, v in data.items():
+                        if k not in loaded or (
+                            isinstance(v, dict)
+                            and float(v.get("saved_at", 0.0) or 0.0)
+                            > float((loaded.get(k) or {}).get("saved_at", 0.0) or 0.0)
+                        ):
+                            loaded[k] = v
         except Exception:
             pass
+    if loaded:
+        _mandi_shared_pool = loaded
 
 
 def _save_mandi_shared_pool() -> None:
@@ -1160,6 +1192,30 @@ def _save_mandi_shared_pool() -> None:
             json.dump(_mandi_shared_pool, fh, ensure_ascii=False)
     except Exception:
         pass
+    try:
+        mandi_bulk_cache.save_pool_to_sqlite(_mandi_shared_pool)
+    except Exception:
+        pass
+
+
+def _canonical_commodity_key(raw_commodity: str) -> str:
+    cleaned = (raw_commodity or "").strip()
+    if not cleaned:
+        return ""
+    if cleaned.upper() == "ALL":
+        return "all"
+    mapped = GUJARATI_CROP_ALIASES.get(cleaned) or GUJARATI_CROP_ALIASES.get(cleaned.lower()) or GUJARATI_CROP_ALIASES.get(cleaned.title())
+    if mapped:
+        return _norm_mandi_text(mapped)
+    norm_val = _norm_mandi_text(cleaned)
+    for item in GUJARAT_MANDI_CROP_CATALOGUE:
+        en_norm = _norm_mandi_text(item["crop_en"])
+        if norm_val == en_norm or norm_val == _norm_mandi_text(item["crop_gu"]):
+            return en_norm
+        for al in item.get("aliases", []):
+            if norm_val == _norm_mandi_text(al):
+                return en_norm
+    return norm_val
 
 
 def _store_in_shared_pool(state: str, market: str, commodity: str, payload: dict[str, Any], records: list[dict[str, Any]]) -> None:
@@ -1168,7 +1224,7 @@ def _store_in_shared_pool(state: str, market: str, commodity: str, payload: dict
     with _mandi_lock:
         _load_mandi_shared_pool()
         now_ts = time.time()
-        c_key = _norm_mandi_text(GUJARATI_CROP_ALIASES.get(commodity.strip(), commodity.strip()))
+        c_key = _canonical_commodity_key(commodity)
         s_key = _norm_mandi_text(state or "Gujarat")
         m_key = _mandi_market_match_key(market) if market.strip() else "ALL"
 
@@ -1182,27 +1238,183 @@ def _store_in_shared_pool(state: str, market: str, commodity: str, payload: dict
                 by_yard.setdefault(r_mkt, []).append(r)
 
         for y_key, y_rows in by_yard.items():
+            latest_y_rows, latest_y_date = _mandi_latest_rows(y_rows)
             yard_pool_key = f"{s_key}|{y_key}|{c_key}"
             yard_payload = dict(payload)
-            yard_payload["records"] = y_rows
+            yard_payload["records"] = latest_y_rows
+            if latest_y_rows:
+                yard_payload["latest_arrival_date"] = latest_y_rows[0].get("arrival_date", "") or latest_y_date
             _mandi_shared_pool[yard_pool_key] = {"saved_at": now_ts, "payload": yard_payload}
 
         _save_mandi_shared_pool()
 
 
+def _ingest_statewide_records_into_shared_pool(
+    state: str,
+    raw_records: list[dict[str, Any]],
+    *,
+    pagination_complete: bool = False,
+    pages_fetched: int = 1,
+    http_status: int = 200,
+) -> int:
+    """Model 3 Statewide Bulk Ingestion: index all valid dated records across all crops and yards."""
+    if not raw_records:
+        return 0
+    now_ist = datetime.now(timezone(timedelta(hours=5, minutes=30)))
+    today_ist = now_ist.date()
+    earliest_day = today_ist - timedelta(days=MANDI_MAX_LOOKBACK_DAYS)
+    checked_at = now_ist.strftime("%d-%m-%Y %H:%M")
+    source_policy = "data.gov.in official API (primary) → AGMARKNET 2.0 public API → CEDA/Agmarknet daily fallback; no fabricated prices"
+
+    dated_rows: list[dict[str, Any]] = []
+    for row in raw_records:
+        if not isinstance(row, dict):
+            continue
+        arrival = row.get("arrival_date") or row.get("Arrival_Date") or row.get("arrival date") or row.get("date") or row.get("Date")
+        parsed = _parse_mandi_date(arrival)
+        if not parsed:
+            continue
+        parsed_ist = parsed.astimezone(now_ist.tzinfo)
+        if parsed_ist > now_ist + timedelta(minutes=5) or parsed_ist.date() < earliest_day or parsed_ist.date() > today_ist:
+            continue
+        enriched = dict(row)
+        enriched.setdefault("source", "official_api")
+        enriched.setdefault("source_url", "https://data.gov.in/")
+        dated_rows.append(enriched)
+
+    normalized_all = _normalise_mandi_records(dated_rows)
+    if not normalized_all:
+        return 0
+
+    with _mandi_lock:
+        _load_mandi_shared_pool()
+        now_ts = time.time()
+        s_key = _norm_mandi_text(state or "Gujarat")
+        _mandi_cache_metrics["bulk_sync_runs"] = _mandi_cache_metrics.get("bulk_sync_runs", 0) + 1
+
+        by_crop: dict[str, list[dict[str, Any]]] = {}
+        for r in normalized_all:
+            c_key = _canonical_commodity_key(str(r.get("commodity") or ""))
+            if c_key:
+                by_crop.setdefault(c_key, []).append(r)
+
+        for c_key, c_rows in by_crop.items():
+            latest_c_rows, latest_c_date = _mandi_latest_rows(c_rows)
+            if latest_c_rows:
+                crop_payload = {
+                    "ok": True,
+                    "live_available": True,
+                    "live_api_configured": bool(MANDI_API_KEY),
+                    "source": "official_api",
+                    "checked_at": checked_at,
+                    "price_unit_source": "₹/quintal (data.gov.in)",
+                    "display_price_unit": "₹/20kg",
+                    "records": latest_c_rows[:100],
+                    "message": f"ભારત સરકારના data.gov.in ડેટામાંથી {latest_c_date}નો ભાવ મળ્યો.",
+                    "latest_arrival_date": latest_c_rows[0].get("arrival_date", "") or latest_c_date,
+                    "source_policy": source_policy,
+                    "diagnostics": {
+                        "primary": {
+                            "request_ok": True,
+                            "http_status": http_status,
+                            "records": len(latest_c_rows),
+                            "source": "data.gov.in",
+                            "raw_records": len(raw_records),
+                            "latest_date": latest_c_date,
+                            "bulk_statewide_cache": True,
+                        }
+                    },
+                }
+                _mandi_shared_pool[f"{s_key}|ALL|{c_key}"] = {"saved_at": now_ts, "payload": crop_payload}
+
+            by_yard: dict[str, list[dict[str, Any]]] = {}
+            for r in c_rows:
+                y_key = _mandi_market_match_key(_mandi_row_market(r))
+                if y_key:
+                    by_yard.setdefault(y_key, []).append(r)
+
+            for y_key, y_rows in by_yard.items():
+                latest_y_rows, latest_y_date = _mandi_latest_rows(y_rows)
+                if not latest_y_rows:
+                    continue
+                yard_payload = {
+                    "ok": True,
+                    "live_available": True,
+                    "live_api_configured": bool(MANDI_API_KEY),
+                    "source": "official_api",
+                    "checked_at": checked_at,
+                    "price_unit_source": "₹/quintal (data.gov.in)",
+                    "display_price_unit": "₹/20kg",
+                    "records": latest_y_rows[:100],
+                    "message": f"ભારત સરકારના data.gov.in ડેટામાંથી {latest_y_date}નો ભાવ મળ્યો.",
+                    "latest_arrival_date": latest_y_rows[0].get("arrival_date", "") or latest_y_date,
+                    "source_policy": source_policy,
+                    "diagnostics": {
+                        "primary": {
+                            "request_ok": True,
+                            "http_status": http_status,
+                            "records": len(latest_y_rows),
+                            "source": "data.gov.in",
+                            "raw_records": len(raw_records),
+                            "latest_date": latest_y_date,
+                            "bulk_statewide_cache": True,
+                        }
+                    },
+                }
+                _mandi_shared_pool[f"{s_key}|{y_key}|{c_key}"] = {"saved_at": now_ts, "payload": yard_payload}
+
+        latest_all_rows, latest_all_date = _mandi_latest_rows(normalized_all)
+        _mandi_shared_pool[f"{s_key}|ALL|__statewide_all__"] = {
+            "saved_at": now_ts,
+            "payload": {
+                "ok": True,
+                "live_available": True,
+                "live_api_configured": bool(MANDI_API_KEY),
+                "source": "official_api",
+                "checked_at": checked_at,
+                "price_unit_source": "₹/quintal (data.gov.in)",
+                "display_price_unit": "₹/20kg",
+                "records": normalized_all,
+                "latest_arrival_date": latest_all_rows[0].get("arrival_date", "") if latest_all_rows else latest_all_date,
+                "source_policy": source_policy,
+                "pagination_complete": pagination_complete,
+                "pages_fetched": pages_fetched,
+            },
+        }
+        _save_mandi_shared_pool()
+        try:
+            mandi_bulk_cache.save_statewide_records_to_sqlite(
+                s_key,
+                normalized_all,
+                market_key_fn=_mandi_market_match_key,
+                commodity_key_fn=_canonical_commodity_key,
+                meta={
+                    "latest_date": latest_all_date,
+                    "raw_record_count": len(raw_records),
+                    "pagination_complete": pagination_complete,
+                    "pages_fetched": pages_fetched,
+                    "source": "official_api",
+                },
+            )
+        except Exception:
+            pass
+    return len(normalized_all)
+
+
 def _get_from_shared_pool(state: str, market: str, commodity: str, max_age_seconds: float) -> dict[str, Any] | None:
     with _mandi_lock:
         _load_mandi_shared_pool()
-        c_key = _norm_mandi_text(GUJARATI_CROP_ALIASES.get(commodity.strip(), commodity.strip()))
+        c_key = _canonical_commodity_key(commodity)
         s_key = _norm_mandi_text(state or "Gujarat")
         m_key = _mandi_market_match_key(market) if market.strip() else "ALL"
         exact_key = f"{s_key}|{m_key}|{c_key}"
+        now_ts = time.time()
 
         entry = _mandi_shared_pool.get(exact_key)
         if isinstance(entry, dict):
             saved_at = float(entry.get("saved_at", 0.0) or 0.0)
             payload = entry.get("payload")
-            if isinstance(payload, dict) and payload.get("records") and (time.time() - saved_at <= max_age_seconds):
+            if isinstance(payload, dict) and payload.get("records") and (now_ts - saved_at <= max_age_seconds):
                 return payload
 
         state_all_key = f"{s_key}|ALL|{c_key}"
@@ -1210,13 +1422,36 @@ def _get_from_shared_pool(state: str, market: str, commodity: str, max_age_secon
         if m_key != "ALL" and isinstance(state_entry, dict):
             saved_at = float(state_entry.get("saved_at", 0.0) or 0.0)
             state_payload = state_entry.get("payload")
-            if isinstance(state_payload, dict) and (time.time() - saved_at <= max_age_seconds):
+            if isinstance(state_payload, dict) and (now_ts - saved_at <= max_age_seconds):
                 all_rows = state_payload.get("records") or []
                 matched_rows = [r for r in all_rows if _mandi_markets_match(_mandi_row_market(r), market)]
                 if matched_rows:
+                    latest_matched, latest_date = _mandi_latest_rows(matched_rows)
                     filtered_payload = dict(state_payload)
-                    filtered_payload["records"] = matched_rows
+                    filtered_payload["records"] = latest_matched[:100]
+                    if latest_matched:
+                        filtered_payload["latest_arrival_date"] = latest_matched[0].get("arrival_date", "") or latest_date
                     return filtered_payload
+
+        # Fallback to the full statewide normalized dataset if present in pool
+        statewide_entry = _mandi_shared_pool.get(f"{s_key}|ALL|__statewide_all__")
+        if isinstance(statewide_entry, dict):
+            saved_at = float(statewide_entry.get("saved_at", 0.0) or 0.0)
+            sw_payload = statewide_entry.get("payload")
+            if isinstance(sw_payload, dict) and (now_ts - saved_at <= max_age_seconds):
+                sw_rows = sw_payload.get("records") or []
+                if commodity and commodity.strip().upper() != "ALL":
+                    sw_rows = [r for r in sw_rows if _commodity_matches(r, commodity)]
+                if market and market.strip():
+                    sw_rows = [r for r in sw_rows if _mandi_markets_match(_mandi_row_market(r), market)]
+                if sw_rows:
+                    latest_sw, latest_date = _mandi_latest_rows(sw_rows)
+                    if latest_sw:
+                        out_payload = dict(sw_payload)
+                        out_payload["records"] = latest_sw[:100]
+                        out_payload["latest_arrival_date"] = latest_sw[0].get("arrival_date", "") or latest_date
+                        out_payload["message"] = f"ભારત સરકારના data.gov.in ડેટામાંથી {latest_date}નો ભાવ મળ્યો."
+                        return out_payload
     return None
 
 GUJARAT_MANDI_CROP_CATALOGUE = [
@@ -1536,6 +1771,19 @@ def _norm_mandi_market(value: Any) -> str:
     return text.strip()
 
 
+_GUJARATI_TO_ENGLISH_MARKET_KEYS = {"રાજકોટ": "rajkot", "ગોંડલ": "gondal", "જેતપુર": "jetpur", "મોરબી": "morbi", "જામનગર": "jamnagar", "જુનાગઢ": "junagadh", "જૂનાગઢ": "junagadh", "અમરેલી": "amreli", "ભાવનગર": "bhavnagar", "સુરેન્દ્રનગર": "surendranagar", "મહેસાણા": "mehsana", "પાટણ": "patan", "પાલનપુર": "palanpur", "ડીસા": "deesa", "દિસા": "deesa", "વિસનગર": "visnagar", "હિંમતનગર": "himatnagar", "હિમતનગર": "himatnagar", "આણંદ": "anand", "નડિયાદ": "nadiad", "ભરૂચ": "bharuch", "અંકલેશ્વર": "ankleshwar", "સુરત": "surat", "નવસારી": "navsari", "વલસાડ": "valsad", "વડોદરા": "vadodara", "અમદાવાદ": "ahmedabad", "બોટાદ": "botad", "ભુજ": "bhuj", "ભૂજ": "bhuj", "ગાંધીધામ": "gandhidham", "દાહોદ": "dahod", "ગોધરા": "godhra", "પંચમહાલ": "panchmahal", "ધોરાજી": "dhoraji", "ઉપલેટા": "upleta", "માણાવદર": "manavadar", "માંગરોળ": "mangrol", "પોરબંદર": "porbandar", "દ્વારકા": "dwarka", "કાલાવડ": "kalavad", "જામજોધપુર": "jamjodhpur", "લાલપુર": "lalpur", "ટંકારા": "tankara", "હળવદ": "halvad", "વાંકાનેર": "wankaner", "માળિયા હાટીના": "maliyahatina", "માળિયા": "maliya", "ચોટીલા": "chotila", "લીંબડી": "limbdi", "ધ્રાંગધ્રા": "dhrangadhra", "સાયલા": "sayla", "વિરમગામ": "viramgam", "ધોળકા": "dholka", "બાવળા": "bavla", "સાણંદ": "sanand", "કલોલ": "kalol", "કડી": "kadi", "સિદ્ધપુર": "sidhpur", "ઊંઝા": "unjha", "ઉંઝા": "unjha", "વિસાવદર": "visavadar", "બાંટવા": "bantwa", "બગસરા": "bagasara", "સાવરકુંડલા": "savarkundla", "ધારી": "dhari", "રાજુલા": "rajula", "મહુવા": "mahuva", "તળાજા": "talaja", "પાલીતાણા": "palitana", "પાલિતાણા": "palitana", "ગારીયાધાર": "gariadhar", "ગારિયાધાર": "gariadhar", "બાબરા": "babra", "જસદણ": "jasdan", "ધ્રોલ": "dhrol", "કેશોદ": "keshod", "કોડીનાર": "kodinar", "મેંદરડા": "mendarda", "તાલાલા": "talala", "ઉના": "una", "ઊના": "una", "અંજાર": "anjar", "માંડવી": "mandvi", "મુંદ્રા": "mundra", "રાપર": "rapar", "માણસા": "mansa", "વિજાપુર": "vijapur", "ખેરાલુ": "kheralu", "વડનગર": "vadnagar", "મોડાસા": "modasa", "બાયડ": "bayad", "કપડવંજ": "kapadvanj", "પેટલાદ": "petlad", "બોરસદ": "borsad", "ખંભાત": "khambhat", "જંબુસર": "jambusar", "વાગરા": "vagra", "બારડોલી": "bardoli", "કામરેજ": "kamrej", "ચીખલી": "chikhli", "ધરમપુર": "dharampur", "ઉમરગામ": "umbergaon", "ડભોઈ": "dabhoi", "પાદરા": "padra", "કરજણ": "karjan", "સાવલી": "savli", "હાલોલ": "halol", "લુણાવાડા": "lunawada", "ઝાલોદ": "jhalod", "લીમખેડા": "limkheda", "દેવગઢ બારિયા": "devgadhbaria", "સંતરામપુર": "santrampur", "વેરાવળ": "veraval", "ઉચ્છલ": "uchhal", "વડાલી": "vadali", "ધાનેરા": "dhanera", "થરાદ": "tharad", "ઈડર": "idar", "ઇડર": "idar", "તલોદ": "talod", "ભેંસાણ": "bhesan", "કુતિયાણા": "kutiyana", "ભાણવડ": "bhanvad", "ખંભાળિયા": "khambhalia", "જામખંભાળિયા": "jamkhambalia", "સંજેલી": "sanjeli", "નિઝર": "nizar", "સોનગઢ": "songadh", "વ્યારા": "vyara", "ખેડબ્રહ્મા": "khedbrahma", "માલપુર": "malpur", "મેઘરજ": "meghraj", "ધનસુરા": "dhansura", "ભિલોડા": "bhiloda", "રાધનપુર": "radhanpur", "હારીજ": "harij", "ચાણસ્મા": "chanasma", "સમી": "sami", "ભાભર": "bhabhar", "દિયોદર": "deodar", "કાંકરેજ": "kankrej", "વાવ": "vav", "લાખણી": "lakhani", "દાંતા": "danta", "વડગામ": "vadgam", "ખાંભા": "khambha", "જાફરાબાદ": "jafrabad", "લાઠી": "lathi", "લીલીયા": "liliya", "કુંકાવાવ": "kunkavav", "વડીયા": "vadia", "વલ્લભીપુર": "vallabhipur", "ઉમરાળા": "umrala", "ઘોઘા": "ghogha", "જેસર": "jesar", "સિહોર": "shihor", "ગઢડા": "gadhada", "બરવાળા": "barwala", "રાણપુર": "ranpur", "દસાડા": "dasada", "લખતર": "lakhtar", "મૂળી": "muli", "થાનગઢ": "thangadh", "ચુડા": "chuda", "વઢવાણ": "wadhwan", "અસારવા": "asarva", "દસ્ક્રોઈ": "daskroi", "દેત્રોજ-રામપુરા": "detrojrampura", "ધંધુકા": "dhandhuka", "ધોલેરા": "dholera", "ઘાટલોડિયા": "ghatlodiya", "માંડલ": "mandal", "મણિનગર": "maninagar", "સાબરમતી": "sabarmati", "વટવા": "vatva", "વેજલપુર": "vejalpur", "વીરમગામ": "viramgam", "કુકાવાવ-વડિયા": "kunkavavvadia", "આણંદ શહેર": "anandcity", "આણંદ ગ્રામ્ય": "anandrural", "આંકલાવ": "anklav", "સોજીત્રા": "sojitra", "તારાપુર": "tarapur", "ઉમરેઠ": "umreth", "અરવલ્લી": "arvalli", "સાઠંબા": "sathamba", "શામળાજી": "shamlaji", "બનાસકાંઠા": "banaskantha", "અમીરગઢ": "amirgadh", "દાંતીવાડા": "dantiwada", "ડીસા શહેર": "deesacity", "હડાદ": "hadad", "ઓગડ": "ogad", "પાલનપુર શહેર": "palanpurcity", "આમોદ": "amod", "ભરૂચ શહેર": "bharuchcity", "હાંસોટ": "hansot", "ઝઘડિયા": "jhagadia", "નેત્રંગ": "netrang", "વાલિયા": "valia", "બોટાદ શહેર": "botadcity", "છોટા ઉદેપુર": "chhotaudepur", "બોડેલી": "bodeli", "જેતપુર પાવી": "jetpurpavi", "કડવાળ": "kadval", "કવાંટ": "kavant", "નસવાડી": "nasvadi", "સંખેડા": "sankheda", "દેવગઢબારિયા": "devgadbaria", "ધાનપુર": "dhanpur", "ફતેપુરા": "fatepura", "ગરબાડા": "garbada", "ગોવિંદગુરુ લીમડી": "govindgurulimdi", "સીંગવડ": "singvad", "સુખસર": "sukhsar", "ડાંગ": "dangs", "આહવા": "ahwa", "સુબીર": "subir", "વઘઈ": "waghai", "દેવભૂમિ દ્વારકા": "devbhumidwarka", "કલ્યાણપુર": "kalyanpur", "ઓખામંડળ": "okhamandal", "ગાંધીનગર": "gandhinagar", "દહેગામ": "dehgam", "કલોલ શહેર": "kalolcity", "કલોલ (ગાંધીનગર)": "kalolgandhinagar", "ગીર સોમનાથ": "girsomnath", "ગીર ગઢડા": "girgadhda", "પાટણ-વેરાવળ": "patanveraval", "સુત્રાપાડા": "sutrapada", "વેરાવળ શહેર": "veravalcity", "જામનગર શહેર": "jamnagarcity", "જામનગર ગ્રામ્ય": "jamnagarrural", "જોડિયા": "jodiya", "જૂનાગઢ શહેર": "junagadhcity", "વંથલી": "vanthali", "કચ્છ": "kachchh", "અબડાસા": "abdasa", "ભચાઉ": "bhachau", "લખપત": "lakhpat", "મુન્દ્રા": "mundra", "નખત્રાણા": "nakhatrana", "ખેડા": "kheda", "ફાગવેલ": "fagvel", "ગળતેશ્વર": "galteshwar", "કઠલાલ": "kathlal", "મહુધા": "mahudha", "માતર": "matar", "મહેમદાવાદ": "mehmedabad", "નડિયાદ શહેર": "nadiadcity", "ઠાસરા": "thasra", "વાસો": "vaso", "બેચરાજી": "becharaji", "જોટાણા": "jotana", "મહેસાણા શહેર": "mahesanacity", "સતલાસણા": "satlasana", "મહીસાગર": "mahisagar", "બાલાસિનોર": "balasinor", "ગોધર": "godhar", "કડાણા": "kadana", "ખાનપુર": "khanpur", "કોઠંબા": "kothmba", "વીરપુર": "virpur", "મોરબી શહેર": "morbicity", "મોરબી ગ્રામ્ય": "morvi", "નર્મદા": "narmada", "ચીકાડા": "chikada", "ડેડીયાપાડા": "dediapada", "ગરૂડેશ્વર": "garudeshwar", "નાંદોદ": "nandod", "સાગબારા": "sagbara", "તિલકવાડા": "tilakwada", "વાંસદા": "bansda", "ગણદેવી": "gandevi", "જલાલપોર": "jalalpore", "ખેરગામ": "khergam", "ઘોઘંબા": "ghoghamba", "જાંબુઘોડા": "jambughoda", "કાલોલ": "kalol", "મોરવા (હડફ)": "morwahadaf", "શહેરા": "shehera", "હારિજ": "harij", "પાટણ શહેર": "patancity", "સાંતલપુર": "santalpur", "સરસ્વતી": "saraswati", "શંખેશ્વર": "shankheshvar", "પોરબંદર શહેર": "porabandarcity", "રાણાવાવ": "ranavav", "ગોંડલ શહેર": "gondalcity", "જામકંડોરણા": "jamkandorna", "જેતપુર શહેર": "jetpurcity", "કોટડા સાંગાણી": "kotdasangani", "લોધિકા": "lodhika", "પડધરી": "paddhari", "રાજકોટ પૂર્વ": "rajkoteast", "રાજકોટ દક્ષિણ": "rajkotsouth", "રાજકોટ પશ્ચિમ": "rajkotwest", "વીંછિયા": "vinchchiya", "સાબરકાંઠા": "sabarkantha", "પોશીના": "poshina", "પ્રાંતિજ": "prantij", "વિજયનગર": "vijaynagar", "અબ્રામા": "abrama", "અડાજણ": "adajan", "અંબિકા": "ambika", "અરેઠ": "areth", "ચોર્યાસી": "chorasi", "કતારગામ": "katargam", "મજુરા": "majura", "ઓલપાડ": "olpad", "પાલસાણા": "palsana", "પુણા": "puna", "ઉધના": "udhna", "ઉમરપાડા": "umarpada", "ચૂડા": "chuda", "સુરેંદ્રાનગર શહેર": "surendranagarcity", "તાપી": "tapi", "ડોલવણ": "dolvan", "કુકરમુંડા": "kukarmunda", "ઉકાઈ": "ukai", "વાલોડ": "valod", "ડેસર": "desar", "શિનોર": "sinor", "વડોદરા પૂર્વ": "vadodaraeast", "વડોદરા ઉત્તર": "vadodaranorth", "વડોદરા ગ્રામ્ય": "vadodararural", "વડોદરા દક્ષિણ": "vadodarasouth", "વડોદરા પશ્ચિમ": "vadodarawest", "વાઘોડિયા": "vaghodia", "કપરાડા": "kaprada", "નાનાપોંઢા": "nanapodha", "પારડી": "pardi", "વાપી": "vapi", "વાવ-થરાદ": "vavtharad", "ધરણીધર": "dharnidhar", "રાહ": "raah", "સૂઈગામ": "suigam"}
+
+_ENGLISH_MARKET_SYNONYMS = {
+    "himmatnagar": "himatnagar",
+    "unja": "unjha",
+    "junagarh": "junagadh",
+    "zalod": "jhalod",
+    "kalawad": "kalavad",
+    "vyra": "vyara",
+    "shihor": "sihor",
+}
+
+
 def _mandi_market_match_key(value: Any) -> str:
     """Canonical key for market equality, translating Gujarati yard names to English canonical keys."""
     text = _norm_mandi_market(value)
@@ -1553,23 +1801,15 @@ def _mandi_market_match_key(value: Any) -> str:
     ):
         text = text.replace(remove_word, " ")
     text = text.strip(" -—,()")
-    _extra_gu_to_en = {
-        "ઊંઝા": "unjha",
-        "ઉંઝા": "unjha",
-        "ડીસા": "deesa",
-        "દિસા": "deesa",
-        "હિંમતનગર": "himatnagar",
-        "હિમતનગર": "himatnagar",
-        "મહેસાણા": "mehsana",
-    }
-    for gu_v, en_k in _extra_gu_to_en.items():
+    for gu_v, en_k in sorted(_GUJARATI_TO_ENGLISH_MARKET_KEYS.items(), key=lambda kv: len(kv[0]), reverse=True):
         if text == gu_v or gu_v in text:
             text = text.replace(gu_v, en_k)
     if "_GUJARATI_MARKET_NAME_MAP" in globals():
-        for en_k, gu_v in _GUJARATI_MARKET_NAME_MAP.items():
+        for en_k, gu_v in sorted(_GUJARATI_MARKET_NAME_MAP.items(), key=lambda kv: len(kv[1]), reverse=True):
             if text == gu_v or gu_v in text:
                 text = text.replace(gu_v, en_k)
-    return re.sub(r"[\W_]+", "", text, flags=re.UNICODE).lower()
+    cleaned = re.sub(r"[^a-zA-Z0-9\u0A80-\u0AFF]+", "", text).lower()
+    return _ENGLISH_MARKET_SYNONYMS.get(cleaned, cleaned)
 
 
 def _mandi_markets_match(row_market: Any, requested_market: Any) -> bool:
@@ -1840,10 +2080,11 @@ def _mandi_api_get(state: str, market: str, commodity: str, request_deadline: fl
         }
         if state:
             params["filters[state]"] = state
-        if market:
-            params["filters[market]"] = market
-        if api_commodity:
-            params["filters[commodity]"] = api_commodity
+        if not MANDI_MODEL3_STATEWIDE_BULK:
+            if market:
+                params["filters[market]"] = market
+            if api_commodity:
+                params["filters[commodity]"] = api_commodity
         url = f"{MANDI_API_SCHEME}://{MANDI_API_HOST}{path}?" + urllib.parse.urlencode(params)
         for attempt in range(2):
             if deadline is not None and time.monotonic() >= deadline:
@@ -1886,6 +2127,10 @@ def _mandi_api_get(state: str, market: str, commodity: str, request_deadline: fl
                             aggregated.append(row)
                     print(f"[MANDI_DEBUG] official_api_page rows={len(page_rows)} aggregated={len(aggregated)}")
                     if len(page_rows) < MANDI_PAGE_SIZE:
+                        if aggregated and MANDI_MODEL3_STATEWIDE_BULK:
+                            _ingest_statewide_records_into_shared_pool(
+                                state, aggregated, pagination_complete=True, pages_fetched=page + 1, http_status=status
+                            )
                         normalized = _mandi_normalized_result({"records": aggregated}, normalized_commodity, fallback_used=False, requested_market=market)
                         normalized["_diagnostics"]["pagination_complete"] = True
                         normalized["_diagnostics"]["pagination_reason"] = "short_page"
@@ -1899,6 +2144,10 @@ def _mandi_api_get(state: str, market: str, commodity: str, request_deadline: fl
                         return normalized, "", 0, status
 
                     if page + 1 >= MANDI_MAX_PAGES:
+                        if aggregated and MANDI_MODEL3_STATEWIDE_BULK:
+                            _ingest_statewide_records_into_shared_pool(
+                                state, aggregated, pagination_complete=False, pages_fetched=page + 1, http_status=status
+                            )
                         normalized = _mandi_normalized_result({"records": aggregated}, normalized_commodity, fallback_used=False, requested_market=market)
                         normalized["_diagnostics"]["pagination_complete"] = False
                         normalized["_diagnostics"]["pagination_reason"] = "max_pages_reached"
@@ -1948,7 +2197,7 @@ def _mandi_api_get(state: str, market: str, commodity: str, request_deadline: fl
                 sleep_for = 1.0 if deadline is None else min(1.0, max(0.0, deadline - time.monotonic()))
                 if sleep_for > 0:
                     time.sleep(sleep_for)
-    if market and not aggregated:
+    if market and not aggregated and not MANDI_MODEL3_STATEWIDE_BULK:
         broad_result = _mandi_api_get(state, "", commodity, request_deadline=deadline)
         if isinstance(broad_result, tuple) and len(broad_result) >= 1:
             broad_payload = broad_result[0]
@@ -2966,7 +3215,8 @@ _GUJARATI_MARKET_NAME_MAP = {
     "dharampur":"ધરમપુર", "umbergaon":"ઉમરગામ", "dabhoi":"ડભોઈ", "padra":"પાદરા",
     "karjan":"કરજણ", "savli":"સાવલી", "halol":"હાલોલ", "lunawada":"લુણાવાડા",
     "jhalod":"ઝાલોદ", "limkheda":"લીમખેડા", "devgadh baria":"દેવગઢ બારિયા",
-    "santrampur":"સંતરામપુર", "mandvi kutch":"માંડવી", "mundra apmc":"મુંદ્રા"
+    "santrampur":"સંતરામપુર", "mandvi kutch":"માંડવી", "mundra apmc":"મુંદ્રા",
+    "veraval":"વેરાવળ", "uchhal":"ઉચ્છલ", "vadali":"વડાલી", "dhanera":"ધાનેરા", "tharad":"થરાદ", "idar":"ઈડર", "talod":"તલોદ", "bhesan":"ભેંસાણ", "kutiyana":"કુતિયાણા", "bhanvad":"ભાણવડ", "khambhalia":"ખંભાળિયા", "jam khambalia":"જામખંભાળિયા", "sanjeli":"સંજેલી", "nizar":"નિઝર", "songadh":"સોનગઢ", "vyara":"વ્યારા", "vyra":"વ્યારા", "khedbrahma":"ખેડબ્રહ્મા", "malpur":"માલપુર", "meghraj":"મેઘરજ", "dhansura":"ધનસુરા", "bhiloda":"ભિલોડા", "radhanpur":"રાધનપુર", "harij":"હારીજ", "chanasma":"ચાણસ્મા", "sami":"સમી", "bhabhar":"ભાભર", "deodar":"દિયોદર", "kankrej":"કાંકરેજ", "vav":"વાવ", "lakhani":"લાખણી", "danta":"દાંતા", "vadgam":"વડગામ", "khambha":"ખાંભા", "jafrabad":"જાફરાબાદ", "lathi":"લાઠી", "liliya":"લીલીયા", "kunkavav":"કુંકાવાવ", "vadia":"વડીયા", "vallabhipur":"વલ્લભીપુર", "umrala":"ઉમરાળા", "ghogha":"ઘોઘા", "jesar":"જેસર", "shihor":"સિહોર", "sihor":"સિહોર", "gadhada":"ગઢડા", "barwala":"બરવાળા", "ranpur":"રાણપુર", "dasada":"દસાડા", "lakhtar":"લખતર", "muli":"મૂળી", "thangadh":"થાનગઢ", "chuda":"ચુડા", "wadhwan":"વઢવાણ", "ahmedabad":"અમદાવાદ", "asarva":"અસારવા", "bavla":"બાવળા", "daskroi":"દસ્ક્રોઈ", "detroj-rampura":"દેત્રોજ-રામપુરા", "dhandhuka":"ધંધુકા", "dholera":"ધોલેરા", "dholka":"ધોળકા", "ghatlodiya":"ઘાટલોડિયા", "mandal":"માંડલ", "maninagar":"મણિનગર", "sabarmati":"સાબરમતી", "sanand":"સાણંદ", "vatva":"વટવા", "vejalpur":"વેજલપુર", "viramgam":"વીરમગામ", "amreli":"અમરેલી", "amreli":"અમરેલી", "babra":"બાબરા", "bagasara":"બગસરા", "dhari":"ધારી", "jafrabad":"જાફરાબાદ", "khambha":"ખાંભા", "kunkavav vadia":"કુકાવાવ-વડિયા", "lathi":"લાઠી", "lilia":"લીલીયા", "rajula":"રાજુલા", "savar kundla":"સાવરકુંડલા", "anand":"આણંદ", "anand city":"આણંદ શહેર", "anand rural":"આણંદ ગ્રામ્ય", "anklav":"આંકલાવ", "borsad":"બોરસદ", "khambhat":"ખંભાત", "petlad":"પેટલાદ", "sojitra":"સોજીત્રા", "tarapur":"તારાપુર", "umreth":"ઉમરેઠ", "arvalli":"અરવલ્લી", "bayad":"બાયડ", "bhiloda":"ભિલોડા", "dhansura":"ધનસુરા", "malpur":"માલપુર", "meghraj":"મેઘરજ", "modasa":"મોડાસા", "sathamba":"સાઠંબા", "shamlaji":"શામળાજી", "banas kantha":"બનાસકાંઠા", "amirgadh":"અમીરગઢ", "danta":"દાંતા", "dantiwada":"દાંતીવાડા", "deesa":"ડીસા", "deesa city":"ડીસા શહેર", "dhanera":"ધાનેરા", "hadad":"હડાદ", "kankrej":"કાંકરેજ", "ogad":"ઓગડ", "palanpur":"પાલનપુર", "palanpur city":"પાલનપુર શહેર", "vadgam":"વડગામ", "bharuch":"ભરૂચ", "amod":"આમોદ", "anklesvar":"અંકલેશ્વર", "bharuch":"ભરૂચ", "bharuch city":"ભરૂચ શહેર", "hansot":"હાંસોટ", "jambusar":"જંબુસર", "jhagadia":"ઝઘડિયા", "netrang":"નેત્રંગ", "vagra":"વાગરા", "valia":"વાલિયા", "bhavnagar":"ભાવનગર", "bhavnagar":"ભાવનગર", "gariadhar":"ગારિયાધાર", "ghogha":"ઘોઘા", "jesar":"જેસર", "mahuva":"મહુવા", "palitana":"પાલીતાણા", "sihor":"સિહોર", "talaja":"તળાજા", "umrala":"ઉમરાળા", "vallabhipur":"વલ્લભીપુર", "botad":"બોટાદ", "barwala":"બરવાળા", "botad":"બોટાદ", "botad city":"બોટાદ શહેર", "gadhada":"ગઢડા", "ranpur":"રાણપુર", "chhotaudepur":"છોટા ઉદેપુર", "bodeli":"બોડેલી", "chhota udaipur":"છોટા ઉદેપુર", "jetpur pavi":"જેતપુર પાવી", "kadval":"કડવાળ", "kavant":"કવાંટ", "nasvadi":"નસવાડી", "sankheda":"સંખેડા", "dahod":"દાહોદ", "devgadbaria":"દેવગઢબારિયા", "dhanpur":"ધાનપુર", "dohad":"દાહોદ", "fatepura":"ફતેપુરા", "garbada":"ગરબાડા", "govindguru limdi":"ગોવિંદગુરુ લીમડી", "jhalod":"ઝાલોદ", "limkheda":"લીમખેડા", "sanjeli":"સંજેલી", "singvad":"સીંગવડ", "sukhsar":"સુખસર", "dangs":"ડાંગ", "ahwa":"આહવા", "subir":"સુબીર", "waghai":"વઘઈ", "devbhumi dwarka":"દેવભૂમિ દ્વારકા", "bhanvad":"ભાણવડ", "kalyanpur":"કલ્યાણપુર", "khambhalia":"ખંભાળિયા", "okhamandal":"ઓખામંડળ", "gandhinagar":"ગાંધીનગર", "dehgam":"દહેગામ", "gandhinagar":"ગાંધીનગર", "kalol city":"કલોલ શહેર", "kalol gandhinagar":"કલોલ (ગાંધીનગર)", "mansa":"માણસા", "gir somnath":"ગીર સોમનાથ", "gir gadhda":"ગીર ગઢડા", "kodinar":"કોડીનાર", "patan-veraval":"પાટણ-વેરાવળ", "sutrapada":"સુત્રાપાડા", "talala":"તાલાલા", "una":"ઉના", "veraval city":"વેરાવળ શહેર", "jamnagar":"જામનગર", "dhrol":"ધ્રોલ", "jamjodhpur":"જામજોધપુર", "jamnagar city":"જામનગર શહેર", "jamnagar rural":"જામનગર ગ્રામ્ય", "jodiya":"જોડિયા", "kalavad":"કાલાવડ", "lalpur":"લાલપુર", "junagadh":"જૂનાગઢ", "bhesan":"ભેંસાણ", "junagadh":"જૂનાગઢ", "junagadh city":"જૂનાગઢ શહેર", "keshod":"કેશોદ", "malia hatina":"માળિયા હાટીના", "manavadar":"માણાવદર", "mangrol":"માંગરોળ", "mendarda":"મેંદરડા", "vanthali":"વંથલી", "visavadar":"વિસાવદર", "kachchh":"કચ્છ", "abdasa":"અબડાસા", "anjar":"અંજાર", "bhachau":"ભચાઉ", "bhuj":"ભુજ", "gandhidham":"ગાંધીધામ", "lakhpat":"લખપત", "mandvi":"માંડવી", "mundra":"મુન્દ્રા", "nakhatrana":"નખત્રાણા", "rapar":"રાપર", "kheda":"ખેડા", "fagvel":"ફાગવેલ", "galteshwar":"ગળતેશ્વર", "kapadvanj":"કપડવંજ", "kathlal":"કઠલાલ", "kheda":"ખેડા", "mahudha":"મહુધા", "matar":"માતર", "mehmedabad":"મહેમદાવાદ", "nadiad":"નડિયાદ", "nadiad city":"નડિયાદ શહેર", "thasra":"ઠાસરા", "vaso":"વાસો", "mahesana":"મહેસાણા", "becharaji":"બેચરાજી", "jotana":"જોટાણા", "kadi":"કડી", "kheralu":"ખેરાલુ", "mahesana":"મહેસાણા", "mahesana city":"મહેસાણા શહેર", "satlasana":"સતલાસણા", "unjha":"ઊંઝા", "vadnagar":"વડનગર", "vijapur":"વિજાપુર", "visnagar":"વિસનગર", "mahisagar":"મહીસાગર", "balasinor":"બાલાસિનોર", "godhar":"ગોધર", "kadana":"કડાણા", "khanpur":"ખાનપુર", "kothmba":"કોઠંબા", "lunawada":"લુણાવાડા", "santrampur":"સંતરામપુર", "virpur":"વીરપુર", "morbi":"મોરબી", "halvad":"હળવદ", "maliya":"માળિયા", "morbi city":"મોરબી શહેર", "morvi":"મોરબી ગ્રામ્ય", "tankara":"ટંકારા", "wankaner":"વાંકાનેર", "narmada":"નર્મદા", "chikada":"ચીકાડા", "dediapada":"ડેડીયાપાડા", "garudeshwar":"ગરૂડેશ્વર", "nandod":"નાંદોદ", "sagbara":"સાગબારા", "tilakwada":"તિલકવાડા", "navsari":"નવસારી", "bansda":"વાંસદા", "chikhli":"ચીખલી", "gandevi":"ગણદેવી", "jalalpore":"જલાલપોર", "khergam":"ખેરગામ", "navsari":"નવસારી", "panch mahals":"પંચમહાલ", "ghoghamba":"ઘોઘંબા", "godhra":"ગોધરા", "halol":"હાલોલ", "jambughoda":"જાંબુઘોડા", "kalol":"કાલોલ", "morwa (hadaf)":"મોરવા (હડફ)", "shehera":"શહેરા", "patan":"પાટણ", "chanasma":"ચાણસ્મા", "harij":"હારિજ", "patan":"પાટણ", "patan city":"પાટણ શહેર", "radhanpur":"રાધનપુર", "sami":"સમી", "santalpur":"સાંતલપુર", "saraswati":"સરસ્વતી", "shankheshvar":"શંખેશ્વર", "sidhpur":"સિદ્ધપુર", "porbandar":"પોરબંદર", "kutiyana":"કુતિયાણા", "porabandar city":"પોરબંદર શહેર", "porbandar":"પોરબંદર", "ranavav":"રાણાવાવ", "rajkot":"રાજકોટ", "dhoraji":"ધોરાજી", "gondal":"ગોંડલ", "gondal city":"ગોંડલ શહેર", "jamkandorna":"જામકંડોરણા", "jasdan":"જસદણ", "jetpur":"જેતપુર", "jetpur city":"જેતપુર શહેર", "kotda sangani":"કોટડા સાંગાણી", "lodhika":"લોધિકા", "paddhari":"પડધરી", "rajkot":"રાજકોટ", "rajkot east":"રાજકોટ પૂર્વ", "rajkot south":"રાજકોટ દક્ષિણ", "rajkot west":"રાજકોટ પશ્ચિમ", "upleta":"ઉપલેટા", "vinchchiya":"વીંછિયા", "sabar kantha":"સાબરકાંઠા", "himatnagar":"હિંમતનગર", "idar":"ઇડર", "khedbrahma":"ખેડબ્રહ્મા", "poshina":"પોશીના", "prantij":"પ્રાંતિજ", "talod":"તલોદ", "vadali":"વડાલી", "vijaynagar":"વિજયનગર", "surat":"સુરત", "abrama":"અબ્રામા", "adajan":"અડાજણ", "ambika":"અંબિકા", "areth":"અરેઠ", "bardoli":"બારડોલી", "chorasi":"ચોર્યાસી", "kamrej":"કામરેજ", "katargam":"કતારગામ", "mahuva":"મહુવા", "majura":"મજુરા", "mandvi":"માંડવી", "mangrol":"માંગરોળ", "olpad":"ઓલપાડ", "palsana":"પાલસાણા", "puna":"પુણા", "udhna":"ઉધના", "umarpada":"ઉમરપાડા", "surendranagar":"સુરેન્દ્રનગર", "chotila":"ચોટીલા", "chuda":"ચૂડા", "dasada":"દસાડા", "dhrangadhra":"ધ્રાંગધ્રા", "lakhtar":"લખતર", "limbdi":"લીંબડી", "muli":"મૂળી", "sayla":"સાયલા", "surendranagar city":"સુરેંદ્રાનગર શહેર", "thangadh":"થાનગઢ", "wadhwan":"વઢવાણ", "tapi":"તાપી", "dolvan":"ડોલવણ", "kukarmunda":"કુકરમુંડા", "nizar":"નિઝર", "songadh":"સોનગઢ", "uchchhal":"ઉચ્છલ", "ukai":"ઉકાઈ", "valod":"વાલોડ", "vyara":"વ્યારા", "vadodara":"વડોદરા", "dabhoi":"ડભોઈ", "desar":"ડેસર", "karjan":"કરજણ", "padra":"પાદરા", "savli":"સાવલી", "sinor":"શિનોર", "vadodara east":"વડોદરા પૂર્વ", "vadodara north":"વડોદરા ઉત્તર", "vadodara rural":"વડોદરા ગ્રામ્ય", "vadodara south":"વડોદરા દક્ષિણ", "vadodara west":"વડોદરા પશ્ચિમ", "vaghodia":"વાઘોડિયા", "valsad":"વલસાડ", "dharampur":"ધરમપુર", "kaprada":"કપરાડા", "nanapodha":"નાનાપોંઢા", "pardi":"પારડી", "umbergaon":"ઉમરગામ", "valsad":"વલસાડ", "vapi":"વાપી", "vav-tharad":"વાવ-થરાદ", "bhabhar":"ભાભર", "deodar":"દિયોદર", "dharnidhar":"ધરણીધર", "lakhani":"લાખણી", "raah":"રાહ", "suigam":"સૂઈગામ", "tharad":"થરાદ", "vav":"વાવ"
 }
 
 def _mandi_market_display_gu(raw: str) -> str:
@@ -3417,13 +3667,17 @@ def mandi(state: str = "Gujarat", market: str = "", commodity: str = "ALL", requ
 
     cached_fresh = _get_from_shared_pool(state_name, market_name, requested_commodity, max_age_seconds=MANDI_SHARED_FRESH_TTL_SECONDS)
     if cached_fresh:
+        with _mandi_lock:
+            _mandi_cache_metrics["cache_hits"] = _mandi_cache_metrics.get("cache_hits", 0) + 1
         cached_out = dict(cached_fresh)
         cached_out["checked_at"] = checked_at
         return cached_out
 
     def unavailable(message: str, live_error: str, diagnostics: dict[str, Any] | None = None):
-        cached_backup = _get_from_shared_pool(state_name, market_name, requested_commodity, max_age_seconds=72 * 3600)
+        cached_backup = _get_from_shared_pool(state_name, market_name, requested_commodity, max_age_seconds=MANDI_FALLBACK_MAX_AGE_HOURS * 3600)
         if cached_backup:
+            with _mandi_lock:
+                _mandi_cache_metrics["stale_fallback_serves"] = _mandi_cache_metrics.get("stale_fallback_serves", 0) + 1
             backup_out = dict(cached_backup)
             backup_out["live_available"] = False
             backup_out["is_cached_data"] = True
@@ -3451,23 +3705,36 @@ def mandi(state: str = "Gujarat", market: str = "", commodity: str = "ALL", requ
     if time.monotonic() >= deadline:
         return unavailable("Live Mandi માટે સમય મર્યાદા પૂરી થઈ ગઈ.", "mandi_total_budget_exceeded")
 
-    # 1) PRIMARY: Government of India data.gov.in API.
-    _mandi_source_log("data.gov.in", "START", state=state_name, market=market_name, commodity=requested_commodity)
-    _dg_started = time.monotonic()
-    data_error = ""
-    upstream_status = 0
-    data = None
-    try:
-        result = _mandi_api_get(state_name, market_name, requested_commodity, request_deadline=deadline)
-        if isinstance(result, tuple) and len(result) == 4:
-            data, data_error, _cooldown, upstream_status = result
-        elif isinstance(result, tuple) and len(result) >= 2:
-            data, data_error = result[0], result[1]
-        else:
-            data_error = "unexpected_data_gov_response"
-    except Exception as exc:
-        data_error = f"{type(exc).__name__}: {str(exc)[:180]}"
-        print(f"[MANDI_DEBUG] data_gov_primary_exception error={data_error!r}")
+    # Model 3 Singleflight Lock: prevent cache stampede when many farmers open the app simultaneously
+    with _mandi_singleflight_lock:
+        coalesced_hit = _get_from_shared_pool(state_name, market_name, requested_commodity, max_age_seconds=MANDI_SHARED_FRESH_TTL_SECONDS)
+        if coalesced_hit:
+            with _mandi_lock:
+                _mandi_cache_metrics["cache_hits"] = _mandi_cache_metrics.get("cache_hits", 0) + 1
+                _mandi_cache_metrics["singleflight_coalesced"] = _mandi_cache_metrics.get("singleflight_coalesced", 0) + 1
+            cached_out = dict(coalesced_hit)
+            cached_out["checked_at"] = checked_at
+            return cached_out
+        with _mandi_lock:
+            _mandi_cache_metrics["cache_misses"] = _mandi_cache_metrics.get("cache_misses", 0) + 1
+
+        # 1) PRIMARY: Government of India data.gov.in API (Model 3 Statewide Bulk Fetch).
+        _mandi_source_log("data.gov.in", "START", state=state_name, market=market_name, commodity=requested_commodity)
+        _dg_started = time.monotonic()
+        data_error = ""
+        upstream_status = 0
+        data = None
+        try:
+            result = _mandi_api_get(state_name, market_name, requested_commodity, request_deadline=deadline)
+            if isinstance(result, tuple) and len(result) == 4:
+                data, data_error, _cooldown, upstream_status = result
+            elif isinstance(result, tuple) and len(result) >= 2:
+                data, data_error = result[0], result[1]
+            else:
+                data_error = "unexpected_data_gov_response"
+        except Exception as exc:
+            data_error = f"{type(exc).__name__}: {str(exc)[:180]}"
+            print(f"[MANDI_DEBUG] data_gov_primary_exception error={data_error!r}")
 
     if isinstance(data, dict):
         records = data.get("records") or []
@@ -3477,7 +3744,7 @@ def mandi(state: str = "Gujarat", market: str = "", commodity: str = "ALL", requ
         raw_count = int(raw_diag.get("raw_record_count", len(records)) or len(records))
         http_status = int(raw_diag.get("http_status", upstream_status or 200) or 200)
 
-        if market_name and not records and time.monotonic() < deadline:
+        if market_name and not records and time.monotonic() < deadline and not MANDI_MODEL3_STATEWIDE_BULK:
             broad_res = _mandi_api_get(state_name, "", requested_commodity, request_deadline=deadline)
             broad_data = broad_res[0] if isinstance(broad_res, tuple) and len(broad_res) >= 1 else None
             if isinstance(broad_data, dict):
@@ -4477,5 +4744,12 @@ async def api_admin_mandi_diagnostics(request: Request, probe_live: bool = False
         "checked_by": admin["username"],
         "catalogue_crops_count": len(GUJARAT_MANDI_CROP_CATALOGUE),
         "shared_cache_entries": len(_mandi_shared_pool),
+        "model3_bulk_cache": {
+            "enabled": MANDI_MODEL3_STATEWIDE_BULK,
+            "fresh_ttl_seconds": MANDI_SHARED_FRESH_TTL_SECONDS,
+            "page_size": MANDI_PAGE_SIZE,
+            "metrics": dict(_mandi_cache_metrics),
+            "sqlite_persistence": mandi_bulk_cache.get_mandi_cache_stats(),
+        },
         "providers": providers_report,
     }
