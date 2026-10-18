@@ -1128,7 +1128,7 @@ MANDI_SUMMARY_CROPS = ("મગફળી", "કપાસ", "જીરું", "�
 CEDA_API_KEY = os.getenv("CEDA_API_KEY", "").strip()
 CEDA_API_BASE = os.getenv("CEDA_API_BASE", "https://api.ceda.ashoka.edu.in/v1").strip().rstrip("/")
 MANDI_FALLBACK_MAX_AGE_HOURS = _mandi_env_seconds("MANDI_FALLBACK_MAX_AGE_HOURS", 96, 1, 168)
-MANDI_MAX_LOOKBACK_DAYS = 3
+MANDI_MAX_LOOKBACK_DAYS = _mandi_env_seconds("MANDI_MAX_LOOKBACK_DAYS", 3, 1, 14)
 MANDI_AGMARKNET_DAILY_TIMEOUT_SECONDS = _mandi_env_seconds("MANDI_AGMARKNET_DAILY_TIMEOUT_SECONDS", 7, 1, 15)
 MANDI_AGMARKNET_STATE_TIMEOUT_SECONDS = _mandi_env_seconds("MANDI_AGMARKNET_STATE_TIMEOUT_SECONDS", 6, 1, 15)
 MANDI_CEDA_TIMEOUT_SECONDS = _mandi_env_seconds("MANDI_CEDA_TIMEOUT_SECONDS", 8, 3, 30)
@@ -1931,8 +1931,15 @@ def _mandi_normalized_result(
         enriched_row.setdefault("source_url", "https://data.gov.in/")
         dated_records.append(enriched_row)
     raw_records = dated_records
+    pre_cmdt_count = len(raw_records)
     if requested_commodity and requested_commodity.strip().upper() != "ALL":
         raw_records = [r for r in raw_records if _commodity_matches(r, requested_commodity)]
+    print(
+        f"[MANDI_DEBUG] official_api_filter_stages total_in={len(payload.get('records') or [])} "
+        f"dated_within_{MANDI_MAX_LOOKBACK_DAYS}d={pre_cmdt_count} "
+        f"commodity_matched={len(raw_records)} requested_commodity={requested_commodity!r}",
+        flush=True,
+    )
 
     # Never trust an upstream market filter by itself. Enforce the selected
     # market again on actual rows before any prices are returned to the app.
@@ -2016,6 +2023,94 @@ def _mandi_log_exception(exc: BaseException, *, http_status: int = 0) -> None:
     )
 
 
+
+_DATA_GOV_COMMODITY_FILTER_MAP = {
+    "groundnut": "Groundnut",
+    "cotton": "Cotton",
+    "jeera": "Cummin Seed(Jeera)",
+    "castor seed": "Castor Seed",
+    "onion": "Onion",
+    "wheat": "Wheat",
+    "bajra": "Bajra(Pearl Millet/Cumbu)",
+    "maize": "Maize",
+    "jowar": "Jowar(Sorghum)",
+    "paddy": "Paddy(Dhan)(Common)",
+    "gram": "Bengal Gram(Gram)(Whole)",
+    "arhar": "Arhar (Tur/Red Gram)(Whole)",
+    "moong": "Green Gram (Moong)(Whole)",
+    "black gram": "Black Gram (Urd Beans)(Whole)",
+    "moth": "Moath Dal",
+    "cowpea": "Cowpea (Lobia/Karamani)",
+    "indian beans": "Indian Beans (Seam)",
+    "peas": "Green Peas",
+    "sesamum": "Sesamum(Sesame,Gingelly,Til)",
+    "mustard": "Mustard",
+    "soyabean": "Soyabean",
+    "sunflower": "Sunflower",
+    "dhaniya": "Corriander seed",
+    "fennel": "Soanf",
+    "isabgul": "Isabgul (Psyllium)",
+    "methi": "Methi Seeds",
+    "ajwan": "Ajwan",
+    "suva": "Suva (Dill Seed)",
+    "turmeric": "Turmeric",
+    "garlic": "Garlic",
+    "ginger": "Ginger(Green)",
+    "chilli": "Green Chilli",
+    "guar": "Guar",
+    "potato": "Potato",
+    "tomato": "Tomato",
+    "brinjal": "Brinjal",
+    "cabbage": "Cabbage",
+    "cauliflower": "Cauliflower",
+    "bhindi": "Bhindi(Ladies Finger)",
+    "bottle gourd": "Bottle gourd",
+    "bitter gourd": "Bitter gourd",
+    "mango": "Mango",
+    "banana": "Banana",
+    "pomegranate": "Pomegranate",
+    "papaya": "Papaya",
+    "lemon": "Lemon",
+    "sapota": "Chikoos(Sapota)",
+    "coconut": "Coconut",
+    "sugarcane": "Sugarcane",
+    "tobacco": "Tobacco",
+    "amaranthus": "Amaranthus",
+}
+
+
+def _data_gov_commodity_filter(api_commodity: str) -> str:
+    cleaned = (api_commodity or "").strip()
+    if not cleaned or cleaned.upper() == "ALL":
+        return ""
+    norm_key = _norm_mandi_text(cleaned)
+    return _DATA_GOV_COMMODITY_FILTER_MAP.get(norm_key, cleaned)
+
+
+def _data_gov_market_filter_value(raw_market: str) -> str:
+    """Convert AGMARKNET or Gujarati yard label (e.g. 'Veraval APMC', 'વેરાવળ યાર્ડ') into data.gov.in market filter ('Veraval')."""
+    text = (raw_market or "").strip()
+    if not text:
+        return ""
+    # Strip APMC / Market Yard suffixes while keeping parenthetical sub-yards like Modasa(Tintoi)
+    cleaned = re.sub(r"\b(?:Agricultural Produce Market Committee|Market Yard|APMC|Yard|Market)\b", "", text, flags=re.I)
+    for gu_word in ("કૃષિ ઉત્પન્ન બજાર સમિતિ યાર્ડ", "કૃષિ ઉત્પન્ન બજાર સમિતિ", "કૃષિ બજાર યાર્ડ", "માર્કેટ યાર્ડ", "યાર્ડ"):
+        cleaned = cleaned.replace(gu_word, "")
+    cleaned = " ".join(cleaned.split()).strip(" -—,")
+    if not cleaned:
+        return ""
+    # If Gujarati script is present, map via canonical key
+    if any("\u0A80" <= ch <= "\u0AFF" for ch in cleaned):
+        m_key = _mandi_market_match_key(cleaned)
+        if "_GUJARATI_MARKET_NAME_MAP" in globals():
+            for en_k, gu_v in _GUJARATI_MARKET_NAME_MAP.items():
+                if _mandi_market_match_key(en_k) == m_key and " " not in en_k:
+                    return en_k.title()
+        if m_key and m_key.isascii():
+            return m_key.title()
+    return cleaned
+
+
 def _mandi_api_get(state: str, market: str, commodity: str, request_deadline: float | None = None):
     """Fetch exclusively from the official data.gov.in Mandi API."""
     global _mandi_global_rate_limit_until
@@ -2068,10 +2163,14 @@ def _mandi_api_get(state: str, market: str, commodity: str, request_deadline: fl
     aggregated = []
     use_ipv4_fallback = False
 
+    dg_commodity = _data_gov_commodity_filter(api_commodity)
+    dg_market_clean = _data_gov_market_filter_value(market) if market else ""
+    tried_targeted_market_pass = False
+
     for page in range(MANDI_MAX_PAGES):
         if deadline is not None and time.monotonic() >= deadline:
             return None, "Live Mandi માટે સમય મર્યાદા પૂરી થઈ ગઈ.", 0, last_status
-        offset = page * MANDI_PAGE_SIZE
+        offset = 0 if tried_targeted_market_pass else len(aggregated)
         params = {
             "api-key": MANDI_API_KEY,
             "format": "json",
@@ -2080,11 +2179,11 @@ def _mandi_api_get(state: str, market: str, commodity: str, request_deadline: fl
         }
         if state:
             params["filters[state]"] = state
-        if not MANDI_MODEL3_STATEWIDE_BULK:
-            if market:
-                params["filters[market]"] = market
-            if api_commodity:
-                params["filters[commodity]"] = api_commodity
+        if dg_commodity:
+            params["filters[commodity]"] = dg_commodity
+        if not MANDI_MODEL3_STATEWIDE_BULK or tried_targeted_market_pass:
+            if dg_market_clean:
+                params["filters[market]"] = dg_market_clean
         url = f"{MANDI_API_SCHEME}://{MANDI_API_HOST}{path}?" + urllib.parse.urlencode(params)
         for attempt in range(2):
             if deadline is not None and time.monotonic() >= deadline:
@@ -2129,9 +2228,26 @@ def _mandi_api_get(state: str, market: str, commodity: str, request_deadline: fl
                     if len(page_rows) < MANDI_PAGE_SIZE:
                         if aggregated and MANDI_MODEL3_STATEWIDE_BULK:
                             _ingest_statewide_records_into_shared_pool(
-                                state, aggregated, pagination_complete=True, pages_fetched=page + 1, http_status=status
+                                state, aggregated, pagination_complete=(len(page_rows) != 10), pages_fetched=page + 1, http_status=status
                             )
                         normalized = _mandi_normalized_result({"records": aggregated}, normalized_commodity, fallback_used=False, requested_market=market)
+                        # If sample key capped page at 10 rows and the requested market wasn't in those 10 rows,
+                        # do one targeted pass with filters[market]=dg_market_clean before giving up!
+                        if (
+                            MANDI_MODEL3_STATEWIDE_BULK
+                            and dg_market_clean
+                            and not tried_targeted_market_pass
+                            and not (normalized.get("records") or [])
+                            and len(page_rows) == 10
+                            and page + 1 < MANDI_MAX_PAGES
+                        ):
+                            tried_targeted_market_pass = True
+                            print(
+                                f"[MANDI_DEBUG] official_api_targeted_market_pass state={state!r} "
+                                f"commodity={dg_commodity!r} market_filter={dg_market_clean!r}",
+                                flush=True,
+                            )
+                            break
                         normalized["_diagnostics"]["pagination_complete"] = True
                         normalized["_diagnostics"]["pagination_reason"] = "short_page"
                         normalized["_diagnostics"]["http_status"] = status
@@ -2159,6 +2275,7 @@ def _mandi_api_get(state: str, market: str, commodity: str, request_deadline: fl
                             _mandi_rate_limit_until.pop(rate_key, None)
                             _mandi_global_rate_limit_until = 0.0
                         return normalized, "", 0, status
+                    break
 
             except urllib.error.HTTPError as exc:
                 last_status = int(exc.code or 0)
@@ -3848,17 +3965,19 @@ def mandi(state: str = "Gujarat", market: str = "", commodity: str = "ALL", requ
                 m_key = _mandi_market_match_key(market_name)
                 _yard_to_dist = {
                     "rajkot": "Rajkot", "gondal": "Rajkot", "jetpur": "Rajkot", "dhoraji": "Rajkot", "upleta": "Rajkot", "jasdan": "Rajkot",
-                    "jamnagar": "Jamnagar", "kalavad": "Jamnagar", "jamjodhpur": "Jamnagar", "dhrol": "Jamnagar",
-                    "junagadh": "Junagadh", "keshod": "Junagadh", "visavadar": "Junagadh", "manavadar": "Junagadh", "mangrol": "Junagadh",
-                    "amreli": "Amreli", "savarkundla": "Amreli", "bagasara": "Amreli", "rajula": "Amreli", "dhari": "Amreli", "babra": "Amreli",
-                    "bhavnagar": "Bhavnagar", "mahuva": "Bhavnagar", "talaja": "Bhavnagar", "palitana": "Bhavnagar", "gariadhar": "Bhavnagar",
-                    "surendranagar": "Surendranagar", "dhrangadhra": "Surendranagar", "limbdi": "Surendranagar", "chotila": "Surendranagar",
-                    "mehsana": "Mehsana", "unjha": "Mehsana", "unja": "Mehsana", "visnagar": "Mehsana", "kadi": "Mehsana", "vijapur": "Mehsana",
-                    "patan": "Patan", "sidhpur": "Patan", "harij": "Patan", "radhanpur": "Patan", "chanasma": "Patan",
-                    "banaskantha": "Banaskantha", "palanpur": "Banaskantha", "deesa": "Banaskantha", "dhanera": "Banaskantha", "tharad": "Banaskantha",
-                    "sabarkantha": "Sabarkantha", "himmatnagar": "Sabarkantha", "idar": "Sabarkantha", "talod": "Sabarkantha",
-                    "ahmedabad": "Ahmedabad", "viramgam": "Ahmedabad", "bavla": "Ahmedabad", "sanand": "Ahmedabad", "dholka": "Ahmedabad",
-                    "kachchh": "Kachchh", "bhuj": "Kachchh", "anjar": "Kachchh", "mandvi": "Kachchh", "rapar": "Kachchh", "gandhidham": "Kachchh",
+                    "morbi": "Rajkot", "wankaner": "Rajkot", "tankara": "Rajkot", "maliya": "Rajkot",
+                    "jamnagar": "Jamnagar", "kalavad": "Jamnagar", "jamjodhpur": "Jamnagar", "dhrol": "Jamnagar", "lalpur": "Jamnagar", "khambhalia": "Jamnagar", "bhanvad": "Jamnagar",
+                    "junagadh": "Junagadh", "keshod": "Junagadh", "visavadar": "Junagadh", "manavadar": "Junagadh", "mangrol": "Junagadh", "bhesan": "Junagadh", "mendarda": "Junagadh", "bantwa": "Junagadh",
+                    "veraval": "Junagadh", "kodinar": "Junagadh", "una": "Junagadh", "talala": "Junagadh", "maliyahatina": "Junagadh",
+                    "amreli": "Amreli", "savarkundla": "Amreli", "bagasara": "Amreli", "rajula": "Amreli", "dhari": "Amreli", "babra": "Amreli", "khambha": "Amreli", "lathi": "Amreli", "liliya": "Amreli", "kunkavav": "Amreli", "vadia": "Amreli",
+                    "bhavnagar": "Bhavnagar", "mahuva": "Bhavnagar", "talaja": "Bhavnagar", "palitana": "Bhavnagar", "gariadhar": "Bhavnagar", "botad": "Bhavnagar", "sihor": "Bhavnagar", "gadhada": "Bhavnagar",
+                    "surendranagar": "Surendranagar", "dhrangadhra": "Surendranagar", "limbdi": "Surendranagar", "chotila": "Surendranagar", "halvad": "Surendranagar", "sayla": "Surendranagar", "dasada": "Surendranagar", "lakhtar": "Surendranagar", "wadhwan": "Surendranagar",
+                    "mehsana": "Mehsana", "unjha": "Mehsana", "unja": "Mehsana", "visnagar": "Mehsana", "kadi": "Mehsana", "vijapur": "Mehsana", "kheralu": "Mehsana", "vadnagar": "Mehsana",
+                    "patan": "Patan", "sidhpur": "Patan", "harij": "Patan", "radhanpur": "Patan", "chanasma": "Patan", "sami": "Patan",
+                    "banaskantha": "Banaskantha", "palanpur": "Banaskantha", "deesa": "Banaskantha", "dhanera": "Banaskantha", "tharad": "Banaskantha", "bhabhar": "Banaskantha", "deodar": "Banaskantha", "kankrej": "Banaskantha", "vav": "Banaskantha", "lakhani": "Banaskantha",
+                    "sabarkantha": "Sabarkantha", "himmatnagar": "Sabarkantha", "himatnagar": "Sabarkantha", "idar": "Sabarkantha", "talod": "Sabarkantha", "vadali": "Sabarkantha", "khedbrahma": "Sabarkantha", "modasa": "Sabarkantha", "bayad": "Sabarkantha", "malpur": "Sabarkantha", "meghraj": "Sabarkantha", "dhansura": "Sabarkantha", "bhiloda": "Sabarkantha",
+                    "ahmedabad": "Ahmedabad", "viramgam": "Ahmedabad", "bavla": "Ahmedabad", "sanand": "Ahmedabad", "dholka": "Ahmedabad", "barwala": "Ahmedabad", "ranpur": "Ahmedabad",
+                    "kachchh": "Kachchh", "bhuj": "Kachchh", "anjar": "Kachchh", "mandvi": "Kachchh", "rapar": "Kachchh", "gandhidham": "Kachchh", "mundra": "Kachchh",
                 }
                 target_district = _yard_to_dist.get(m_key, "")
             async def _ceda_bounded():
