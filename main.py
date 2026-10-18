@@ -1127,8 +1127,8 @@ MANDI_MAX_PAGES = _mandi_env_seconds("MANDI_MAX_PAGES", 5, 1, 20)
 MANDI_SUMMARY_CROPS = ("મગફળી", "કપાસ", "જીરું", "એરંડા", "ડુંગળી")
 CEDA_API_KEY = os.getenv("CEDA_API_KEY", "").strip()
 CEDA_API_BASE = os.getenv("CEDA_API_BASE", "https://api.ceda.ashoka.edu.in/v1").strip().rstrip("/")
-MANDI_FALLBACK_MAX_AGE_HOURS = _mandi_env_seconds("MANDI_FALLBACK_MAX_AGE_HOURS", 96, 1, 168)
-MANDI_MAX_LOOKBACK_DAYS = _mandi_env_seconds("MANDI_MAX_LOOKBACK_DAYS", 3, 1, 14)
+MANDI_FALLBACK_MAX_AGE_HOURS = _mandi_env_seconds("MANDI_FALLBACK_MAX_AGE_HOURS", 168, 1, 168)
+MANDI_MAX_LOOKBACK_DAYS = _mandi_env_seconds("MANDI_MAX_LOOKBACK_DAYS", 7, 1, 14)
 MANDI_AGMARKNET_DAILY_TIMEOUT_SECONDS = _mandi_env_seconds("MANDI_AGMARKNET_DAILY_TIMEOUT_SECONDS", 7, 1, 15)
 MANDI_AGMARKNET_STATE_TIMEOUT_SECONDS = _mandi_env_seconds("MANDI_AGMARKNET_STATE_TIMEOUT_SECONDS", 6, 1, 15)
 MANDI_CEDA_TIMEOUT_SECONDS = _mandi_env_seconds("MANDI_CEDA_TIMEOUT_SECONDS", 8, 3, 30)
@@ -1363,7 +1363,31 @@ def _ingest_statewide_records_into_shared_pool(
                 }
                 _mandi_shared_pool[f"{s_key}|{y_key}|{c_key}"] = {"saved_at": now_ts, "payload": yard_payload}
 
-        latest_all_rows, latest_all_date = _mandi_latest_rows(normalized_all)
+        existing_sw_entry = _mandi_shared_pool.get(f"{s_key}|ALL|__statewide_all__")
+        merged_sw_rows = list(normalized_all)
+        if isinstance(existing_sw_entry, dict) and isinstance(existing_sw_entry.get("payload"), dict):
+            seen_sw_keys = {
+                (
+                    _mandi_market_match_key(_mandi_row_market(r)),
+                    _canonical_commodity_key(str(r.get("commodity") or "")),
+                    str(r.get("arrival_date_iso") or r.get("arrival_date") or ""),
+                    str(r.get("variety") or ""),
+                )
+                for r in merged_sw_rows if isinstance(r, dict)
+            }
+            for old_r in (existing_sw_entry["payload"].get("records") or []):
+                if not isinstance(old_r, dict):
+                    continue
+                rk = (
+                    _mandi_market_match_key(_mandi_row_market(old_r)),
+                    _canonical_commodity_key(str(old_r.get("commodity") or "")),
+                    str(old_r.get("arrival_date_iso") or old_r.get("arrival_date") or ""),
+                    str(old_r.get("variety") or ""),
+                )
+                if rk not in seen_sw_keys:
+                    seen_sw_keys.add(rk)
+                    merged_sw_rows.append(old_r)
+        latest_all_rows, latest_all_date = _mandi_latest_rows(merged_sw_rows)
         _mandi_shared_pool[f"{s_key}|ALL|__statewide_all__"] = {
             "saved_at": now_ts,
             "payload": {
@@ -1374,7 +1398,7 @@ def _ingest_statewide_records_into_shared_pool(
                 "checked_at": checked_at,
                 "price_unit_source": "₹/quintal (data.gov.in)",
                 "display_price_unit": "₹/20kg",
-                "records": normalized_all,
+                "records": merged_sw_rows,
                 "latest_arrival_date": latest_all_rows[0].get("arrival_date", "") if latest_all_rows else latest_all_date,
                 "source_policy": source_policy,
                 "pagination_complete": pagination_complete,
@@ -1410,12 +1434,36 @@ def _get_from_shared_pool(state: str, market: str, commodity: str, max_age_secon
         exact_key = f"{s_key}|{m_key}|{c_key}"
         now_ts = time.time()
 
+        def _prepare_cached_payload(raw_payload: dict[str, Any], raw_rows: list[dict[str, Any]]) -> dict[str, Any] | None:
+            today_ist = datetime.now(timezone(timedelta(hours=5, minutes=30))).date()
+            earliest_day = today_ist - timedelta(days=MANDI_MAX_LOOKBACK_DAYS)
+            valid_rows = []
+            for r in raw_rows:
+                if not isinstance(r, dict):
+                    continue
+                p_dt = _parse_mandi_date(r.get("arrival_date") or r.get("report_date") or r.get("arrival_date_iso") or "")
+                if p_dt and (earliest_day <= p_dt.date() <= today_ist):
+                    valid_rows.append(dict(r))
+            if not valid_rows:
+                return None
+            latest_rows, latest_date = _mandi_latest_rows(valid_rows)
+            if not latest_rows:
+                return None
+            min_age, disp_dt = _refresh_mandi_records_date_labels(latest_rows)
+            out_p = dict(raw_payload)
+            out_p["records"] = latest_rows[:100]
+            out_p["latest_arrival_date"] = latest_rows[0].get("arrival_date", "") or disp_dt or latest_date
+            out_p["message"] = _build_mandi_date_aware_message("અધિકૃત બજાર ડેટા", out_p["latest_arrival_date"], min_age)
+            return out_p
+
         entry = _mandi_shared_pool.get(exact_key)
         if isinstance(entry, dict):
             saved_at = float(entry.get("saved_at", 0.0) or 0.0)
             payload = entry.get("payload")
             if isinstance(payload, dict) and payload.get("records") and (now_ts - saved_at <= max_age_seconds):
-                return payload
+                prepared = _prepare_cached_payload(payload, payload.get("records") or [])
+                if prepared:
+                    return prepared
 
         state_all_key = f"{s_key}|ALL|{c_key}"
         state_entry = _mandi_shared_pool.get(state_all_key)
@@ -1426,12 +1474,9 @@ def _get_from_shared_pool(state: str, market: str, commodity: str, max_age_secon
                 all_rows = state_payload.get("records") or []
                 matched_rows = [r for r in all_rows if _mandi_markets_match(_mandi_row_market(r), market)]
                 if matched_rows:
-                    latest_matched, latest_date = _mandi_latest_rows(matched_rows)
-                    filtered_payload = dict(state_payload)
-                    filtered_payload["records"] = latest_matched[:100]
-                    if latest_matched:
-                        filtered_payload["latest_arrival_date"] = latest_matched[0].get("arrival_date", "") or latest_date
-                    return filtered_payload
+                    prepared = _prepare_cached_payload(state_payload, matched_rows)
+                    if prepared:
+                        return prepared
 
         # Fallback to the full statewide normalized dataset if present in pool
         statewide_entry = _mandi_shared_pool.get(f"{s_key}|ALL|__statewide_all__")
@@ -1445,13 +1490,9 @@ def _get_from_shared_pool(state: str, market: str, commodity: str, max_age_secon
                 if market and market.strip():
                     sw_rows = [r for r in sw_rows if _mandi_markets_match(_mandi_row_market(r), market)]
                 if sw_rows:
-                    latest_sw, latest_date = _mandi_latest_rows(sw_rows)
-                    if latest_sw:
-                        out_payload = dict(sw_payload)
-                        out_payload["records"] = latest_sw[:100]
-                        out_payload["latest_arrival_date"] = latest_sw[0].get("arrival_date", "") or latest_date
-                        out_payload["message"] = f"ભારત સરકારના data.gov.in ડેટામાંથી {latest_date}નો ભાવ મળ્યો."
-                        return out_payload
+                    prepared = _prepare_cached_payload(sw_payload, sw_rows)
+                    if prepared:
+                        return prepared
     return None
 
 GUJARAT_MANDI_CROP_CATALOGUE = [
@@ -1882,7 +1923,7 @@ def _commodity_matches(row: dict[str, Any], requested: str) -> bool:
 
 
 def _mandi_latest_rows(rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], str]:
-    """Keep every row from the newest report *date*, not just one timestamp."""
+    """Step-by-step lookback: check Today (day 0), then Yesterday (day 1), then day 2 ... up to MANDI_MAX_LOOKBACK_DAYS (7 days)."""
     dated = []
     for row in rows:
         if not isinstance(row, dict):
@@ -1893,6 +1934,12 @@ def _mandi_latest_rows(rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]]
     valid = [parsed for _, parsed in dated if parsed]
     if not valid:
         return rows, ""
+    today_ist = datetime.now(timezone(timedelta(hours=5, minutes=30))).date()
+    for day_offset in range(MANDI_MAX_LOOKBACK_DAYS + 1):
+        target_day = today_ist - timedelta(days=day_offset)
+        day_matches = [row for row, parsed in dated if parsed and parsed.date() == target_day]
+        if day_matches:
+            return day_matches, target_day.strftime("%d-%m-%Y")
     latest_day = max(parsed.date() for parsed in valid)
     return [row for row, parsed in dated if parsed and parsed.date() == latest_day], latest_day.strftime("%d-%m-%Y")
 
@@ -2088,7 +2135,7 @@ def _data_gov_commodity_filter(api_commodity: str) -> str:
 
 
 def _data_gov_market_filter_value(raw_market: str) -> str:
-    """Convert AGMARKNET or Gujarati yard label (e.g. 'Veraval APMC', 'વેરાવળ યાર્ડ') into data.gov.in market filter ('Veraval')."""
+    """Convert AGMARKNET or Gujarati yard label (e.g. 'Veraval APMC', 'veraval', 'વેરાવળ યાર્ડ') into data.gov.in market filter ('Veraval')."""
     text = (raw_market or "").strip()
     if not text:
         return ""
@@ -2108,7 +2155,20 @@ def _data_gov_market_filter_value(raw_market: str) -> str:
                     return en_k.title()
         if m_key and m_key.isascii():
             return m_key.title()
+    if cleaned.isascii() and cleaned.islower():
+        return cleaned.title()
     return cleaned
+
+
+def _data_gov_market_filter_candidates(raw_market: str) -> list[str]:
+    """Return candidate data.gov.in filters[market] values (both clean 'Veraval' and 'Veraval APMC')."""
+    base = _data_gov_market_filter_value(raw_market)
+    if not base:
+        return []
+    candidates = [base]
+    if "apmc" not in base.lower() and "(" not in base:
+        candidates.append(f"{base} APMC")
+    return candidates
 
 
 def _mandi_api_get(state: str, market: str, commodity: str, request_deadline: float | None = None):
@@ -2165,12 +2225,13 @@ def _mandi_api_get(state: str, market: str, commodity: str, request_deadline: fl
 
     dg_commodity = _data_gov_commodity_filter(api_commodity)
     dg_market_clean = _data_gov_market_filter_value(market) if market else ""
-    tried_targeted_market_pass = False
+    dg_market_candidates = _data_gov_market_filter_candidates(market) if market else []
+    targeted_candidate_idx = -1
 
     for page in range(MANDI_MAX_PAGES):
         if deadline is not None and time.monotonic() >= deadline:
             return None, "Live Mandi માટે સમય મર્યાદા પૂરી થઈ ગઈ.", 0, last_status
-        offset = 0 if tried_targeted_market_pass else len(aggregated)
+        offset = 0 if targeted_candidate_idx >= 0 else len(aggregated)
         params = {
             "api-key": MANDI_API_KEY,
             "format": "json",
@@ -2181,9 +2242,11 @@ def _mandi_api_get(state: str, market: str, commodity: str, request_deadline: fl
             params["filters[state]"] = state
         if dg_commodity:
             params["filters[commodity]"] = dg_commodity
-        if not MANDI_MODEL3_STATEWIDE_BULK or tried_targeted_market_pass:
+        if not MANDI_MODEL3_STATEWIDE_BULK:
             if dg_market_clean:
                 params["filters[market]"] = dg_market_clean
+        elif targeted_candidate_idx >= 0 and targeted_candidate_idx < len(dg_market_candidates):
+            params["filters[market]"] = dg_market_candidates[targeted_candidate_idx]
         url = f"{MANDI_API_SCHEME}://{MANDI_API_HOST}{path}?" + urllib.parse.urlencode(params)
         for attempt in range(2):
             if deadline is not None and time.monotonic() >= deadline:
@@ -2231,20 +2294,21 @@ def _mandi_api_get(state: str, market: str, commodity: str, request_deadline: fl
                                 state, aggregated, pagination_complete=(len(page_rows) != 10), pages_fetched=page + 1, http_status=status
                             )
                         normalized = _mandi_normalized_result({"records": aggregated}, normalized_commodity, fallback_used=False, requested_market=market)
-                        # If sample key capped page at 10 rows and the requested market wasn't in those 10 rows,
-                        # do one targeted pass with filters[market]=dg_market_clean before giving up!
+                        # If sample key capped Pass 1 at 10 rows and the requested market wasn't in those 10 rows,
+                        # try targeted market filter candidates ('Veraval', 'Veraval APMC') before giving up!
                         if (
                             MANDI_MODEL3_STATEWIDE_BULK
-                            and dg_market_clean
-                            and not tried_targeted_market_pass
+                            and dg_market_candidates
                             and not (normalized.get("records") or [])
-                            and len(page_rows) == 10
+                            and (len(page_rows) == 10 or targeted_candidate_idx >= 0)
+                            and (targeted_candidate_idx + 1 < len(dg_market_candidates))
                             and page + 1 < MANDI_MAX_PAGES
                         ):
-                            tried_targeted_market_pass = True
+                            targeted_candidate_idx += 1
+                            next_mkt_filter = dg_market_candidates[targeted_candidate_idx]
                             print(
                                 f"[MANDI_DEBUG] official_api_targeted_market_pass state={state!r} "
-                                f"commodity={dg_commodity!r} market_filter={dg_market_clean!r}",
+                                f"commodity={dg_commodity!r} market_filter={next_mkt_filter!r}",
                                 flush=True,
                             )
                             break
@@ -2338,6 +2402,7 @@ def _mandi_api_get(state: str, market: str, commodity: str, request_deadline: fl
 
 _ceda_commodity_cache: dict[str, tuple[Any, float]] = {}
 _ceda_geography_cache: tuple[Any, float] | None = None
+_ceda_v1_auth_failed: bool = False
 _CEDA_METADATA_CACHE_SECONDS = 6 * 60 * 60
 _CEDA_PUBLIC_BASE = "https://agmarknet.ceda.ashoka.edu.in/api"
 _ceda_rate_limit_until: float = 0.0
@@ -2618,7 +2683,7 @@ async def _fetch_agmarknet_2_live(state: str, market: str, commodity: str, reque
             _agmarknet_state_cache[state_key] = (state_id, time.monotonic())
         print(f"[MANDI_DEBUG] agmarknet2_state_resolved state={state_name!r} id={state_id}")
 
-        last_error = "AGMARKNET 2.0માં છેલ્લા 3 દિવસના માન્ય ભાવ મળ્યા નથી."
+        last_error = f"AGMARKNET 2.0માં છેલ્લા {MANDI_MAX_LOOKBACK_DAYS} દિવસના માન્ય ભાવ મળ્યા નથી."
 
         if wanted.upper() != "ALL":
             ckey = _norm_mandi_text(wanted)
@@ -2909,7 +2974,7 @@ async def _fetch_agmarknet_2_live(state: str, market: str, commodity: str, reque
 
 async def _fetch_ceda_fresh_mandi(state: str, district: str, commodity: str) -> tuple[list[dict[str, Any]], str]:
     """Fetch real Agmarknet-derived data through CEDA."""
-    global _ceda_geography_cache
+    global _ceda_geography_cache, _ceda_v1_auth_failed
 
     circuit_remaining = _ceda_circuit_remaining()
     if circuit_remaining > 0:
@@ -2922,7 +2987,7 @@ async def _fetch_ceda_fresh_mandi(state: str, district: str, commodity: str) -> 
     if api_commodity.upper() == "ALL":
         return [], "CEDA fallback requires a specific commodity"
 
-    timeout = httpx.Timeout(MANDI_CEDA_TIMEOUT_SECONDS, connect=min(8.0, MANDI_CEDA_TIMEOUT_SECONDS))
+    timeout = httpx.Timeout(MANDI_CEDA_TIMEOUT_SECONDS, connect=min(4.0, MANDI_CEDA_TIMEOUT_SECONDS))
     headers = {"Accept": "application/json"}
     if CEDA_API_KEY:
         headers["Authorization"] = f"Bearer {CEDA_API_KEY}"
@@ -2932,13 +2997,16 @@ async def _fetch_ceda_fresh_mandi(state: str, district: str, commodity: str) -> 
 
     async with httpx.AsyncClient(base_url=CEDA_API_BASE, headers=headers, timeout=timeout) as client:
         async def call(method: str, path: str, payload: dict | None = None):
-            if not CEDA_API_KEY:
-                return None, "CEDA_API_KEY not configured"
+            global _ceda_v1_auth_failed
+            if not CEDA_API_KEY or _ceda_v1_auth_failed:
+                return None, "CEDA_API_KEY not configured or auth failed"
             try:
                 response = await client.request(method, path, json=payload)
                 retry_after = response.headers.get("Retry-After", "")
                 if response.status_code == 429:
                     _ceda_note_rate_limit(retry_after, f"authenticated:{path}")
+                if response.status_code in (401, 403):
+                    _ceda_v1_auth_failed = True
                 if response.status_code != 200:
                     suffix = f"; Retry-After={retry_after}" if retry_after else ""
                     return None, f"HTTP {response.status_code}{suffix}"
@@ -2997,21 +3065,26 @@ async def _fetch_ceda_fresh_mandi(state: str, district: str, commodity: str) -> 
         commodity_meta_source = "cache" if commodity_meta else ""
 
         if not commodity_meta:
-            commodities, err = await call("GET", "/agmarknet/commodities")
-            if commodities is not None:
-                commodity_meta = commodities
-                commodity_meta_source = "ceda_v1"
+            static_matches = _ceda_find_commodity_matches(_CEDA_STATIC_COMMODITIES, api_commodity)
+            if static_matches:
+                commodity_meta = static_matches
+                commodity_meta_source = "ceda_static_official_ids"
             else:
-                print(f"[MANDI_DEBUG] ceda_commodities_failed error={err!r}")
-                if _ceda_circuit_remaining() > 0:
-                    return [], f"CEDA rate limit circuit open after metadata request: {err}"
-                public_rows = await public_commodity_metadata()
-                if public_rows:
-                    commodity_meta = public_rows
-                    commodity_meta_source = "ceda_public_metadata"
+                commodities, err = await call("GET", "/agmarknet/commodities")
+                if commodities is not None:
+                    commodity_meta = commodities
+                    commodity_meta_source = "ceda_v1"
                 else:
-                    commodity_meta = _CEDA_STATIC_COMMODITIES
-                    commodity_meta_source = "ceda_static_official_ids"
+                    print(f"[MANDI_DEBUG] ceda_commodities_failed error={err!r}")
+                    if _ceda_circuit_remaining() > 0:
+                        return [], f"CEDA rate limit circuit open after metadata request: {err}"
+                    public_rows = await public_commodity_metadata()
+                    if public_rows:
+                        commodity_meta = public_rows
+                        commodity_meta_source = "ceda_public_metadata"
+                    else:
+                        commodity_meta = _CEDA_STATIC_COMMODITIES
+                        commodity_meta_source = "ceda_static_official_ids"
 
         matches = _ceda_find_commodity_matches(commodity_meta, api_commodity)
         if not matches:
@@ -3033,6 +3106,9 @@ async def _fetch_ceda_fresh_mandi(state: str, district: str, commodity: str) -> 
         if _ceda_geography_cache and (time.monotonic() - _ceda_geography_cache[1] < _CEDA_METADATA_CACHE_SECONDS):
             geographies = _ceda_geography_cache[0]
             geo_source = "cache"
+        elif norm(state) == "gujarat":
+            geographies = _CEDA_STATIC_GUJARAT_GEOGRAPHIES
+            geo_source = "ceda_static_gujarat_ids"
         else:
             geographies, err = await call("GET", "/agmarknet/geographies")
             if geographies is not None:
@@ -3146,8 +3222,6 @@ async def _fetch_ceda_fresh_mandi(state: str, district: str, commodity: str) -> 
                         continue
                     row_district = str(r.get("district") or r.get("district_name") or r.get("District") or "").strip()
                     if district and row_district and norm(row_district) != norm(district) and norm(district) not in norm(row_district):
-                        continue
-                    if district and not row_district:
                         continue
                     market_id = r.get("market_id", r.get("marketId"))
                     market_name = (
@@ -3283,27 +3357,74 @@ def _normalise_mandi_records(records: list[dict[str, Any]]) -> list[dict[str, An
         _price_float(row.get("modal_price")) or -1.0,
         _norm_mandi_market(row.get("market", "")),
     ), reverse=True)
+    _refresh_mandi_records_date_labels(normalized)
+    return normalized
+
+
+def _refresh_mandi_records_date_labels(records: list[dict[str, Any]], yard_note: str = "") -> tuple[int | None, str]:
+    """Dynamically compute age_days, freshness_label_gu, and date_notice_gu against current IST date."""
     now_date = datetime.now(timezone(timedelta(hours=5, minutes=30))).date()
-    for row in normalized:
-        try:
-            row_date = datetime.fromisoformat(row.get("arrival_date_iso", "")).date()
+    min_age: int | None = None
+    latest_disp = ""
+    for row in records:
+        if not isinstance(row, dict):
+            continue
+        row_date = None
+        iso_str = str(row.get("arrival_date_iso") or "").strip()
+        if iso_str:
+            try:
+                row_date = datetime.fromisoformat(iso_str).date()
+            except Exception:
+                row_date = None
+        if row_date is None:
+            parsed = _parse_mandi_date(row.get("arrival_date") or row.get("report_date") or "")
+            if parsed:
+                row_date = parsed.date()
+        disp_date = row_date.strftime("%d/%m/%Y") if row_date else str(row.get("arrival_date") or row.get("report_date") or "").strip()
+        if row_date is not None:
             age_days = max(0, (now_date - row_date).days)
-        except Exception:
+            if min_age is None or age_days < min_age:
+                min_age = age_days
+                latest_disp = disp_date
+        else:
             age_days = None
         row["age_days"] = age_days
         if age_days == 0:
             row["freshness_status"] = "today"
-            row["freshness_label_gu"] = "આજનો અધિકૃત ભાવ"
+            base_label = f"આજનો તાજો અધિકૃત ભાવ (તા. {disp_date})" if disp_date else "આજનો અધિકૃત ભાવ"
+            base_notice = f"🟢 આ ભાવ આજનો તાજો છે (તા. {disp_date})." if disp_date else "🟢 આ ભાવ આજનો તાજો છે."
         elif age_days == 1:
             row["freshness_status"] = "recent"
-            row["freshness_label_gu"] = "ગઈકાલનો અધિકૃત ભાવ"
+            base_label = f"ભાવ આજનો નથી, ગઈકાલનો તા. {disp_date} નો છે" if disp_date else "ભાવ આજનો નથી, ગઈકાલનો છે"
+            base_notice = f"⚠️ નોંધ: આ ભાવ આજનો નથી, ગઈકાલનો (તા. {disp_date}) ભાવ છે." if disp_date else "⚠️ નોંધ: આ ભાવ આજનો નથી, ગઈકાલનો ભાવ છે."
         elif isinstance(age_days, int):
             row["freshness_status"] = "recent"
-            row["freshness_label_gu"] = f"{age_days} દિવસ જૂનો અધિકૃત ભાવ"
+            base_label = f"ભાવ આજનો નથી, તા. {disp_date} નો છે ({age_days} દિવસ જૂનો)" if disp_date else f"ભાવ આજનો નથી ({age_days} દિવસ જૂનો)"
+            base_notice = f"⚠️ નોંધ: આ ભાવ આજનો નથી, તા. {disp_date} નો છે ({age_days} દિવસ જૂનો)." if disp_date else f"⚠️ નોંધ: આ ભાવ આજનો નથી ({age_days} દિવસ જૂનો)."
         else:
             row["freshness_status"] = "unknown"
-            row["freshness_label_gu"] = "તારીખ ચકાસો"
-    return normalized
+            base_label = "તારીખ ચકાસો"
+            base_notice = "⚠️ તારીખ ચકાસો"
+        if yard_note:
+            suffix = f"({yard_note})"
+            if suffix not in base_label:
+                base_label = f"{base_label} {suffix}"
+            if yard_note not in base_notice:
+                base_notice = f"{base_notice} {suffix}"
+        row["freshness_label_gu"] = base_label
+        row["date_notice_gu"] = base_notice
+    return min_age, latest_disp
+
+
+def _build_mandi_date_aware_message(source_label_gu: str, latest_date: str, min_age: int | None, yard_fallback_prefix: str = "") -> str:
+    prefix = f"{yard_fallback_prefix} • " if yard_fallback_prefix else ""
+    if min_age == 0:
+        return f"{prefix}{source_label_gu}માંથી આજનો (તા. {latest_date}) તાજો ભાવ મળ્યો."
+    if min_age == 1:
+        return f"{prefix}⚠️ આ ભાવ આજનો નથી, ગઈકાલનો (તા. {latest_date}) છેલ્લો ઉપલબ્ધ અધિકૃત ભાવ છે."
+    if isinstance(min_age, int) and min_age > 1:
+        return f"{prefix}⚠️ આ ભાવ આજનો નથી, તા. {latest_date} નો ({min_age} દિવસ જૂનો) છેલ્લો ઉપલબ્ધ અધિકૃત ભાવ છે."
+    return f"{prefix}{source_label_gu}માંથી તા. {latest_date} નો ભાવ મળ્યો."
 
 _GUJARATI_MARKET_NAME_MAP = {
     "rajkot":"રાજકોટ", "gondal":"ગોંડલ", "jetpur":"જેતપુર", "morbi":"મોરબી",
@@ -3588,6 +3709,9 @@ def mandi_today_summary_crop(state: str = "Gujarat", market: str = "", commodity
         "ok": bool(payload.get("ok", False)) if isinstance(payload, dict) else False,
         "crop": requested,
         "live_available": bool(payload.get("live_available", False)) if isinstance(payload, dict) else False,
+        "is_cached_data": bool(payload.get("is_cached_data", False)) if isinstance(payload, dict) else False,
+        "cached_checked_at": str(payload.get("cached_checked_at", "") or "") if isinstance(payload, dict) else "",
+        "exact_market_match": bool(payload.get("exact_market_match", True)) if isinstance(payload, dict) else True,
         "source": str(payload.get("source", "") or "") if isinstance(payload, dict) else "",
         "checked_at": str(payload.get("checked_at", checked_at) or checked_at) if isinstance(payload, dict) else checked_at,
         "message": str(payload.get("message", "") or "") if isinstance(payload, dict) else "",
@@ -3803,6 +3927,43 @@ def mandi(state: str = "Gujarat", market: str = "", commodity: str = "ALL", requ
             backup_out["live_error"] = live_error
             backup_out["message"] = "લાઇવ સર્વર હાલ ઉપલબ્ધ ન હોવાથી અગાઉ સાચવેલો (Cached) અધિકૃત ભાવ દર્શાવેલ છે."
             return backup_out
+        # If the farmer requested a specific yard (e.g., 'veraval') that had NO auction/arrival for this crop today,
+        # but our statewide pool HAS live/recent Gujarat records for this exact crop from other Gujarat APMCs
+        # (e.g., 'Mandvi APMC' returned by data.gov.in Pass 1), serve those real Gujarat records with a clear yard note!
+        if market_name:
+            statewide_crop = _get_from_shared_pool(state_name, "", requested_commodity, max_age_seconds=MANDI_SHARED_FRESH_TTL_SECONDS)
+            is_fresh_sw = True
+            if not statewide_crop:
+                statewide_crop = _get_from_shared_pool(state_name, "", requested_commodity, max_age_seconds=MANDI_FALLBACK_MAX_AGE_HOURS * 3600)
+                is_fresh_sw = False
+            if isinstance(statewide_crop, dict) and statewide_crop.get("records"):
+                req_yard_gu = _mandi_market_display_gu(market_name)
+                yard_note = f"{req_yard_gu}માં આવક ન હોવાથી અન્ય યાર્ડનો ભાવ"
+                sw_records = [dict(r) for r in (statewide_crop.get("records") or []) if isinstance(r, dict)]
+                if sw_records:
+                    min_age, disp_dt = _refresh_mandi_records_date_labels(sw_records, yard_note=yard_note)
+                    sw_out = dict(statewide_crop)
+                    sw_out["records"] = sw_records[:100]
+                    sw_out["live_available"] = bool(is_fresh_sw)
+                    sw_out["is_cached_data"] = not bool(is_fresh_sw)
+                    sw_out["exact_market_match"] = False
+                    sw_out["requested_market"] = market_name
+                    sw_out["checked_at"] = checked_at
+                    latest_dt = disp_dt or sw_out.get("latest_arrival_date") or (sw_records[0].get("arrival_date", "") if sw_records else "")
+                    sw_out["latest_arrival_date"] = latest_dt
+                    sw_out["message"] = _build_mandi_date_aware_message(
+                        "ગુજરાતના અન્ય યાર્ડના અધિકૃત ડેટા",
+                        latest_dt,
+                        min_age,
+                        yard_fallback_prefix=f"{req_yard_gu}માં છેલ્લા {MANDI_MAX_LOOKBACK_DAYS} દિવસમાં {requested_commodity}ની આવક નોંધાઈ નથી",
+                    )
+                    print(
+                        f"[MANDI_DEBUG] statewide_same_crop_fallback state={state_name!r} "
+                        f"requested_market={market_name!r} commodity={requested_commodity!r} "
+                        f"records={len(sw_records)} observed_markets={[r.get('market') for r in sw_records[:5]]!r}",
+                        flush=True,
+                    )
+                    return sw_out
         return {
             "ok": True,
             "live_available": False,
@@ -3882,7 +4043,9 @@ def mandi(state: str = "Gujarat", market: str = "", commodity: str = "ALL", requ
         if records:
             latest_rows, latest_date = _mandi_latest_rows(records)
             if latest_rows:
-                print(f"[MANDI_DEBUG] source_success priority=1 source='data.gov.in' latest_date={latest_date!r} records={len(latest_rows)}")
+                min_age, disp_dt = _refresh_mandi_records_date_labels(latest_rows)
+                eff_date = latest_rows[0].get("arrival_date", "") if latest_rows else (disp_dt or latest_date)
+                print(f"[MANDI_DEBUG] source_success priority=1 source='data.gov.in' latest_date={latest_date!r} age_days={min_age} records={len(latest_rows)}")
                 _mandi_source_log("data.gov.in", "RESULT", status="SUCCESS", elapsed_ms=int((time.monotonic()-_dg_started)*1000), http_status=http_status, records=len(latest_rows), state=state_name, market=market_name, commodity=requested_commodity)
                 response_payload = {
                     "ok": True,
@@ -3893,8 +4056,8 @@ def mandi(state: str = "Gujarat", market: str = "", commodity: str = "ALL", requ
                     "price_unit_source": "₹/quintal (data.gov.in)",
                     "display_price_unit": "₹/20kg",
                     "records": latest_rows[:100],
-                    "message": f"ભારત સરકારના data.gov.in ડેટામાંથી {latest_date}નો ભાવ મળ્યો.",
-                    "latest_arrival_date": latest_rows[0].get("arrival_date", "") if latest_rows else latest_date,
+                    "message": _build_mandi_date_aware_message("ભારત સરકારના data.gov.in ડેટા", eff_date, min_age),
+                    "latest_arrival_date": eff_date,
                     "source_policy": source_policy,
                     "diagnostics": {
                         "primary": {"request_ok": True, "http_status": http_status, "records": len(latest_rows), "source": "data.gov.in", "raw_records": raw_count, "latest_date": latest_date}
@@ -3928,7 +4091,9 @@ def mandi(state: str = "Gujarat", market: str = "", commodity: str = "ALL", requ
         if normalized:
             latest_rows, latest_date = _mandi_latest_rows(normalized)
             normalized = latest_rows
-            print(f"[MANDI_DEBUG] source_success priority=2 source='agmarknet_2_public' latest_date={latest_date!r} records={len(normalized)}")
+            min_age, disp_dt = _refresh_mandi_records_date_labels(normalized)
+            eff_date = normalized[0].get("arrival_date", "") if normalized else (disp_dt or latest_date)
+            print(f"[MANDI_DEBUG] source_success priority=2 source='agmarknet_2_public' latest_date={latest_date!r} age_days={min_age} records={len(normalized)}")
             _mandi_source_log("agmarknet_2_public", "RESULT", status="SUCCESS", elapsed_ms=int((time.monotonic()-_ag_started)*1000), http_status=0, records=len(normalized), state=state_name, market=market_name, commodity=requested_commodity)
             response_payload = {
                 "ok": True,
@@ -3939,8 +4104,8 @@ def mandi(state: str = "Gujarat", market: str = "", commodity: str = "ALL", requ
                 "price_unit_source": "₹/quintal (AGMARKNET 2.0)",
                 "display_price_unit": "₹/20kg",
                 "records": normalized[:100],
-                "message": f"AGMARKNETના {latest_date}ના ડેટામાંથી અધિકૃત ભાવ મળ્યો.",
-                "latest_arrival_date": normalized[0].get("arrival_date", "") if normalized else latest_date,
+                "message": _build_mandi_date_aware_message("AGMARKNET 2.0 ડેટા", eff_date, min_age),
+                "latest_arrival_date": eff_date,
                 "source_policy": source_policy,
                 "diagnostics": {
                     "primary": {"request_ok": False, "records": 0, "source": "data.gov.in", "error": data_error or "no_fresh_records", "http_status": int(upstream_status or 0)},
@@ -4002,7 +4167,9 @@ def mandi(state: str = "Gujarat", market: str = "", commodity: str = "ALL", requ
         latest_rows, latest_date = _mandi_latest_rows(ceda_records)
         normalized = _normalise_mandi_records(latest_rows)
         if normalized:
-            print(f"[MANDI_DEBUG] source_success priority=3 source='ceda_agmarknet_fallback' latest_date={latest_date!r} records={len(normalized)}")
+            min_age, disp_dt = _refresh_mandi_records_date_labels(normalized)
+            eff_date = normalized[0].get("arrival_date", "") if normalized else (disp_dt or latest_date)
+            print(f"[MANDI_DEBUG] source_success priority=3 source='ceda_agmarknet_fallback' latest_date={latest_date!r} age_days={min_age} records={len(normalized)}")
             _mandi_source_log("ceda_agmarknet_fallback", "RESULT", status="SUCCESS", elapsed_ms=int((time.monotonic()-_ceda_started)*1000), http_status=0, records=len(normalized), state=state_name, market=market_name, commodity=requested_commodity)
             response_payload = {
                 "ok": True,
@@ -4013,8 +4180,8 @@ def mandi(state: str = "Gujarat", market: str = "", commodity: str = "ALL", requ
                 "price_unit_source": "₹/quintal (Agmarknet via CEDA)",
                 "display_price_unit": "₹/20kg",
                 "records": normalized[:100],
-                "latest_arrival_date": normalized[0].get("arrival_date", "") if normalized else latest_date,
-                "message": f"CEDAના Agmarknet ડેટામાંથી {latest_date}નો ભાવ મળ્યો.",
+                "latest_arrival_date": eff_date,
+                "message": _build_mandi_date_aware_message("CEDA Agmarknet ડેટા", eff_date, min_age),
                 "source_policy": source_policy,
                 "diagnostics": {
                     "primary": {"request_ok": False, "records": 0, "source": "data.gov.in", "error": data_error or "no_fresh_records", "http_status": int(upstream_status or 0)},
@@ -4032,8 +4199,8 @@ def mandi(state: str = "Gujarat", market: str = "", commodity: str = "ALL", requ
         f"ceda_error={ceda_error or 'no_fresh_records'!r}"
     )
     return unavailable(
-        "આજનો, ગઈકાલનો કે છેલ્લા 3 દિવસનો માન્ય બજાર ભાવ કોઈપણ ઉપલબ્ધ સ્રોતમાંથી મળ્યો નથી.",
-        data_error or ag_error or ceda_error or "no_fresh_data_in_last_3_days",
+        f"આજનો, ગઈકાલનો કે છેલ્લા {MANDI_MAX_LOOKBACK_DAYS} દિવસનો માન્ય બજાર ભાવ કોઈપણ ઉપલબ્ધ સ્રોતમાંથી મળ્યો નથી.",
+        data_error or ag_error or ceda_error or f"no_fresh_data_in_last_{MANDI_MAX_LOOKBACK_DAYS}_days",
         {
             "primary": {"request_ok": False, "records": 0, "source": "data.gov.in", "http_status": int(upstream_status or 0), "error": data_error or "no_fresh_records"},
             "secondary": {"request_ok": False, "records": 0, "source": "agmarknet_2_public", "error": ag_error or "no_fresh_records"},
