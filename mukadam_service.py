@@ -1,3 +1,7 @@
+import sys as _sys, os as _os
+_BACKEND_DIR = _os.path.dirname(_os.path.abspath(__file__))
+if _BACKEND_DIR not in _sys.path:
+    _sys.path.insert(0, _BACKEND_DIR)
 import os
 import math
 import time
@@ -34,11 +38,27 @@ _PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 # Prefer Render Persistent Disk; otherwise use the backend project folder instead of /tmp.
 # On Render Free, the project folder is still ephemeral across redeploys/spin-downs;
 # optional GitHub snapshot backup below provides cross-restart recovery when configured.
-_DEFAULT_STORE_DIR = (
-    "/var/data"
-    if os.path.isdir("/var/data") and os.access("/var/data", os.W_OK)
-    else _PROJECT_DIR
-)
+def _select_default_store_dir() -> str:
+    if os.path.isdir("/var/data") and os.access("/var/data", os.W_OK):
+        return "/var/data"
+    probe = os.path.join(_PROJECT_DIR, ".sqlite_lock_probe.db")
+    try:
+        c = sqlite3.connect(probe)
+        c.execute("CREATE TABLE IF NOT EXISTS _p (id INT)")
+        c.commit()
+        c.close()
+        try:
+            os.remove(probe)
+        except OSError:
+            pass
+        return _PROJECT_DIR
+    except Exception:
+        fallback = "/tmp/smart_agri_mukadam_store"
+        os.makedirs(fallback, exist_ok=True)
+        return fallback
+
+
+_DEFAULT_STORE_DIR = _select_default_store_dir()
 DB_PATH = os.environ.get("MUKADAM_DB_PATH", os.path.join(_DEFAULT_STORE_DIR, "mukadam_marketplace.db"))
 BACKUP_JSON_PATH = os.environ.get(
     "MUKADAM_JSON_PATH",
@@ -449,9 +469,18 @@ def _restore_from_local_json_if_empty() -> None:
     try:
         # Merge missing entries even if SQLite already has some rows; INSERT OR IGNORE
         # leaves newer SQLite records intact while restoring records missing from a partial DB.
+        tombstones = {
+            str(r[0]) for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='mukadam_deleted_tombstones'"
+            ).fetchall()
+        }
+        deleted_mobiles = (
+            {str(r[0]) for r in conn.execute("SELECT mobile FROM mukadam_deleted_tombstones").fetchall()}
+            if tombstones else set()
+        )
         for rec in records:
             mobile = _clean_mobile(rec.get("mobile", ""))
-            if len(mobile) != 10:
+            if len(mobile) != 10 or mobile in deleted_mobiles:
                 continue
             conn.execute(
                 """
@@ -569,6 +598,22 @@ def init_mukadam_db() -> None:
             for location_column in ("district_code", "taluka_code", "village_code"):
                 if location_column not in columns:
                     conn.execute(f"ALTER TABLE mukadams ADD COLUMN {location_column} TEXT NOT NULL DEFAULT ''")
+            for col_name, col_def in (
+                ("created_at", "REAL NOT NULL DEFAULT 0.0"),
+                ("account_status", "TEXT NOT NULL DEFAULT 'ACTIVE'"),
+                ("is_blocked", "INTEGER NOT NULL DEFAULT 0"),
+                ("blocked_at", "REAL DEFAULT NULL"),
+                ("blocked_by", "TEXT NOT NULL DEFAULT ''"),
+                ("block_reason", "TEXT NOT NULL DEFAULT ''"),
+                ("block_admin_note", "TEXT NOT NULL DEFAULT ''"),
+                ("block_expires_at", "REAL DEFAULT NULL"),
+                ("deleted_at", "REAL DEFAULT NULL"),
+                ("deleted_by", "TEXT NOT NULL DEFAULT ''"),
+                ("deletion_reason", "TEXT NOT NULL DEFAULT ''"),
+                ("previous_status", "TEXT NOT NULL DEFAULT ''"),
+            ):
+                if col_name not in columns:
+                    conn.execute(f"ALTER TABLE mukadams ADD COLUMN {col_name} {col_def}")
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS mukadam_pin_attempts ("
                 "id INTEGER PRIMARY KEY AUTOINCREMENT, mobile TEXT NOT NULL DEFAULT '', "
@@ -577,9 +622,25 @@ def init_mukadam_db() -> None:
             )
             conn.execute("CREATE INDEX IF NOT EXISTS idx_mukadam_pin_mobile_time ON mukadam_pin_attempts(mobile, attempted_at)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_mukadam_pin_ip_time ON mukadam_pin_attempts(client_ip, attempted_at)")
+            try:
+                try:
+                    import admin_service
+                except ImportError:
+                    from . import admin_service
+                admin_service.init_admin_schema(conn)
+            except Exception as adm_exc:
+                print(f"[Mukadam] Admin schema init warning: {adm_exc}")
             conn.commit()
         finally:
             conn.close()
+        try:
+            try:
+                import admin_service
+            except ImportError:
+                from . import admin_service
+            admin_service.bootstrap_admin_from_env()
+        except Exception:
+            pass
         _restore_from_local_json_if_empty()
         _restore_from_github_if_empty()
         _backfill_location_codes()
@@ -770,11 +831,20 @@ def _restore_from_github_if_empty() -> None:
             records = list(records.values())
         if not isinstance(records, list):
             return
+        tombstones = {
+            str(r[0]) for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='mukadam_deleted_tombstones'"
+            ).fetchall()
+        }
+        deleted_mobiles = (
+            {str(r[0]) for r in conn.execute("SELECT mobile FROM mukadam_deleted_tombstones").fetchall()}
+            if tombstones else set()
+        )
         for rec in records:
             if not isinstance(rec, dict):
                 continue
             mobile = _clean_mobile(rec.get("mobile", ""))
-            if len(mobile) != 10:
+            if len(mobile) != 10 or mobile in deleted_mobiles:
                 continue
             conn.execute(
                 """
@@ -910,6 +980,29 @@ def register_or_update_mukadam(payload: Dict[str, Any], client_ip: str = "unknow
                 "SELECT * FROM mukadams WHERE mobile = ?", (mobile,)
             ).fetchone()
             if existing:
+                # Check if block has expired
+                exp_ts = existing["block_expires_at"] if "block_expires_at" in existing.keys() else None
+                if exp_ts is not None and float(exp_ts or 0) > 0 and now >= float(exp_ts):
+                    conn.execute(
+                        "UPDATE mukadams SET is_blocked = 0, account_status = 'ACTIVE', blocked_at = NULL, block_expires_at = NULL WHERE id = ?",
+                        (int(existing["id"]),),
+                    )
+                    existing = conn.execute("SELECT * FROM mukadams WHERE mobile = ?", (mobile,)).fetchone()
+                acc_status = str(existing["account_status"] if "account_status" in existing.keys() else "ACTIVE").upper()
+                is_blk = int(existing["is_blocked"] if "is_blocked" in existing.keys() else 0) == 1
+                is_del = (existing["deleted_at"] if "deleted_at" in existing.keys() else None) is not None
+                if acc_status == "SOFT_DELETED" or is_del:
+                    return {
+                        "ok": False,
+                        "http_status": 403,
+                        "message_gu": "આ મુકાદમ પ્રોફાઇલ હાલ દૂર (Removed) કરવામાં આવી છે. એડમિનનો સંપર્ક કરો.",
+                    }
+                if acc_status == "BLOCKED" or is_blk:
+                    return {
+                        "ok": False,
+                        "http_status": 403,
+                        "message_gu": "આ મુકાદમ પ્રોફાઇલ હાલ એડમિન દ્વારા સ્થગિત (Blocked) કરવામાં આવી છે.",
+                    }
                 pin_matches, needs_pin_upgrade = _verify_pin_hash(existing["pin_hash"], pin)
                 if not pin_matches:
                     _record_pin_attempt(conn, mobile, client_ip, "register", False, now)
@@ -981,8 +1074,8 @@ def register_or_update_mukadam(payload: Dict[str, Any], client_ip: str = "unknow
                         rickshaw_fare_type, rickshaw_fare_rate,
                         mukadami_type, mukadami_rate,
                         skills, notes, rating_sum, rating_count, contact_clicks, updated_at,
-                        phone_verified_at, phone_verified
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 5.0, 1, 0, ?, 0.0, 0)
+                        phone_verified_at, phone_verified, created_at, account_status, is_blocked
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 5.0, 1, 0, ?, 0.0, 0, ?, 'ACTIVE', 0)
                     """,
                     (
                         name,
@@ -1010,6 +1103,7 @@ def register_or_update_mukadam(payload: Dict[str, Any], client_ip: str = "unknow
                         float(payload.get("mukadami_rate", 0.0) or 0.0),
                         skills_str,
                         str(payload.get("notes", "")).strip(),
+                        now,
                         now,
                     ),
                 )
@@ -1052,6 +1146,23 @@ def update_mukadam_quick_status(payload: Dict[str, Any], client_ip: str = "unkno
                 _record_pin_attempt(conn, mobile, client_ip, "quick_status", False, now)
                 conn.commit()
                 return {"ok": False, "message_gu": "મોબાઇલ નંબર અથવા PIN ખોટો છે. તપાસીને ફરી પ્રયાસ કરો."}
+            exp_ts = existing["block_expires_at"] if "block_expires_at" in existing.keys() else None
+            if exp_ts is not None and float(exp_ts or 0) > 0 and now >= float(exp_ts):
+                conn.execute(
+                    "UPDATE mukadams SET is_blocked = 0, account_status = 'ACTIVE', blocked_at = NULL, block_expires_at = NULL WHERE id = ?",
+                    (int(existing["id"]),),
+                )
+                existing = conn.execute("SELECT * FROM mukadams WHERE mobile = ?", (mobile,)).fetchone()
+            acc_status = str(existing["account_status"] if "account_status" in existing.keys() else "ACTIVE").upper()
+            is_blk = int(existing["is_blocked"] if "is_blocked" in existing.keys() else 0) == 1
+            is_del = (existing["deleted_at"] if "deleted_at" in existing.keys() else None) is not None
+            if acc_status in ("BLOCKED", "SOFT_DELETED") or is_blk or is_del:
+                conn.commit()
+                return {
+                    "ok": False,
+                    "http_status": 403,
+                    "message_gu": "તમારી પ્રોફાઇલ હાલ એડમિન દ્વારા સ્થગિત (Blocked) કરવામાં આવી છે; સ્ટેટસ બદલી શકાતું નથી.",
+                }
             pin_matches, needs_pin_upgrade = _verify_pin_hash(existing["pin_hash"], pin)
             if not pin_matches:
                 _record_pin_attempt(conn, mobile, client_ip, "quick_status", False, now)
@@ -1219,10 +1330,42 @@ def search_nearby_mukadams(
         ref_lat is not None and ref_lon is not None
         and abs(float(ref_lat or 0.0)) > 0.001 and abs(float(ref_lon or 0.0)) > 0.001
     )
+    # Auto-expire any temporary blocks before filtering
+    any_expired = any(
+        int(r.get("is_blocked", 0) or 0) == 1
+        and r.get("block_expires_at") is not None
+        and float(r.get("block_expires_at") or 0) > 0
+        and now >= float(r.get("block_expires_at") or 0)
+        for r in cached_list
+    )
+    if any_expired:
+        with _MUKADAM_LOCK:
+            conn_exp = sqlite3.connect(DB_PATH)
+            try:
+                conn_exp.execute(
+                    "UPDATE mukadams SET is_blocked = 0, account_status = 'ACTIVE', blocked_at = NULL, block_expires_at = NULL WHERE is_blocked = 1 AND block_expires_at IS NOT NULL AND block_expires_at > 0 AND block_expires_at <= ?",
+                    (now,),
+                )
+                conn_exp.commit()
+            finally:
+                conn_exp.close()
+            _refresh_ram_cache()
+            cached_list = [dict(item) for item in _MUKADAM_RAM_CACHE]
+
     eligible: List[Dict[str, Any]] = []
     for raw in cached_list:
         item = dict(raw)
         item.pop("pin_hash", None)
+        acc_status = str(item.get("account_status", "ACTIVE") or "ACTIVE").upper()
+        if acc_status in ("BLOCKED", "SOFT_DELETED") or int(item.get("is_blocked", 0) or 0) == 1 or item.get("deleted_at") is not None:
+            search_diag["excluded_unavailable"] += 1
+            continue
+        for priv_key in (
+            "account_status", "is_blocked", "blocked_at", "blocked_by",
+            "block_reason", "block_admin_note", "block_expires_at",
+            "deleted_at", "deleted_by", "deletion_reason", "previous_status",
+        ):
+            item.pop(priv_key, None)
         status = str(item.get("available_status", "available")).strip().lower()
         if not include_unavailable and status == "unavailable":
             search_diag["excluded_unavailable"] += 1
@@ -1395,18 +1538,43 @@ def search_nearby_mukadams(
     }
 
 
-def record_rating_or_contact(payload: Dict[str, Any]) -> Dict[str, Any]:
+def record_rating_or_contact(payload: Dict[str, Any], client_ip: str = "unknown") -> Dict[str, Any]:
     if not _CACHE_INITIALIZED:
         init_mukadam_db()
     mobile = _clean_mobile(payload.get("mobile", ""))
     action = str(payload.get("action", "contact")).strip()
     stars = payload.get("stars", None)
     if len(mobile) != 10:
-        return {"ok": False, "message_gu": "અમાન્ય મોબાઇલ નંબર."}
+        return {"ok": False, "http_status": 400, "message_gu": "અમાન્ય મોબાઇલ નંબર."}
 
+    now = time.time()
+    ip_key = _client_ip_key(client_ip)
     with _MUKADAM_LOCK:
         conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
         try:
+            if ip_key:
+                recent = int(conn.execute(
+                    "SELECT COUNT(*) FROM mukadam_public_action_attempts WHERE client_ip = ? AND attempted_at >= ?",
+                    (ip_key, now - 600),
+                ).fetchone()[0] or 0)
+                if recent >= 20:
+                    return {"ok": False, "http_status": 429, "message_gu": "ઘણા પ્રયાસ થયા છે. થોડા સમય પછી ફરી પ્રયાસ કરો."}
+                conn.execute(
+                    "INSERT INTO mukadam_public_action_attempts (mobile, client_ip, action, attempted_at) VALUES (?, ?, ?, ?)",
+                    (mobile, ip_key, action[:20], now),
+                )
+                conn.execute("DELETE FROM mukadam_public_action_attempts WHERE attempted_at < ?", (now - 3600,))
+
+            row = conn.execute("SELECT * FROM mukadams WHERE mobile = ?", (mobile,)).fetchone()
+            if not row:
+                conn.commit()
+                return {"ok": False, "http_status": 404, "message_gu": "મુકાદમ પ્રોફાઇલ મળી નથી."}
+            acc_status = str(row["account_status"] if "account_status" in row.keys() else "ACTIVE").upper()
+            if acc_status in ("BLOCKED", "SOFT_DELETED") or int(row["is_blocked"] if "is_blocked" in row.keys() else 0) == 1 or (row["deleted_at"] if "deleted_at" in row.keys() else None) is not None:
+                conn.commit()
+                return {"ok": False, "http_status": 403, "message_gu": "આ મુકાદમ પ્રોફાઇલ હાલ સક્રિય નથી."}
+
             if action == "rate" and stars is not None:
                 rating = max(1.0, min(5.0, float(stars)))
                 conn.execute(
@@ -1430,7 +1598,7 @@ def record_rating_or_contact(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     _refresh_ram_cache()
     _trigger_github_backup_async()
-    return {"ok": True, "message_gu": message}
+    return {"ok": True, "http_status": 200, "message_gu": message}
 
 
 def export_mukadams_csv() -> str:
@@ -1495,3 +1663,65 @@ def export_mukadams_csv() -> str:
                 ]
             )
     return output.getvalue()
+
+
+def self_delete_mukadam_by_pin(payload: Dict[str, Any], client_ip: str = "unknown") -> Dict[str, Any]:
+    """Allows a registered Mukadam to delete their own directory profile using their mobile + 4-digit PIN (Google Play Account Deletion compliance)."""
+    if not _CACHE_INITIALIZED:
+        init_mukadam_db()
+    mobile = _clean_mobile(str(payload.get("mobile", "")))
+    pin = _clean_pin(str(payload.get("pin", "")))
+    reason = str(payload.get("reason", "User requested self deletion")).strip()[:200] or "User requested self deletion"
+
+    if len(mobile) != 10:
+        return {"ok": False, "http_status": 400, "message_gu": "સાચો ૧૦ અંકનો મોબાઇલ નંબર નાખો."}
+    if len(pin) != 4:
+        return {"ok": False, "http_status": 400, "message_gu": "સાચો ૪ અંકનો સિક્યોરિટી PIN નાખો."}
+
+    now = time.time()
+    with _MUKADAM_LOCK:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        try:
+            if _pin_auth_limited(conn, mobile, client_ip, now):
+                conn.commit()
+                return {"ok": False, "http_status": 429, "message_gu": "ઘણા ખોટા PIN પ્રયાસ થયા છે. ૧૫ મિનિટ પછી પ્રયાસ કરો."}
+            row = conn.execute("SELECT * FROM mukadams WHERE mobile = ?", (mobile,)).fetchone()
+            if not row:
+                _record_pin_attempt(conn, mobile, client_ip, "self_delete", False, now)
+                conn.commit()
+                return {"ok": False, "http_status": 404, "message_gu": "આ મોબાઇલ નંબર પર કોઈ મુકાદમ પ્રોફાઇલ નોંધાયેલ નથી."}
+            stored_hash = str(row["pin_hash"] or "")
+            verified, _ = _verify_pin_hash(stored_hash, pin)
+            if not verified:
+                _record_pin_attempt(conn, mobile, client_ip, "self_delete", False, now)
+                conn.commit()
+                return {"ok": False, "http_status": 403, "message_gu": "ખોટો PIN. સાચો ૪-અંકનો PIN નાખો."}
+            _record_pin_attempt(conn, mobile, client_ip, "self_delete", True, now)
+            muk_id = int(row["id"])
+            mobile_sha = hashlib.sha256(mobile.encode("utf-8")).hexdigest()
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS deleted_mukadam_tombstones (
+                    mukadam_id INTEGER PRIMARY KEY,
+                    mobile_sha256 TEXT NOT NULL,
+                    deleted_at REAL NOT NULL,
+                    deleted_by TEXT NOT NULL,
+                    deletion_reason TEXT NOT NULL
+                )"""
+            )
+            conn.execute(
+                """INSERT OR REPLACE INTO deleted_mukadam_tombstones
+                   (mukadam_id, mobile_sha256, deleted_at, deleted_by, deletion_reason)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (muk_id, mobile_sha, now, "SELF_USER_DELETE", reason),
+            )
+            conn.execute("DELETE FROM mukadams WHERE id = ?", (muk_id,))
+            conn.commit()
+        finally:
+            conn.close()
+        _refresh_ram_cache()
+    return {
+        "ok": True,
+        "http_status": 200,
+        "message_gu": "તમારી મુકાદમ પ્રોફાઇલ અને ડેટા સર્વર પરથી કાયમી ધોરણે કાઢી નાખવામાં આવ્યા છે.",
+    }
