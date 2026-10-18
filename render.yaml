@@ -37,7 +37,6 @@ services:
       - key: CEDA_API_KEY
         sync: false
       # Optional durable Mukadam snapshots for instances without a Persistent Disk.
-      # Set the token and repository name in Render; the token needs repository Contents write access. The path defaults below.
       - key: GITHUB_BACKUP_TOKEN
         sync: false
       - key: GITHUB_BACKUP_REPO
@@ -46,3 +45,16 @@ services:
         value: backups/mukadam_data.json
       - key: MANDI_FALLBACK_MAX_AGE_HOURS
         value: "96"
+      # Secure Admin Panel Bootstrap & Session Configuration (Set values in Render Dashboard):
+      - key: ADMIN_BOOTSTRAP_USERNAME
+        sync: false
+      - key: ADMIN_BOOTSTRAP_PASSWORD
+        sync: false
+      - key: ADMIN_BOOTSTRAP_DISPLAY_NAME
+        value: "મુખ્ય એડમિન (Super Admin)"
+      - key: ADMIN_RESET_MASTER_SECRET
+        sync: false
+      - key: ADMIN_SESSION_TTL_SECONDS
+        value: "28800"
+      - key: ADMIN_SESSION_IDLE_SECONDS
+        value: "7200"
