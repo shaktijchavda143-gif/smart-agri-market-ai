@@ -40,6 +40,8 @@ services:
         value: "14400"
       - key: MANDI_PAGE_SIZE
         value: "1000"
+      - key: MANDI_MAX_LOOKBACK_DAYS
+        value: "7"
       - key: CEDA_API_KEY
         sync: false
       # Optional durable Mukadam snapshots for instances without a Persistent Disk.
@@ -50,7 +52,7 @@ services:
       - key: GITHUB_BACKUP_PATH
         value: backups/mukadam_data.json
       - key: MANDI_FALLBACK_MAX_AGE_HOURS
-        value: "96"
+        value: "168"
       # Secure Admin Panel Bootstrap & Session Configuration (Set values in Render Dashboard):
       - key: ADMIN_BOOTSTRAP_USERNAME
         sync: false
