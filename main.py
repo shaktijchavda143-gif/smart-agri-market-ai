@@ -2345,10 +2345,12 @@ def _mandi_api_get(state: str, market: str, commodity: str, request_deadline: fl
                 last_status = int(exc.code or 0)
                 print(f"[MANDI_DEBUG] official_api_http_error page={page + 1} http_status={last_status} attempt={attempt + 1}")
                 if last_status == 429:
+                    if attempt == 0 and (deadline is None or (deadline - time.monotonic()) > 2.5):
+                        time.sleep(1.1)
+                        continue
                     cooldown = _mandi_retry_after_seconds(exc)
                     with _mandi_lock:
-                        _mandi_rate_limit_until[rate_key] = time.monotonic() + cooldown
-                        _mandi_global_rate_limit_until = time.monotonic() + cooldown
+                        _mandi_rate_limit_until[rate_key] = time.monotonic() + min(cooldown, 8)
                     return None, f"Live Mandi API limit પર છે; server cooldown {cooldown} સેકન્ડ માટે સક્રિય છે.", cooldown, last_status
                 if last_status in (401, 403):
                     return None, "Live Mandi API authentication/permission error.", 0, last_status
@@ -5039,3 +5041,74 @@ async def api_admin_mandi_diagnostics(request: Request, probe_live: bool = False
         },
         "providers": providers_report,
     }
+
+
+_weather_ram_cache: dict[str, tuple[dict[str, Any], float]] = {}
+_WEATHER_CACHE_TTL_SECONDS = 900.0
+
+_WMO_WEATHER_GUJARATI: dict[int, str] = {
+    0: "☀️ સ્વચ્છ આકાશ (Clear Sky)",
+    1: "🌤️ મુખ્યત્વે સ્વચ્છ આકાશ",
+    2: "⛅ આંશિક વાદળછાયું (Partly Cloudy)",
+    3: "☁️ વાદળછાયું વાતાવરણ (Overcast)",
+    45: "🌫️ ધુમ્મસવાળું વાતાવરણ (Fog)",
+    48: "🌫️ ગાઢ ધુમ્મસ",
+    51: "🌦️ હળવા છાંટા (Light Drizzle)",
+    53: "🌦️ મધ્યમ ઝરમર વરસાદ",
+    55: "🌧️ ઝરમર વરસાદ",
+    61: "🌧️ હળવો વરસાદ (Light Rain)",
+    63: "🌧️ મધ્યમ વરસાદ (Moderate Rain)",
+    65: "🌧️ ભારે વરસાદ (Heavy Rain)",
+    71: "❄️ હળવી હિમવર્ષા",
+    80: "🌦️ હળવા વરસાદી ઝાપટાં",
+    81: "🌧️ મધ્યમ વરસાદી ઝાપટાં",
+    82: "⛈️ ભારે વરસાદી ઝાપટાં",
+    95: "⛈️ ગાજવીજ સાથે વરસાદ (Thunderstorm)",
+    96: "⛈️ ગાજવીજ અને કરા સાથે વરસાદ",
+    99: "⛈️ ભારે ગાજવીજ સાથે વરસાદ",
+}
+
+
+@app.get("/api/v1/weather/current")
+def api_weather_current(latitude: float = 22.3039, longitude: float = 70.8022):
+    """Live current weather endpoint for Gujarat farmers (Open-Meteo backed with 15-min cache)."""
+    cache_key = f"{round(float(latitude), 2)}:{round(float(longitude), 2)}"
+    now_m = time.monotonic()
+    cached = _weather_ram_cache.get(cache_key)
+    if cached and (now_m - cached[1]) < _WEATHER_CACHE_TTL_SECONDS:
+        return cached[0]
+
+    params = urllib.parse.urlencode({
+        "latitude": f"{float(latitude):.4f}",
+        "longitude": f"{float(longitude):.4f}",
+        "current": "temperature_2m,relative_humidity_2m,wind_speed_10m,weather_code",
+        "timezone": "Asia/Kolkata",
+    })
+    url = f"https://api.open-meteo.com/v1/forecast?{params}"
+    req = urllib.request.Request(url, headers={"Accept": "application/json", "User-Agent": "SmartAgriMarketAI/3.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=8.0) as resp:
+            body = json.loads(resp.read().decode("utf-8", "ignore"))
+            curr = body.get("current") or {}
+            temp = float(curr.get("temperature_2m", 30.0))
+            hum = float(curr.get("relative_humidity_2m", 55.0))
+            wind = float(curr.get("wind_speed_10m", 10.0))
+            code = int(curr.get("weather_code", 0) or 0)
+            desc = _WMO_WEATHER_GUJARATI.get(code, "🌤️ સામાન્ય હવામાન")
+            payload = {
+                "ok": True,
+                "latitude": float(latitude),
+                "longitude": float(longitude),
+                "temperature": round(temp, 1),
+                "humidity": round(hum, 0),
+                "wind_speed": round(wind, 1),
+                "weather_code": code,
+                "description": desc,
+                "source": "Open-Meteo Official Meteorological Feed",
+            }
+            _weather_ram_cache[cache_key] = (payload, now_m)
+            return payload
+    except Exception as exc:
+        if cached:
+            return cached[0]
+        raise HTTPException(status_code=503, detail=f"Weather service unavailable: {type(exc).__name__}")
