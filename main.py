@@ -168,6 +168,7 @@ def root():
     return {"ok": True, "service": "smart-agri-ai", "version": APP_VERSION}
 
 
+@app.get("/healthz")
 @app.get("/api/v1/health")
 def health():
     return {
@@ -4559,12 +4560,12 @@ async def serve_public_privacy_policy():
     <li><strong>POST_NOTIFICATIONS:</strong> પાક અને હવામાનની ઉપયોગી સ્થાનિક સૂચનાઓ (Smart Alerts) માટે.</li>
   </ul>
   <h2>૩. Third-Party SDK અને સરકારી લિંક્સ (Disclosures)</h2>
-  <p>આ એપમાં AdMob, Firebase Analytics કે કોઈ જાહેરાત/ટ્રેકિંગ SDK નથી. 7/12 (AnyROR), i-Khedut, PM-KISAN અને વીજળી બિલ માટે એપ માત્ર અધિકૃત સરકારી પોર્ટલ બાહ્ય બ્રાઉઝરમાં ખોલે છે; સ્માર્ટ એગ્રી કોઈ સરકારી સંસ્થાનું પ્રતિનિધિત્વ કરતી નથી.</p>
+  <p><strong>બિન-સરકારી એપ સ્પષ્ટતા (Non-Government Affiliation Disclaimer):</strong> ‘સ્માર્ટ એગ્રી’ (Smart Agri) એક સ્વતંત્ર ખાનગી એપ છે અને કોઈપણ સરકારી સંસ્થા કે વિભાગનું પ્રતિનિધિત્વ કરતી નથી (Smart Agri does NOT represent any government entity). એપમાં દર્શાવેલ બાહ્ય લિંક્સ માત્ર ખેડૂતોની સુવિધા માટે નીચેના અધિકૃત જાહેર સ્ત્રોતો બાહ્ય બ્રાઉઝરમાં ખોલે છે:</p><ul><li>7/12 અને 8અ જમીન રેકોર્ડ: <a href="https://anyror.gujarat.gov.in/">https://anyror.gujarat.gov.in/</a></li><li>પી.એમ. કિસાન સન્માન નિધિ: <a href="https://pmkisan.gov.in/">https://pmkisan.gov.in/</a></li><li>સરકારી કૃષિ યોજનાઓ: <a href="https://ikhedut.gujarat.gov.in/">https://ikhedut.gujarat.gov.in/</a> અને <a href="https://agri.gujarat.gov.in/">https://agri.gujarat.gov.in/</a></li><li>વીજળી બિલ પોર્ટલ: <a href="https://portal.guvnl.in/">https://portal.guvnl.in/</a> અને <a href="https://connect.torrentpower.com/">https://connect.torrentpower.com/</a></li><li>APMC બજાર ભાવ માહિતી: <a href="https://agmarknet.gov.in/">https://agmarknet.gov.in/</a> અને <a href="https://data.gov.in/">https://data.gov.in/</a></li></ul><p>આ એપમાં AdMob, Firebase Analytics કે કોઈ જાહેરાત/ટ્રેકિંગ SDK નથી.</p>
   <h2>૪. ડેટા અને એકાઉન્ટ કાઢી નાખવું (User Data & Account Deletion)</h2>
   <p>તમે એપના <strong>સેટિંગ્સ → એકાઉન્ટ / વપરાશકર્તા ડેટા કાઢી નાખો</strong> માંથી સ્થાનિક ડેટા તેમજ નોંધાયેલ મુકાદમ પ્રોફાઇલ કાઢી શકો છો, અથવા વેબ પર <a href="/account-deletion">/account-deletion</a> પેજ પરથી સીધી ડિલીટ કરી શકો છો.</p>
   <hr>
   <h2>English Summary — Smart Agri Privacy Policy</h2>
-  <p>Smart Agri stores farmer profile, crop records, expenses, and diary notes locally on your device. AI crop queries/photos and voluntary Mukadam directory registrations (name, mobile, PBKDF2-SHA256 hashed 4-digit PIN, LGD location, labor availability) are transmitted over HTTPS to our backend. We do not use AdMob or third-party advertising SDKs, and we never sell personal data. Users can delete local data in-app (Settings → Delete Data) and delete registered Mukadam profiles in-app or via <a href="/account-deletion">/account-deletion</a>.</p>
+  <p><strong>Government Non-Affiliation Disclaimer &amp; Official Sources:</strong> Smart Agri is an independent private application and is <strong>NOT affiliated with, endorsed by, or representing any government entity</strong>. Official government/utility sources linked in the app: <a href="https://anyror.gujarat.gov.in/">https://anyror.gujarat.gov.in/</a> (Land Records), <a href="https://pmkisan.gov.in/">https://pmkisan.gov.in/</a> (PM-KISAN), <a href="https://ikhedut.gujarat.gov.in/">https://ikhedut.gujarat.gov.in/</a> &amp; <a href="https://agri.gujarat.gov.in/">https://agri.gujarat.gov.in/</a> (Agriculture Schemes), <a href="https://portal.guvnl.in/">https://portal.guvnl.in/</a> &amp; <a href="https://connect.torrentpower.com/">https://connect.torrentpower.com/</a> (Electricity Bills), and <a href="https://agmarknet.gov.in/">https://agmarknet.gov.in/</a> &amp; <a href="https://data.gov.in/">https://data.gov.in/</a> (Mandi Rates).</p><p>Smart Agri stores farmer profile, crop records, expenses, and diary notes locally on your device. AI crop queries/photos and voluntary Mukadam directory registrations (name, mobile, PBKDF2-SHA256 hashed 4-digit PIN, LGD location, labor availability) are transmitted over HTTPS to our backend. We do not use AdMob or third-party advertising SDKs, and we never sell personal data. Users can delete local data in-app (Settings → Delete Data) and delete registered Mukadam profiles in-app or via <a href="/account-deletion">/account-deletion</a>.</p>
 </div>
 </body>
 </html>"""
@@ -5112,3 +5113,26 @@ def api_weather_current(latitude: float = 22.3039, longitude: float = 70.8022):
         if cached:
             return cached[0]
         raise HTTPException(status_code=503, detail=f"Weather service unavailable: {type(exc).__name__}")
+
+
+# --- AUTO KEEP-ALIVE FOR RENDER FREE TIER (EVERY 9 MINUTES) ---
+import threading as _ka_threading
+import time as _ka_time
+import urllib.request as _ka_req
+
+def _render_keep_alive_worker():
+    urls = [
+        "https://smart-farmer-diary.onrender.com/healthz",
+        "https://smart-agri-market-ai.onrender.com/healthz",
+    ]
+    while True:
+        _ka_time.sleep(540)  # 9 minutes
+        for u in urls:
+            try:
+                req = _ka_req.Request(u, headers={"User-Agent": "SmartAgri-KeepAlive/1.0"})
+                with _ka_req.urlopen(req, timeout=10) as _:
+                    pass
+            except Exception:
+                pass
+
+_ka_threading.Thread(target=_render_keep_alive_worker, daemon=True).start()
